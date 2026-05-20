@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Wrapper script for GitHub MCP server
+# Fetches personal access token from Bitwarden (rbw) to avoid storing secrets in repo
+
+export GITHUB_PERSONAL_ACCESS_TOKEN="$(rbw get github_personal_access_token 2>/dev/null)"
+
+if [ -z "$GITHUB_PERSONAL_ACCESS_TOKEN" ]; then
+  echo "Error: Could not fetch github_personal_access_token from rbw" >&2
+  exit 1
+fi
+
+exec npx -y @modelcontextprotocol/server-github "$@"

@@ -1,0 +1,17 @@
+[package]
+name = "apalis-diesel-postgres"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "PostgreSQL storage backend for Apalis implemented with Diesel."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AlexeyMatskevich/apalis-diesel-postgres"
+readme = "README.md"
+keywords = ["apalis", "diesel", "postgres", "jobs", "queue"]
+categories = ["asynchronous", "database"]
+authors = ["Aleksey Matskevich"]
+exclude = ["scripts/", "flake.nix", "flake.lock", ".zed/", ".venv/"]
+
+[dependencies]
+
+[dev-dependencies]

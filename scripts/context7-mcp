@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Wrapper script for Context7 MCP server
+# Fetches API key from Bitwarden (rbw) to avoid storing secrets in repo
+
+export CONTEXT7_API_KEY="$(rbw get context7 2>/dev/null)"
+
+if [ -z "$CONTEXT7_API_KEY" ]; then
+  echo "Warning: Could not fetch context7 API key from rbw. Running without API key (rate limited)." >&2
+fi
+
+exec npx -y @upstash/context7-mcp@latest "$@"

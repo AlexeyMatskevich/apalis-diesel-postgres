@@ -1,0 +1,8 @@
+/target
+.zed/
+.mcp.json
+.claude/
+.codex/
+.venv/
+.direnv/
+.env
