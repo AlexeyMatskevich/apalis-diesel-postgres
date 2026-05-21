@@ -18,7 +18,7 @@ pub fn build_pool(database_url: impl AsRef<str>) -> Result<PgPool, Error> {
 
 /// Build a Diesel/r2d2 PostgreSQL pool with a custom r2d2 builder configuration.
 ///
-/// The `configure` callback receives a [`r2d2::Builder`] and can chain calls
+/// The `configure` callback receives a [`diesel::r2d2::Builder`] and can chain calls
 /// such as `.max_size(32)`, `.connection_timeout(...)`, or `.min_idle(...)`.
 pub fn build_pool_with<F>(database_url: impl AsRef<str>, configure: F) -> Result<PgPool, Error>
 where
