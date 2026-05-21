@@ -65,6 +65,15 @@ pub const fn crate_name() -> &'static str {
     "apalis-diesel-postgres"
 }
 
+// apalis `WorkerBuilder::build()` requires the backend to be `Send + Sync`.
+const _: fn() = || {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PostgresStorage<()>>();
+    assert_send_sync::<PostgresStorage<(), JsonCodec<CompactType>, PgNotify>>();
+    assert_send_sync::<PostgresStorage<(), JsonCodec<CompactType>, SharedFetcher>>();
+    assert_send_sync::<SharedPostgresStorage<()>>();
+};
+
 /// PostgreSQL storage backend implemented with Diesel.
 pub struct PostgresStorage<
     Args,

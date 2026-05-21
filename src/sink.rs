@@ -1,22 +1,27 @@
 use std::{
+    future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::Mutex,
     task::{Context, Poll},
 };
 
 use apalis_codec::json::JsonCodec;
-use futures::{FutureExt, Sink, future::BoxFuture};
+use futures::{FutureExt, Sink};
 
 use crate::{CompactType, Config, Error, PgPool, PgTask, PostgresStorage, queries};
 
-type FlushFuture = BoxFuture<'static, Result<(), Error>>;
+// Wrapped in `Mutex` upstream so `PgSink: Sync` even when the inner future
+// isn't (ntex's `BlockingResult` is `Send`-only). `Mutex::get_mut` keeps the
+// hot path lock-free.
+type FlushFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>;
 
 /// Buffered task sink used by [`PostgresStorage`].
 pub struct PgSink<Args, Codec = JsonCodec<CompactType>> {
     pool: PgPool,
     config: Config,
     buffer: Vec<PgTask<CompactType>>,
-    flush_future: Option<FlushFuture>,
+    flush_future: Mutex<Option<FlushFuture>>,
     _marker: PhantomData<(Args, Codec)>,
 }
 
@@ -41,7 +46,7 @@ impl<Args, Codec> Clone for PgSink<Args, Codec> {
             pool: self.pool.clone(),
             config: self.config.clone(),
             buffer: Vec::new(),
-            flush_future: None,
+            flush_future: Mutex::new(None),
             _marker: PhantomData,
         }
     }
@@ -55,7 +60,7 @@ impl<Args, Codec> PgSink<Args, Codec> {
             pool: pool.clone(),
             config: config.clone(),
             buffer: Vec::new(),
-            flush_future: None,
+            flush_future: Mutex::new(None),
             _marker: PhantomData,
         }
     }
@@ -70,8 +75,9 @@ impl<Args, Codec> PgSink<Args, Codec> {
 
     /// Whether `poll_ready` must drive a flush before accepting more work —
     /// either a flush is already in flight, or the buffer is at capacity.
-    fn needs_flush_before_ready(&self) -> bool {
-        self.flush_future.is_some() || self.buffer.len() >= self.capacity()
+    fn needs_flush_before_ready(&mut self) -> bool {
+        self.flush_future.get_mut().expect("flush_future mutex poisoned").is_some()
+            || self.buffer.len() >= self.capacity()
     }
 
     /// Try to enqueue a single task into the buffer, returning
@@ -89,25 +95,33 @@ impl<Args, Codec> PgSink<Args, Codec> {
     /// when none is in flight and the buffer is non-empty; otherwise polls the
     /// existing future and clears it once it resolves.
     fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if self.flush_future.is_none() && self.buffer.is_empty() {
+        // `&mut self` makes `Mutex::get_mut` infallible-by-borrow — no lock
+        // acquisition, just unique-borrow projection. The mutex exists purely
+        // to satisfy `PgSink: Sync` when the inner future is not `Sync` (ntex).
+        let flush_future = self
+            .flush_future
+            .get_mut()
+            .expect("flush_future mutex poisoned");
+
+        if flush_future.is_none() && self.buffer.is_empty() {
             return Poll::Ready(Ok(()));
         }
 
-        if self.flush_future.is_none() {
+        if flush_future.is_none() {
             let pool = self.pool.clone();
             let config = self.config.clone();
             let buffer = std::mem::take(&mut self.buffer);
-            self.flush_future = Some(queries::push_tasks(pool, config, buffer).boxed());
+            *flush_future = Some(Box::pin(queries::push_tasks(pool, config, buffer)));
         }
 
-        let Some(future) = self.flush_future.as_mut() else {
+        let Some(future) = flush_future.as_mut() else {
             return Poll::Ready(Ok(()));
         };
 
         match future.poll_unpin(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
-                self.flush_future = None;
+                *flush_future = None;
                 Poll::Ready(result)
             }
         }
@@ -154,7 +168,7 @@ mod tests {
         PgConnection,
         r2d2::{ConnectionManager, Pool},
     };
-    use futures::{FutureExt, Sink, future, task::noop_waker_ref};
+    use futures::{Sink, future, task::noop_waker_ref};
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
@@ -215,13 +229,20 @@ mod tests {
 
     fn poll_ready_in_flight() -> ReadyObservation {
         let mut storage = storage(2);
-        storage.sink.flush_future = Some(future::pending::<Result<(), Error>>().boxed());
+        storage.sink.flush_future =
+            Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
         let mut cx = Context::from_waker(noop_waker_ref());
         let poll = Pin::new(&mut storage).poll_ready(&mut cx);
+        let has_flush_future = storage
+            .sink
+            .flush_future
+            .get_mut()
+            .expect("flush_future mutex poisoned")
+            .is_some();
         ReadyObservation {
             poll,
             buffer_len: storage.sink.buffer.len(),
-            has_flush_future: storage.sink.flush_future.is_some(),
+            has_flush_future,
         }
     }
 
@@ -242,12 +263,17 @@ mod tests {
         for _ in 0..buffered {
             sink.buffer.push(task());
         }
-        sink.flush_future = future;
+        sink.flush_future = Mutex::new(future);
         let mut cx = Context::from_waker(noop_waker_ref());
         let poll = sink.poll_flush_inner(&mut cx);
+        let future_cleared = sink
+            .flush_future
+            .get_mut()
+            .expect("flush_future mutex poisoned")
+            .is_none();
         FlushObservation {
             poll,
-            future_cleared: sink.flush_future.is_none(),
+            future_cleared,
             buffer_len: sink.buffer.len(),
         }
     }
@@ -257,11 +283,11 @@ mod tests {
     }
 
     fn poll_flush_in_flight_ready(result: Result<(), Error>) -> FlushObservation {
-        poll_flush_sink_with_state(1, 0, Some(future::ready(result).boxed()))
+        poll_flush_sink_with_state(1, 0, Some(Box::pin(future::ready(result))))
     }
 
     fn poll_flush_in_flight_pending() -> FlushObservation {
-        poll_flush_sink_with_state(1, 0, Some(future::pending().boxed()))
+        poll_flush_sink_with_state(1, 0, Some(Box::pin(future::pending())))
     }
 
     /// `poll_flush_creates_future` exercises the `flush_future.is_none() &&
@@ -293,8 +319,13 @@ mod tests {
     fn cloned_sink_state_drops_flush_future() -> bool {
         let mut sink = sink(3);
         sink.buffer.push(task());
-        sink.flush_future = Some(future::pending::<Result<(), Error>>().boxed());
-        sink.clone().flush_future.is_none()
+        sink.flush_future =
+            Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
+        sink.clone()
+            .flush_future
+            .get_mut()
+            .expect("flush_future mutex poisoned")
+            .is_none()
     }
 
     fn cloned_sink_buffer_size(buffer_size: usize) -> usize {

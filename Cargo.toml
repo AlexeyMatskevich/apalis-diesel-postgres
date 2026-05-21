@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"],
 ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
+apalis = "1.0.0-rc.9"
 lets_expect = { version = "0.5", features = ["tokio"] }
 
 [features]
@@ -47,4 +48,8 @@ ntex = ["dep:ntex-rt"]
 
 [[example]]
 name = "outbox"
+required-features = ["tokio"]
+
+[[example]]
+name = "worker"
 required-features = ["tokio"]

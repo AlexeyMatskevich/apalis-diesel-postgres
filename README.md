@@ -44,8 +44,9 @@ as a compatibility check, not a runtime shape.
 ## Quick start
 
 Build a pool, run the migrations once at startup, create a storage. The
-worker side (poll/lock/ack) follows the regular apalis APIs and is not
-covered here — see the apalis docs.
+worker side (poll/lock/ack) follows the regular apalis APIs — see the
+[Running an apalis worker](#running-an-apalis-worker) section below for a
+full end-to-end wiring.
 
 ```rust,no_run
 # async fn run() -> Result<(), apalis_diesel_postgres::Error> {
@@ -76,6 +77,107 @@ example end-to-end against a real database, see
 ```sh
 DATABASE_URL=postgres://127.0.0.1:5432/apalis_diesel_postgres \
     cargo run --example outbox --features tokio
+```
+
+## Running an apalis worker
+
+Add `apalis` to your `Cargo.toml`; it re-exports `WorkerBuilder`, `Worker`,
+`Data` and the `BoxDynError` alias used by handlers. `PostgresStorage<T>`
+satisfies apalis's `Backend + Send + Sync` requirement, so it slots straight
+into `WorkerBuilder::backend(...)`.
+
+```rust,no_run
+# use apalis::prelude::*;
+# use apalis_diesel_postgres::{Config, PostgresStorage, build_pool, setup};
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct SendEmail { to: String }
+# async fn handle_email(job: SendEmail) -> Result<(), BoxDynError> {
+#     println!("sending to {}", job.to);
+#     Ok(())
+# }
+# async fn run() -> Result<(), BoxDynError> {
+let pool = build_pool("postgres://127.0.0.1:5432/app")?;
+setup(&pool).await?;
+
+let storage: PostgresStorage<SendEmail> =
+    PostgresStorage::new_with_config(&pool, &Config::new("emails"));
+
+WorkerBuilder::new("emails-worker")
+    .backend(storage)
+    .build(handle_email)
+    .run()
+    .await?;
+# Ok(())
+# }
+```
+
+### Calling `push_with_conn` from inside a handler
+
+The outbox pattern isn't limited to HTTP handlers — the same transactional
+guarantees apply when one job needs to enqueue a follow-up job atomically
+with its own database writes. Inject the follow-up queue's storage via
+`Data<...>`, hop onto the blocking pool, and share a `&mut PgConnection`
+between the business write and `push_with_conn`:
+
+```rust,no_run
+# use apalis::prelude::*;
+# use apalis_diesel_postgres::{Error as PgError, PostgresStorage};
+# use diesel::Connection;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct SendEmail { to: String }
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct LogActivity { kind: String, target: String }
+async fn handle_email(
+    job: SendEmail,
+    activity: Data<PostgresStorage<LogActivity>>,
+) -> Result<(), BoxDynError> {
+    let activity = (*activity).clone();
+    let to = job.to.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<(), PgError> {
+        let mut conn = activity.pool().get().map_err(PgError::Pool)?;
+        conn.transaction(|c| {
+            // Your business write goes here — same connection, same txn.
+            activity.push_with_conn(c, LogActivity {
+                kind: "email_sent".to_owned(),
+                target: to,
+            })?;
+            Ok::<_, PgError>(())
+        })
+    })
+    .await??;
+    Ok(())
+}
+```
+
+Wire the follow-up storage into the worker via `.data(...)`:
+
+```rust,no_run
+# use apalis::prelude::*;
+# use apalis_diesel_postgres::PostgresStorage;
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct SendEmail { to: String }
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct LogActivity { kind: String, target: String }
+# async fn handle_email(_: SendEmail, _: Data<PostgresStorage<LogActivity>>)
+#     -> Result<(), BoxDynError> { Ok(()) }
+# fn wire(
+#     emails: PostgresStorage<SendEmail>,
+#     activity: PostgresStorage<LogActivity>,
+# ) {
+let worker = WorkerBuilder::new("emails-worker")
+    .backend(emails)
+    .data(activity)
+    .build(handle_email);
+# let _ = worker;
+# }
+```
+
+End-to-end runnable example: [`examples/worker.rs`](examples/worker.rs).
+
+```sh
+DATABASE_URL=postgres://127.0.0.1:5432/apalis_diesel_postgres \
+    cargo run --example worker --features tokio
 ```
 
 ## Transactional enqueue (outbox pattern)
