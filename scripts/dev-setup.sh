@@ -27,11 +27,6 @@ if [ ! -f .zed/settings.json ] || [ "$current_hash" != "$stored_hash" ]; then
       "binary": {
         "path": "$(which nixd)"
       }
-    },
-    "nil": {
-      "binary": {
-        "path": "$(which nixd)"
-      }
     }
   },
   "languages": {
@@ -44,7 +39,8 @@ EOF
   echo "$current_hash" > .zed/.lsp-hash
 fi
 
-if [ ! -f .mcp.json ] || [ "$current_hash" != "$stored_hash" ]; then
+if [ "${APALIS_DIESEL_POSTGRES_WRITE_MCP:-0}" = "1" ] &&
+  { [ ! -f .mcp.json ] || [ "$current_hash" != "$stored_hash" ]; }; then
   echo "Generating .mcp.json..."
   cat > .mcp.json << EOF
 {

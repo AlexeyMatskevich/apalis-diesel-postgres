@@ -10,19 +10,67 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  static:
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.88
+    - uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: 1.88.0
         components: rustfmt, clippy
     - name: Check formatting
       run: cargo fmt --all -- --check
-    - name: Clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
-    - name: Test
-      run: cargo test --all-features --verbose
+    # `tokio` and `ntex` are mutually exclusive runtime features, so we
+    # cannot combine them via `--all-features` or `--no-default-features`.
+    - name: Check tokio feature
+      run: cargo check --locked --features tokio
+    - name: Check ntex feature
+      run: cargo check --locked --no-default-features --features ntex
+    - name: Clippy (tokio)
+      run: cargo clippy --locked --all-targets --features tokio -- -D warnings
+    - name: Clippy (ntex)
+      run: cargo clippy --locked --all-targets --no-default-features --features ntex -- -D warnings
+    - name: Unit tests with tokio feature
+      run: env -u DATABASE_URL cargo test --locked --features tokio --lib --verbose
+    - name: Unit tests with ntex feature
+      run: env -u DATABASE_URL cargo test --locked --no-default-features --features ntex --lib --verbose
+    - name: Doctests
+      run: cargo test --locked --doc --features tokio --verbose
     - name: Docs
-      run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+      run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --features tokio --no-deps
+
+  postgres:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: apalis_diesel_postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      APALIS_DIESEL_POSTGRES_REQUIRE_DATABASE: "1"
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/apalis_diesel_postgres
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.88.0
+    - name: PostgreSQL integration tests
+      run: >-
+        cargo test --locked --features tokio --verbose
+        --test postgres_lifecycle
+        --test postgres_notify_shared
+        --test postgres_queries
+        -- --test-threads=1

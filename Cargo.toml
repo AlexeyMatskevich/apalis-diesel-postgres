@@ -10,8 +10,41 @@ readme = "README.md"
 keywords = ["apalis", "diesel", "postgres", "jobs", "queue"]
 categories = ["asynchronous", "database"]
 authors = ["Aleksey Matskevich"]
-exclude = ["scripts/", "flake.nix", "flake.lock", ".zed/", ".venv/"]
+exclude = [
+    ".env.example",
+    ".github/",
+    ".gitignore",
+    ".zed/",
+    ".venv/",
+    "flake.lock",
+    "flake.nix",
+    "scripts/",
+]
 
 [dependencies]
+apalis-codec = { version = "0.1.0-rc.9", features = ["json"] }
+apalis-core = { version = "1.0.0-rc.9", default-features = false, features = ["sleep"] }
+apalis-sql = { version = "1.0.0-rc.9" }
+chrono = { version = "0.4", features = ["serde"] }
+diesel = { version = "2.3", features = ["postgres", "r2d2", "chrono", "serde_json"] }
+diesel_migrations = "2.3"
+futures = "0.3"
+ntex-rt = { version = "3.12", optional = true }
+pin-project = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"], optional = true }
+ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
+lets_expect = { version = "0.5", features = ["tokio"] }
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+ntex = ["dep:ntex-rt"]
+
+[[example]]
+name = "outbox"
+required-features = ["tokio"]
