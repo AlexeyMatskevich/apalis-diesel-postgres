@@ -1,5 +1,8 @@
 # apalis-diesel-postgres
 
+[![crates.io](https://img.shields.io/crates/v/apalis-diesel-postgres.svg)](https://crates.io/crates/apalis-diesel-postgres)
+[![docs.rs](https://img.shields.io/docsrs/apalis-diesel-postgres)](https://docs.rs/apalis-diesel-postgres)
+
 PostgreSQL storage backend for [Apalis](https://github.com/apalis-dev/apalis)
 implemented with Diesel and `r2d2`.
 
