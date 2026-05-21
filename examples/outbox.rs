@@ -33,9 +33,7 @@ use std::time::Duration;
 use apalis_diesel_postgres::{
     Config, Error as PgError, PgPool, PgTask, PostgresStorage, build_pool_with, setup,
 };
-use diesel::{
-    Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query, sql_types::Text,
-};
+use diesel::{Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
 use ulid::Ulid;
 
 const BUSINESS_TABLE: &str = "outbox_example_orders";
@@ -272,38 +270,38 @@ fn insert_order(
 }
 
 async fn ensure_business_table(pool: PgPool) -> Result<(), BoxError> {
-    tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut conn = pool.get()?;
-        sql_query(format!(
-            "CREATE TABLE IF NOT EXISTS {BUSINESS_TABLE} (
+    tokio::task::spawn_blocking(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut conn = pool.get()?;
+            sql_query(format!(
+                "CREATE TABLE IF NOT EXISTS {BUSINESS_TABLE} (
                 id TEXT PRIMARY KEY,
                 recipient TEXT NOT NULL
             )"
-        ))
-        .execute(&mut conn)?;
-        Ok(())
-    })
+            ))
+            .execute(&mut conn)?;
+            Ok(())
+        },
+    )
     .await??;
     Ok(())
 }
 
-async fn cleanup(
-    backend_pool: &PgPool,
-    apalis_pool: &PgPool,
-    queue: &str,
-) -> Result<(), BoxError> {
+async fn cleanup(backend_pool: &PgPool, apalis_pool: &PgPool, queue: &str) -> Result<(), BoxError> {
     let queue = queue.to_owned();
     let backend_pool = backend_pool.clone();
     let apalis_pool = apalis_pool.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut conn = backend_pool.get()?;
-        sql_query(format!("DELETE FROM {BUSINESS_TABLE}")).execute(&mut conn)?;
-        let mut conn = apalis_pool.get()?;
-        sql_query("DELETE FROM apalis.jobs WHERE job_type = $1")
-            .bind::<Text, _>(&queue)
-            .execute(&mut conn)?;
-        Ok(())
-    })
+    tokio::task::spawn_blocking(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut conn = backend_pool.get()?;
+            sql_query(format!("DELETE FROM {BUSINESS_TABLE}")).execute(&mut conn)?;
+            let mut conn = apalis_pool.get()?;
+            sql_query("DELETE FROM apalis.jobs WHERE job_type = $1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)?;
+            Ok(())
+        },
+    )
     .await??;
     Ok(())
 }
@@ -313,10 +311,11 @@ async fn print_counts(pool: &PgPool, queue: String) -> Result<(), BoxError> {
     let (jobs, orders) = tokio::task::spawn_blocking(
         move || -> Result<(i64, i64), Box<dyn std::error::Error + Send + Sync>> {
             let mut conn = pool.get()?;
-            let jobs = sql_query("SELECT COUNT(*)::bigint AS n FROM apalis.jobs WHERE job_type = $1")
-                .bind::<Text, _>(&queue)
-                .get_result::<CountRow>(&mut conn)?
-                .n;
+            let jobs =
+                sql_query("SELECT COUNT(*)::bigint AS n FROM apalis.jobs WHERE job_type = $1")
+                    .bind::<Text, _>(&queue)
+                    .get_result::<CountRow>(&mut conn)?
+                    .n;
             let orders = sql_query(format!(
                 "SELECT COUNT(*)::bigint AS n FROM {BUSINESS_TABLE}"
             ))

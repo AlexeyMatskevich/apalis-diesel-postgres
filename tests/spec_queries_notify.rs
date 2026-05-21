@@ -32,9 +32,7 @@ mod support;
 use std::time::Duration;
 
 use apalis_core::{backend::Backend, worker::context::WorkerContext};
-use apalis_diesel_postgres::{
-    Config, PgPool, PgTask, PostgresStorage, build_pool_with, setup,
-};
+use apalis_diesel_postgres::{Config, PgPool, PgTask, PostgresStorage, build_pool_with, setup};
 use diesel::{PgConnection, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
 use lets_expect::{AssertionError, AssertionResult, *};
@@ -448,12 +446,10 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
     let queue_for_publish = queue.clone();
     let row_id_for_publish = row_id.clone();
     with_conn(pool.clone(), move |conn| {
-        sql_query(
-            "UPDATE apalis.jobs SET run_at = now() - INTERVAL '1 second' WHERE id = $1",
-        )
-        .bind::<Text, _>(&row_id_for_publish)
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
+        sql_query("UPDATE apalis.jobs SET run_at = now() - INTERVAL '1 second' WHERE id = $1")
+            .bind::<Text, _>(&row_id_for_publish)
+            .execute(conn)
+            .map_err(|e| e.to_string())?;
         let payload = serde_json::json!({
             "job_type": queue_for_publish,
             "id": row_id_for_publish,
@@ -482,8 +478,8 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
     .map_err(|_| "timed out waiting for legacy-shape NOTIFY to surface".to_owned())??;
 
     drop(stream);
-    let received_id = received
-        .and_then(|t: PgTask<String>| t.parts.task_id.map(|id| id.to_string()));
+    let received_id =
+        received.and_then(|t: PgTask<String>| t.parts.task_id.map(|id| id.to_string()));
 
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(LegacyShapeRun {
@@ -496,8 +492,8 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
 // assertions
 // --------------------------------------------------------------------------
 
-fn produced_exactly_one_payload()
--> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult {
+fn produced_exactly_one_payload() -> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult
+{
     observe::<TriggerRun, _>("payload count", |run| {
         if run.payloads.len() == 1 {
             Ok(())
@@ -525,8 +521,8 @@ fn produced_no_payload() -> impl Fn(&Result<Outcome<TriggerRun>, String>) -> Ass
     })
 }
 
-fn payload_uses_ids_array_shape()
--> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult {
+fn payload_uses_ids_array_shape() -> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult
+{
     observe::<TriggerRun, _>("payload shape", |run| {
         let Some(payload) = run.payloads.first() else {
             return Err("no payloads captured to inspect shape".into());
@@ -546,8 +542,8 @@ fn payload_uses_ids_array_shape()
     })
 }
 
-fn payload_carries_a_single_id()
--> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult {
+fn payload_carries_a_single_id() -> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult
+{
     observe::<TriggerRun, _>("payload ids length", |run| {
         let Some(payload) = run.payloads.first() else {
             return Err("no payloads captured".into());
@@ -564,8 +560,9 @@ fn payload_carries_a_single_id()
     })
 }
 
-fn payloads_are_chunked_at_one_hundred(expected_total: usize)
--> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult {
+fn payloads_are_chunked_at_one_hundred(
+    expected_total: usize,
+) -> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult {
     observe::<TriggerRun, _>("payload chunking", move |run| {
         if run.payloads.is_empty() {
             return Err("no payloads captured".into());

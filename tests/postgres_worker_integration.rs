@@ -177,7 +177,9 @@ async fn run_worker_integration(handler_outcome: HandlerOutcome) -> Result<Worke
             done.notify_one();
             match handler_outcome {
                 HandlerOutcome::Ok => Ok(()),
-                HandlerOutcome::Err => Err::<(), BoxDynError>("handler intentionally failed".into()),
+                HandlerOutcome::Err => {
+                    Err::<(), BoxDynError>("handler intentionally failed".into())
+                }
             }
         }
     };
@@ -260,11 +262,13 @@ where
     }
 }
 
-fn handler_was_invoked_exactly_once()
--> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult {
-    observe("handler invocation count", |run| match run.handler_invocations {
-        1 => Ok(()),
-        n => Err(format!("expected exactly 1 handler invocation, got {n}")),
+fn handler_was_invoked_exactly_once() -> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult
+{
+    observe("handler invocation count", |run| {
+        match run.handler_invocations {
+            1 => Ok(()),
+            n => Err(format!("expected exactly 1 handler invocation, got {n}")),
+        }
     })
 }
 
@@ -280,8 +284,7 @@ fn in_handler_push_succeeded_exactly_once()
     })
 }
 
-fn email_terminal_status_is_done()
--> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult {
+fn email_terminal_status_is_done() -> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult {
     observe("email terminal status", |run| match &run.email_status {
         Some(Status::Done) => Ok(()),
         Some(other) => Err(format!("expected Status::Done, got {other:?}")),
@@ -289,8 +292,8 @@ fn email_terminal_status_is_done()
     })
 }
 
-fn email_terminal_status_is_not_done()
--> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult {
+fn email_terminal_status_is_not_done() -> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult
+{
     observe("email terminal status (err branch)", |run| {
         match &run.email_status {
             Some(Status::Done) => {

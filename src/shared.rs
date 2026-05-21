@@ -111,9 +111,7 @@ impl<Codec> SharedPostgresStorage<Codec> {
                                 exit_listener(
                                     &registry,
                                     &listener_alive,
-                                    Some(format!(
-                                        "failed to receive shared notification: {error}"
-                                    )),
+                                    Some(format!("failed to receive shared notification: {error}")),
                                 );
                                 return;
                             }
@@ -194,11 +192,7 @@ impl<Codec> SharedPostgresStorage<Codec> {
 /// spawning a fresh listener; (b) listener runs first, sees an empty registry,
 /// stores `false`, and a subsequent registrant spawns. Without this serialization
 /// a registrant could observe stale `true` and skip spawn.
-fn exit_listener(
-    registry: &SharedRegistry,
-    listener_alive: &AtomicBool,
-    error: Option<String>,
-) {
+fn exit_listener(registry: &SharedRegistry, listener_alive: &AtomicBool, error: Option<String>) {
     match registry.lock() {
         Ok(mut guard) => {
             if let Some(message) = error {

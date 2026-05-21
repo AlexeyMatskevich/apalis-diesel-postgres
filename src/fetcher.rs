@@ -11,12 +11,20 @@ use std::{
 };
 
 use apalis_core::{
-    backend::{TaskStream, codec::Codec, poll_strategy::{PollContext, PollStrategyExt}},
+    backend::{
+        TaskStream,
+        codec::Codec,
+        poll_strategy::{PollContext, PollStrategyExt},
+    },
     task::Task,
     timer::Delay,
     worker::context::WorkerContext,
 };
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, future::{BoxFuture, ready}, stream};
+use futures::{
+    FutureExt, Stream, StreamExt, TryFutureExt,
+    future::{BoxFuture, ready},
+    stream,
+};
 
 use crate::{CompactType, Config, Error, PgContext, PgPool, PgTask, queries};
 

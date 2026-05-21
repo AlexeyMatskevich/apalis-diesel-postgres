@@ -241,7 +241,11 @@ struct WorkerRow {
     last_seen_age_secs: i64,
 }
 
-async fn worker_row(pool: PgPool, queue: String, worker_id: String) -> Result<Option<WorkerRow>, String> {
+async fn worker_row(
+    pool: PgPool,
+    queue: String,
+    worker_id: String,
+) -> Result<Option<WorkerRow>, String> {
     with_conn(pool, move |conn| {
         sql_query(
             "SELECT lease_token,
@@ -475,13 +479,16 @@ async fn run_reenqueue(setup: ReenqueueSetup) -> Result<Outcome<ReenqueueRun>, S
     }))
 }
 
-fn reenqueue_touched_one_row()
--> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
+fn reenqueue_touched_one_row() -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult
+{
     observe::<ReenqueueRun, _>("reenqueue affected", |run| {
         if run.affected == 1 {
             Ok(())
         } else {
-            Err(format!("expected exactly one row to be re-enqueued, got {}", run.affected))
+            Err(format!(
+                "expected exactly one row to be re-enqueued, got {}",
+                run.affected
+            ))
         }
     })
 }
@@ -500,8 +507,9 @@ fn reenqueue_left_row_untouched()
     })
 }
 
-fn reenqueue_row_status(expected: &'static str)
--> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
+fn reenqueue_row_status(
+    expected: &'static str,
+) -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
     observe::<ReenqueueRun, _>("reenqueue row status", move |run| {
         if run.status == expected {
             Ok(())
@@ -511,19 +519,23 @@ fn reenqueue_row_status(expected: &'static str)
     })
 }
 
-fn reenqueue_row_attempts(expected: i32)
--> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
+fn reenqueue_row_attempts(
+    expected: i32,
+) -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
     observe::<ReenqueueRun, _>("reenqueue row attempts", move |run| {
         if run.attempts == expected {
             Ok(())
         } else {
-            Err(format!("expected attempts={expected}, got {}", run.attempts))
+            Err(format!(
+                "expected attempts={expected}, got {}",
+                run.attempts
+            ))
         }
     })
 }
 
-fn reenqueue_clears_lock_by()
--> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
+fn reenqueue_clears_lock_by() -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult
+{
     observe::<ReenqueueRun, _>("reenqueue clears lock_by", |run| {
         if run.lock_by.is_none() {
             Ok(())
@@ -548,7 +560,9 @@ fn reenqueue_preserves_last_result()
 -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
     observe::<ReenqueueRun, _>("reenqueue preserves last_result", |run| {
         match &run.last_result_value {
-            Some(value) if value.get("Ok").and_then(Value::as_str) == Some("preserved-result") => Ok(()),
+            Some(value) if value.get("Ok").and_then(Value::as_str) == Some("preserved-result") => {
+                Ok(())
+            }
             other => Err(format!(
                 "expected pre-existing last_result to remain (Ok: preserved-result), got {other:?}"
             )),
@@ -644,8 +658,8 @@ async fn run_register(setup: RegisterSetup) -> Result<Outcome<RegisterRun>, Stri
     }))
 }
 
-fn register_inserted_one_row()
--> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
+fn register_inserted_one_row() -> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult
+{
     observe::<RegisterRun, _>("register affected=1", |run| {
         if run.affected == 1 {
             Ok(())
@@ -655,8 +669,7 @@ fn register_inserted_one_row()
     })
 }
 
-fn register_was_blocked()
--> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
+fn register_was_blocked() -> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
     observe::<RegisterRun, _>("register affected=0", |run| {
         if run.affected == 0 {
             Ok(())
@@ -669,12 +682,15 @@ fn register_was_blocked()
     })
 }
 
-fn register_stored_token_equals(expected: &'static str)
--> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
+fn register_stored_token_equals(
+    expected: &'static str,
+) -> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
     observe::<RegisterRun, _>("register stored token", move |run| {
         match &run.stored_lease_token {
             Some(t) if t == expected => Ok(()),
-            other => Err(format!("expected stored lease_token={expected:?}, got {other:?}")),
+            other => Err(format!(
+                "expected stored lease_token={expected:?}, got {other:?}"
+            )),
         }
     })
 }
@@ -762,8 +778,7 @@ async fn run_keep_alive(setup: KeepAliveSetup) -> Result<Outcome<KeepAliveRun>, 
     }))
 }
 
-fn keep_alive_refreshed()
--> impl Fn(&Result<Outcome<KeepAliveRun>, String>) -> AssertionResult {
+fn keep_alive_refreshed() -> impl Fn(&Result<Outcome<KeepAliveRun>, String>) -> AssertionResult {
     observe::<KeepAliveRun, _>("keep_alive refreshed", |run| {
         if run.affected != 1 {
             return Err(format!("expected affected=1, got {}", run.affected));
@@ -778,8 +793,7 @@ fn keep_alive_refreshed()
     })
 }
 
-fn keep_alive_no_match()
--> impl Fn(&Result<Outcome<KeepAliveRun>, String>) -> AssertionResult {
+fn keep_alive_no_match() -> impl Fn(&Result<Outcome<KeepAliveRun>, String>) -> AssertionResult {
     observe::<KeepAliveRun, _>("keep_alive no match", |run| {
         if run.affected == 0 {
             Ok(())
@@ -792,8 +806,8 @@ fn keep_alive_no_match()
     })
 }
 
-fn keep_alive_did_not_refresh()
--> impl Fn(&Result<Outcome<KeepAliveRun>, String>) -> AssertionResult {
+fn keep_alive_did_not_refresh() -> impl Fn(&Result<Outcome<KeepAliveRun>, String>) -> AssertionResult
+{
     observe::<KeepAliveRun, _>("keep_alive stale", |run| match run.last_seen_age_after {
         Some(age) if age >= 20 => Ok(()),
         Some(age) => Err(format!(

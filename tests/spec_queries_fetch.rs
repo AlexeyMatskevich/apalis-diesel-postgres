@@ -287,7 +287,10 @@ async fn run_empty_queue() -> Result<Outcome<FetchRun>, String> {
 
 // ----- 2./3. buffer vs available -----------------------------------------
 
-async fn run_buffer_sizes(buffer_size: i32, seed_count: usize) -> Result<Outcome<FetchRun>, String> {
+async fn run_buffer_sizes(
+    buffer_size: i32,
+    seed_count: usize,
+) -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
@@ -301,8 +304,17 @@ async fn run_buffer_sizes(buffer_size: i32, seed_count: usize) -> Result<Outcome
         // Use distinct run_at offsets so ORDER BY priority DESC, run_at ASC is
         // deterministic (older first).
         let offset = -(10 + i as i64);
-        let id =
-            insert_row(pool.clone(), queue.clone(), "buf", "Pending", 0, 25, offset, 0).await?;
+        let id = insert_row(
+            pool.clone(),
+            queue.clone(),
+            "buf",
+            "Pending",
+            0,
+            25,
+            offset,
+            0,
+        )
+        .await?;
         seeded_ids.push(id);
     }
     let rows = fetch_next_sql(pool.clone(), queue.clone(), worker_id.clone(), buffer_size).await?;
@@ -369,17 +381,7 @@ async fn run_run_at_boundary() -> Result<Outcome<FetchRun>, String> {
     // Use offset 0 → run_at = now() at insert time. By the time fetch runs,
     // run_at is slightly in the past, which is the boundary direction we care
     // about: the predicate is `run_at <= now()`, inclusive.
-    let id = insert_row(
-        pool.clone(),
-        queue.clone(),
-        "now",
-        "Pending",
-        0,
-        25,
-        0,
-        0,
-    )
-    .await?;
+    let id = insert_row(pool.clone(), queue.clone(), "now", "Pending", 0, 25, 0, 0).await?;
 
     let rows = fetch_next_sql(pool.clone(), queue.clone(), worker_id.clone(), 10).await?;
     cleanup_queue(pool, queue.clone()).await?;
@@ -406,10 +408,28 @@ async fn run_equal_priority_tie_break() -> Result<Outcome<FetchRun>, String> {
     // Insert NEWER first, OLDER second. Both have priority=5. A correct
     // ORDER BY priority DESC, run_at ASC returns OLDER before NEWER, so the
     // result order must be the *reverse* of insert order.
-    let newer =
-        insert_row(pool.clone(), queue.clone(), "newer", "Pending", 0, 25, -10, 5).await?;
-    let older =
-        insert_row(pool.clone(), queue.clone(), "older", "Pending", 0, 25, -60, 5).await?;
+    let newer = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "newer",
+        "Pending",
+        0,
+        25,
+        -10,
+        5,
+    )
+    .await?;
+    let older = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "older",
+        "Pending",
+        0,
+        25,
+        -60,
+        5,
+    )
+    .await?;
 
     let rows = fetch_next_sql(pool.clone(), queue.clone(), worker_id.clone(), 10).await?;
     cleanup_queue(pool, queue.clone()).await?;
@@ -436,10 +456,18 @@ async fn run_priority_desc_ordering() -> Result<Outcome<FetchRun>, String> {
     // Insert LOW priority first with an OLDER run_at, so the only signal that
     // can produce the correct order is `priority DESC` — `run_at ASC` alone
     // would otherwise put the low-priority row first.
-    let low =
-        insert_row(pool.clone(), queue.clone(), "low", "Pending", 0, 25, -60, 0).await?;
-    let high =
-        insert_row(pool.clone(), queue.clone(), "high", "Pending", 0, 25, -10, 10).await?;
+    let low = insert_row(pool.clone(), queue.clone(), "low", "Pending", 0, 25, -60, 0).await?;
+    let high = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "high",
+        "Pending",
+        0,
+        25,
+        -10,
+        10,
+    )
+    .await?;
 
     let rows = fetch_next_sql(pool.clone(), queue.clone(), worker_id.clone(), 10).await?;
     cleanup_queue(pool, queue.clone()).await?;
@@ -521,7 +549,9 @@ fn fetched_no_rows() -> impl Fn(&Result<Outcome<FetchRun>, String>) -> Assertion
     })
 }
 
-fn fetched_row_count(expected: usize) -> impl Fn(&Result<Outcome<FetchRun>, String>) -> AssertionResult {
+fn fetched_row_count(
+    expected: usize,
+) -> impl Fn(&Result<Outcome<FetchRun>, String>) -> AssertionResult {
     observe::<FetchRun, _>("fetch row count", move |run| {
         if run.rows.len() == expected {
             Ok(())

@@ -262,11 +262,7 @@ where
     /// - [`Error::InvalidArgument`] if serialized metadata exceeds the byte
     ///   cap, or for unreachable `run_at`.
     /// - [`Error::Database`] for SQL/driver failures.
-    pub fn push_with_conn(
-        &self,
-        conn: &mut PgConnection,
-        args: Args,
-    ) -> Result<PgTaskId, Error> {
+    pub fn push_with_conn(&self, conn: &mut PgConnection, args: Args) -> Result<PgTaskId, Error> {
         let encoded = EncodeCodec::encode(&args).map_err(|err| Error::Decode(Box::new(err)))?;
         let task_id = PgTaskId::new(Ulid::new());
         let mut task = PgTask::<CompactType>::new(encoded);
@@ -301,7 +297,10 @@ where
     ) -> Result<PgTaskId, Error> {
         let encoded =
             EncodeCodec::encode(&task.args).map_err(|err| Error::Decode(Box::new(err)))?;
-        let task_id = task.parts.task_id.unwrap_or_else(|| PgTaskId::new(Ulid::new()));
+        let task_id = task
+            .parts
+            .task_id
+            .unwrap_or_else(|| PgTaskId::new(Ulid::new()));
         let mut compact = PgTask::<CompactType> {
             args: encoded,
             parts: task.parts,

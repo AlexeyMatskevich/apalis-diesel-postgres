@@ -76,7 +76,10 @@ impl<Args, Codec> PgSink<Args, Codec> {
     /// Whether `poll_ready` must drive a flush before accepting more work —
     /// either a flush is already in flight, or the buffer is at capacity.
     fn needs_flush_before_ready(&mut self) -> bool {
-        self.flush_future.get_mut().expect("flush_future mutex poisoned").is_some()
+        self.flush_future
+            .get_mut()
+            .expect("flush_future mutex poisoned")
+            .is_some()
             || self.buffer.len() >= self.capacity()
     }
 
@@ -319,8 +322,7 @@ mod tests {
     fn cloned_sink_state_drops_flush_future() -> bool {
         let mut sink = sink(3);
         sink.buffer.push(task());
-        sink.flush_future =
-            Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
+        sink.flush_future = Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
         sink.clone()
             .flush_future
             .get_mut()

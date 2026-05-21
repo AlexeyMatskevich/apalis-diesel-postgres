@@ -260,23 +260,26 @@ async fn run_status_filter(setup: StatusFilterSetup) -> Result<Outcome<StatusFil
     // Seed one row per status. Pending uses no done_at; terminals do.
     let pending = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
     let done = insert_job(pool.clone(), queue.clone(), "Done", 5, Some(1), 1, 3).await?;
-    let failed = insert_job(
-        pool.clone(),
-        queue.clone(),
-        "Failed",
-        5,
-        Some(1),
-        3,
-        3,
-    )
-    .await?;
+    let failed = insert_job(pool.clone(), queue.clone(), "Failed", 5, Some(1), 3, 3).await?;
     let killed = insert_job(pool.clone(), queue.clone(), "Killed", 5, Some(1), 1, 3).await?;
 
     let (expected_id, other_status_ids) = match setup.filter_status {
-        Status::Pending => (pending.clone(), vec![done.clone(), failed.clone(), killed.clone()]),
-        Status::Done => (done.clone(), vec![pending.clone(), failed.clone(), killed.clone()]),
-        Status::Failed => (failed.clone(), vec![pending.clone(), done.clone(), killed.clone()]),
-        Status::Killed => (killed.clone(), vec![pending.clone(), done.clone(), failed.clone()]),
+        Status::Pending => (
+            pending.clone(),
+            vec![done.clone(), failed.clone(), killed.clone()],
+        ),
+        Status::Done => (
+            done.clone(),
+            vec![pending.clone(), failed.clone(), killed.clone()],
+        ),
+        Status::Failed => (
+            failed.clone(),
+            vec![pending.clone(), done.clone(), killed.clone()],
+        ),
+        Status::Killed => (
+            killed.clone(),
+            vec![pending.clone(), done.clone(), failed.clone()],
+        ),
         other => return Err(format!("unsupported status in this matrix: {other:?}")),
     };
 
@@ -377,8 +380,7 @@ async fn run_order_by_run_at() -> Result<Outcome<OrderRun>, String> {
     }))
 }
 
-fn newer_run_at_listed_first()
--> impl Fn(&Result<Outcome<OrderRun>, String>) -> AssertionResult {
+fn newer_run_at_listed_first() -> impl Fn(&Result<Outcome<OrderRun>, String>) -> AssertionResult {
     observe::<OrderRun, _>("order by run_at DESC", |run| {
         if run.first_id == run.newer_id && run.second_id == run.older_id {
             Ok(())
@@ -408,7 +410,9 @@ enum PaginationOutcome {
     OtherError(#[allow(dead_code)] String),
 }
 
-async fn run_pagination(setup: PaginationSetup) -> Result<Outcome<(PaginationOutcome, Vec<String>)>, String> {
+async fn run_pagination(
+    setup: PaginationSetup,
+) -> Result<Outcome<(PaginationOutcome, Vec<String>)>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
@@ -453,7 +457,8 @@ async fn run_pagination(setup: PaginationSetup) -> Result<Outcome<(PaginationOut
             // Match the variant by Display surface — `Error::InvalidArgument`
             // formats with "invalid argument" prefix.
             let s = err.to_string();
-            if s.to_ascii_lowercase().contains("filter.page") || s.to_ascii_lowercase().contains("invalid")
+            if s.to_ascii_lowercase().contains("filter.page")
+                || s.to_ascii_lowercase().contains("invalid")
             {
                 PaginationOutcome::InvalidArgument
             } else {
@@ -472,20 +477,18 @@ fn pagination_returns_expected_slice(
     start: usize,
     len: usize,
 ) -> impl Fn(&PaginationRun) -> AssertionResult {
-    observe::<(PaginationOutcome, Vec<String>), _>("pagination slice", move |run| {
-        match &run.0 {
-            PaginationOutcome::Ok { ids } => {
-                let expected = &run.1[start..(start + len).min(run.1.len())];
-                if ids == expected {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "expected slice {expected:?} starting at {start} len {len}, got {ids:?}"
-                    ))
-                }
+    observe::<(PaginationOutcome, Vec<String>), _>("pagination slice", move |run| match &run.0 {
+        PaginationOutcome::Ok { ids } => {
+            let expected = &run.1[start..(start + len).min(run.1.len())];
+            if ids == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected slice {expected:?} starting at {start} len {len}, got {ids:?}"
+                ))
             }
-            other => Err(format!("expected Ok response, got {other:?}")),
         }
+        other => Err(format!("expected Ok response, got {other:?}")),
     })
 }
 
@@ -669,8 +672,10 @@ async fn run_metrics_terminal_mix() -> Result<Outcome<MetricsRun>, String> {
 /// the SQL builds `value AS REAL` from a COUNT(*) so the integer rendering
 /// is what Postgres chooses. Accept any representation parseable to the
 /// expected count.
-fn metric_counts_at_least(title: &'static str, expected: f64)
--> impl Fn(&MetricsRun) -> Result<(), String> {
+fn metric_counts_at_least(
+    title: &'static str,
+    expected: f64,
+) -> impl Fn(&MetricsRun) -> Result<(), String> {
     move |run: &MetricsRun| {
         let value_opt = match title {
             "DONE_JOBS" => &run.done_jobs,
@@ -696,8 +701,10 @@ fn metric_counts_at_least(title: &'static str, expected: f64)
     }
 }
 
-fn metric_value_is(title: &'static str, expected: f64)
--> impl Fn(&Result<Outcome<MetricsRun>, String>) -> AssertionResult {
+fn metric_value_is(
+    title: &'static str,
+    expected: f64,
+) -> impl Fn(&Result<Outcome<MetricsRun>, String>) -> AssertionResult {
     let body = metric_counts_at_least(title, expected);
     observe::<MetricsRun, _>(title, body)
 }

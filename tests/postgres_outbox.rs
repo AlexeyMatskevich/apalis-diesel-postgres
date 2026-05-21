@@ -202,11 +202,7 @@ async fn run_commit_scenario() -> Result<Outcome<CommitRun>, String> {
     let observed = with_conn(pool.clone(), move |conn| {
         let job = fetch_job(conn, &q2)?
             .ok_or_else(|| "expected one job after commit, found none".to_owned())?;
-        Ok::<_, String>((
-            job.id,
-            count_jobs(conn, &q2)?,
-            count_business(conn, &q2)?,
-        ))
+        Ok::<_, String>((job.id, count_jobs(conn, &q2)?, count_business(conn, &q2)?))
     })
     .await?;
 
@@ -285,42 +281,38 @@ async fn run_rollback_scenario() -> Result<Outcome<RollbackRun>, String> {
     // The outer transaction returns an error from its closure so Diesel
     // rolls it back. We capture the inner `push_with_conn` result before
     // forcing the rollback to confirm the call itself was Ok at the time.
-    let push_result_was_ok =
-        tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let mut conn = pool_for_txn.get().map_err(|e| e.to_string())?;
-            let mut push_ok_observed = false;
-            let txn_result: Result<(), diesel::result::Error> = conn.transaction(|c| {
-                sql_query("INSERT INTO apalis_outbox_test_marker (key, queue) VALUES ($1, $2)")
-                    .bind::<Text, _>(&k)
-                    .bind::<Text, _>(&q)
-                    .execute(c)?;
-                // The outer rollback must be the ONLY reason this transaction
-                // aborts: a hidden `push_with_conn` failure would otherwise
-                // produce the same `RollbackTransaction` error and silently
-                // mask the broken path. Surface the push failure as a
-                // distinct error variant so the assertion below can tell the
-                // two cases apart.
-                storage
-                    .push_with_conn(c, "payload".to_owned())
-                    .map_err(|e| {
-                        diesel::result::Error::QueryBuilderError(
-                            format!("push_with_conn failed during rollback test: {e}").into(),
-                        )
-                    })?;
-                push_ok_observed = true;
-                // Now force the outer transaction to roll back.
-                Err(diesel::result::Error::RollbackTransaction)
-            });
-            // The push call must have completed Ok before the forced rollback,
-            // and the forced rollback must be the error we received.
-            Ok(push_ok_observed
-                && matches!(
-                    txn_result,
-                    Err(diesel::result::Error::RollbackTransaction)
-                ))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+    let push_result_was_ok = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let mut conn = pool_for_txn.get().map_err(|e| e.to_string())?;
+        let mut push_ok_observed = false;
+        let txn_result: Result<(), diesel::result::Error> = conn.transaction(|c| {
+            sql_query("INSERT INTO apalis_outbox_test_marker (key, queue) VALUES ($1, $2)")
+                .bind::<Text, _>(&k)
+                .bind::<Text, _>(&q)
+                .execute(c)?;
+            // The outer rollback must be the ONLY reason this transaction
+            // aborts: a hidden `push_with_conn` failure would otherwise
+            // produce the same `RollbackTransaction` error and silently
+            // mask the broken path. Surface the push failure as a
+            // distinct error variant so the assertion below can tell the
+            // two cases apart.
+            storage
+                .push_with_conn(c, "payload".to_owned())
+                .map_err(|e| {
+                    diesel::result::Error::QueryBuilderError(
+                        format!("push_with_conn failed during rollback test: {e}").into(),
+                    )
+                })?;
+            push_ok_observed = true;
+            // Now force the outer transaction to roll back.
+            Err(diesel::result::Error::RollbackTransaction)
+        });
+        // The push call must have completed Ok before the forced rollback,
+        // and the forced rollback must be the error we received.
+        Ok(push_ok_observed
+            && matches!(txn_result, Err(diesel::result::Error::RollbackTransaction)))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     let q2 = queue.clone();
     let (db_jobs, db_business) = with_conn(pool.clone(), move |conn| {
@@ -347,13 +339,15 @@ fn rollback_call_succeeded_before_outer_rollback()
     })
 }
 
-fn rollback_leaves_no_job()
--> impl Fn(&Result<Outcome<RollbackRun>, String>) -> AssertionResult {
+fn rollback_leaves_no_job() -> impl Fn(&Result<Outcome<RollbackRun>, String>) -> AssertionResult {
     observe("rollback→job count", |run: &RollbackRun| {
         if run.db_jobs == 0 {
             Ok(())
         } else {
-            Err(format!("expected 0 jobs after rollback, got {}", run.db_jobs))
+            Err(format!(
+                "expected 0 jobs after rollback, got {}",
+                run.db_jobs
+            ))
         }
     })
 }
@@ -406,7 +400,10 @@ async fn run_custom_fields_scenario() -> Result<Outcome<CustomRun>, String> {
         .as_secs()
         + 3_600) as i64;
     let mut expected_metadata = serde_json::Map::new();
-    expected_metadata.insert("reason".to_owned(), serde_json::Value::String("test".to_owned()));
+    expected_metadata.insert(
+        "reason".to_owned(),
+        serde_json::Value::String("test".to_owned()),
+    );
     expected_metadata.insert(
         "n".to_owned(),
         serde_json::Value::Number(serde_json::Number::from(7)),
@@ -483,13 +480,16 @@ fn custom_priority_is_stored() -> impl Fn(&Result<Outcome<CustomRun>, String>) -
     })
 }
 
-fn custom_max_attempts_is_stored()
--> impl Fn(&Result<Outcome<CustomRun>, String>) -> AssertionResult {
+fn custom_max_attempts_is_stored() -> impl Fn(&Result<Outcome<CustomRun>, String>) -> AssertionResult
+{
     observe("custom→max_attempts", |run: &CustomRun| {
         if run.db_max_attempts == 9 {
             Ok(())
         } else {
-            Err(format!("expected max_attempts=9, got {}", run.db_max_attempts))
+            Err(format!(
+                "expected max_attempts=9, got {}",
+                run.db_max_attempts
+            ))
         }
     })
 }
@@ -567,10 +567,8 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
             let mut conn = pool_for_seed.get().map_err(|e| e.to_string())?;
             let mut task = PgTask::<String>::new("payload-1".to_owned());
             task.parts.idempotency_key = Some(idem_for_seed);
-            conn.transaction::<_, PgError, _>(|c| {
-                storage.push_task_with_conn(c, task).map(|_| ())
-            })
-            .map_err(|e| e.to_string())
+            conn.transaction::<_, PgError, _>(|c| storage.push_task_with_conn(c, task).map(|_| ()))
+                .map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -598,9 +596,11 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
                 let mut task = PgTask::<String>::new("payload-2".to_owned());
                 task.parts.idempotency_key = Some(idem_for_run.clone());
                 match storage_for_run.push_task_with_conn(c, task) {
-                    Ok(_) => return Err(PgError::InvalidArgument(
-                        "expected idempotency conflict, got success".into(),
-                    )),
+                    Ok(_) => {
+                        return Err(PgError::InvalidArgument(
+                            "expected idempotency conflict, got success".into(),
+                        ));
+                    }
                     Err(PgError::InvalidArgument(msg)) if msg.contains("idempotency_key") => {
                         observed.set(true);
                     }

@@ -31,10 +31,10 @@ use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz},
 };
-use serde_json::Value;
-use std::sync::Arc;
 use futures::StreamExt;
 use lets_expect::{AssertionError, AssertionResult, *};
+use serde_json::Value;
+use std::sync::Arc;
 use ulid::Ulid;
 
 // --------------------------------------------------------------------------
@@ -1134,8 +1134,7 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Seed the queue with one row that occupies the idempotency_key slot.
-    let mut seed_storage =
-        PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut seed_storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let seed = TaskBuilder::new("seed".to_owned())
         .with_task_id(task_id())
         .run_at_timestamp(now_unix())
@@ -1143,7 +1142,10 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
         .with_ctx(SqlContext::new().with_max_attempts(5))
         .with_idempotency_key("shared-key")
         .build();
-    seed_storage.push_task(seed).await.map_err(|e| e.to_string())?;
+    seed_storage
+        .push_task(seed)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Build a 3-task batch with the same idempotency_key. With buffer_size=3
     // and a single `send_all` the entire batch flushes through one
@@ -1191,18 +1193,12 @@ fn partial_batch_rejects_with_count()
 -> impl Fn(&Result<Outcome<PartialBatchRun>, String>) -> AssertionResult {
     observe::<PartialBatchRun, _>("partial-batch reject", |run| {
         match run.push_error.as_deref() {
-            Some(msg)
-                if msg.contains("idempotency_key conflict")
-                    && msg.contains("of") =>
-            {
-                Ok(())
-            }
+            Some(msg) if msg.contains("idempotency_key conflict") && msg.contains("of") => Ok(()),
             Some(other) => Err(format!(
                 "expected InvalidArgument citing 'idempotency_key conflict: M of N', got {other:?}"
             )),
             None => Err(
-                "expected push_all to be rejected when every task in the batch conflicts"
-                    .into(),
+                "expected push_all to be rejected when every task in the batch conflicts".into(),
             ),
         }
     })
@@ -1292,11 +1288,12 @@ async fn run_metadata_cap(meta_payload_len: usize) -> Result<Outcome<MetadataCap
     }))
 }
 
-fn metadata_cap_succeeds()
--> impl Fn(&Result<Outcome<MetadataCapRun>, String>) -> AssertionResult {
+fn metadata_cap_succeeds() -> impl Fn(&Result<Outcome<MetadataCapRun>, String>) -> AssertionResult {
     observe::<MetadataCapRun, _>("metadata under cap", |run| {
         if let Some(err) = &run.push_error {
-            Err(format!("expected push to succeed under the cap, got error: {err}"))
+            Err(format!(
+                "expected push to succeed under the cap, got error: {err}"
+            ))
         } else if !run.row_present {
             Err("expected the row to land in apalis.jobs after a successful push".into())
         } else {
@@ -1305,8 +1302,7 @@ fn metadata_cap_succeeds()
     })
 }
 
-fn metadata_cap_rejects()
--> impl Fn(&Result<Outcome<MetadataCapRun>, String>) -> AssertionResult {
+fn metadata_cap_rejects() -> impl Fn(&Result<Outcome<MetadataCapRun>, String>) -> AssertionResult {
     observe::<MetadataCapRun, _>("metadata over cap", |run| match run.push_error.as_deref() {
         Some(msg) if msg.contains("metadata") && msg.contains("cap") => Ok(()),
         Some(other) => Err(format!(
@@ -1388,7 +1384,9 @@ fn idempotency_cap_succeeds()
 -> impl Fn(&Result<Outcome<IdempotencyCapRun>, String>) -> AssertionResult {
     observe::<IdempotencyCapRun, _>("idempotency under cap", |run| {
         if let Some(err) = &run.push_error {
-            Err(format!("expected push to succeed under the cap, got error: {err}"))
+            Err(format!(
+                "expected push to succeed under the cap, got error: {err}"
+            ))
         } else if !run.row_present {
             Err("expected the row to land in apalis.jobs after a successful push".into())
         } else {
@@ -1399,12 +1397,14 @@ fn idempotency_cap_succeeds()
 
 fn idempotency_cap_rejects()
 -> impl Fn(&Result<Outcome<IdempotencyCapRun>, String>) -> AssertionResult {
-    observe::<IdempotencyCapRun, _>("idempotency over cap", |run| match run.push_error.as_deref() {
-        Some(msg) if msg.contains("idempotency_key") && msg.contains("cap") => Ok(()),
-        Some(other) => Err(format!(
-            "expected InvalidArgument citing the idempotency_key cap, got {other:?}"
-        )),
-        None => Err("expected push to be rejected for oversize idempotency_key".into()),
+    observe::<IdempotencyCapRun, _>("idempotency over cap", |run| {
+        match run.push_error.as_deref() {
+            Some(msg) if msg.contains("idempotency_key") && msg.contains("cap") => Ok(()),
+            Some(other) => Err(format!(
+                "expected InvalidArgument citing the idempotency_key cap, got {other:?}"
+            )),
+            None => Err("expected push to be rejected for oversize idempotency_key".into()),
+        }
     })
 }
 
@@ -1483,8 +1483,8 @@ async fn run_queue_name_cap(name_len: usize) -> Result<Outcome<QueueNameCapRun>,
     }))
 }
 
-fn queue_name_cap_succeeds()
--> impl Fn(&Result<Outcome<QueueNameCapRun>, String>) -> AssertionResult {
+fn queue_name_cap_succeeds() -> impl Fn(&Result<Outcome<QueueNameCapRun>, String>) -> AssertionResult
+{
     observe::<QueueNameCapRun, _>("queue name under cap", |run| {
         if let Some(err) = &run.push_error {
             Err(format!(
@@ -1499,14 +1499,16 @@ fn queue_name_cap_succeeds()
     })
 }
 
-fn queue_name_cap_rejects()
--> impl Fn(&Result<Outcome<QueueNameCapRun>, String>) -> AssertionResult {
-    observe::<QueueNameCapRun, _>("queue name over cap", |run| match run.push_error.as_deref() {
-        Some(msg) if msg.contains("queue name") && msg.contains("cap") => Ok(()),
-        Some(other) => Err(format!(
-            "expected InvalidArgument citing the queue name cap, got {other:?}"
-        )),
-        None => Err("expected push to be rejected for oversize queue name".into()),
+fn queue_name_cap_rejects() -> impl Fn(&Result<Outcome<QueueNameCapRun>, String>) -> AssertionResult
+{
+    observe::<QueueNameCapRun, _>("queue name over cap", |run| {
+        match run.push_error.as_deref() {
+            Some(msg) if msg.contains("queue name") && msg.contains("cap") => Ok(()),
+            Some(other) => Err(format!(
+                "expected InvalidArgument citing the queue name cap, got {other:?}"
+            )),
+            None => Err("expected push to be rejected for oversize queue name".into()),
+        }
     })
 }
 
@@ -1557,12 +1559,10 @@ struct AckPredicateRun {
 async fn job_status_row(pool: PgPool, id: PgTaskId) -> Result<AckStatusRow, String> {
     let id_s = id.to_string();
     with_conn(pool, move |conn| {
-        sql_query(
-            "SELECT status, attempts, last_result FROM apalis.jobs WHERE id = $1",
-        )
-        .bind::<Text, _>(&id_s)
-        .get_result::<AckStatusRow>(conn)
-        .map_err(|e| e.to_string())
+        sql_query("SELECT status, attempts, last_result FROM apalis.jobs WHERE id = $1")
+            .bind::<Text, _>(&id_s)
+            .get_result::<AckStatusRow>(conn)
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -1756,8 +1756,7 @@ fn ack_succeeds() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> Asser
     })
 }
 
-fn ack_writes_done()
--> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
+fn ack_writes_done() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
     observe::<AckPredicateRun, _>("ack writes Done", |run| {
         if run.row_status == "Done" {
             Ok(())
@@ -1767,25 +1766,26 @@ fn ack_writes_done()
     })
 }
 
-fn ack_persists_result()
--> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
+fn ack_persists_result() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
     observe::<AckPredicateRun, _>("ack writes last_result", |run| match &run.row_last_result {
         Some(_) => Ok(()),
         None => Err("expected last_result to be populated after successful ack".into()),
     })
 }
 
-fn ack_rejected_as_stale()
--> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
+fn ack_rejected_as_stale() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult
+{
     observe::<AckPredicateRun, _>("ack rejected", |run| match run.ack_error.as_deref() {
         Some(msg) if msg.contains("stale acknowledgement") => Ok(()),
-        Some(other) => Err(format!("expected stale acknowledgement error, got {other:?}")),
+        Some(other) => Err(format!(
+            "expected stale acknowledgement error, got {other:?}"
+        )),
         None => Err("expected ack to be rejected as stale, but it succeeded".into()),
     })
 }
 
-fn ack_row_stays_running()
--> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
+fn ack_row_stays_running() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult
+{
     observe::<AckPredicateRun, _>("row stays Running", |run| {
         if run.row_status == "Running" {
             Ok(())
@@ -1809,8 +1809,9 @@ fn ack_row_keeps_null_last_result()
     })
 }
 
-fn ack_row_attempts(expected: i32)
--> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
+fn ack_row_attempts(
+    expected: i32,
+) -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
     observe::<AckPredicateRun, _>("row attempts", move |run| {
         if run.row_attempts == expected {
             Ok(())
