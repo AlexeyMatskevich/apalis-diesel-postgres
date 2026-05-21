@@ -32,6 +32,9 @@ if [ ! -f .zed/settings.json ] || [ "$current_hash" != "$stored_hash" ]; then
   "languages": {
     "TOML": {
       "language_servers": ["taplo", "!package-version-server"]
+    },
+    "Nix": {
+      "language_servers": ["nixd", "!nil"]
     }
   }
 }

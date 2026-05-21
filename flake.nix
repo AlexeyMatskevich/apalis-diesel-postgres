@@ -80,7 +80,6 @@
 
               postgresql_18
               diesel-cli
-              cargo-llvm-cov
             ];
 
             nativeBuildInputs = [
