@@ -298,6 +298,7 @@ mod tests {
     /// the buffer and immediately polls it. Against an unreachable pool the
     /// inner `push_tasks` future resolves to Err on first poll, so this returns
     /// a `Ready(Err(...))` observation with the buffer drained.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     fn poll_flush_creates_future() -> FlushObservation {
         poll_flush_sink_with_state(2, 1, None)
     }
@@ -360,6 +361,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     fn poll_started_flush(result: &Poll<Result<(), Error>>) -> AssertionResult {
         match result {
             Poll::Pending | Poll::Ready(Err(_)) => Ok(()),
@@ -405,6 +407,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     fn observation_drained_buffer_into_future(obs: &FlushObservation) -> AssertionResult {
         if obs.buffer_len != 0 {
             return Err(AssertionError::new(vec![format!(

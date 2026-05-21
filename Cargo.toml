@@ -40,6 +40,7 @@ ulid = { version = "1", features = ["serde"] }
 [dev-dependencies]
 apalis = "1.0.0-rc.9"
 lets_expect = { version = "0.5", features = ["tokio"] }
+ntex = { version = "3", default-features = false, features = ["neon-polling"] }
 
 [features]
 default = ["tokio"]
@@ -53,3 +54,7 @@ required-features = ["tokio"]
 [[example]]
 name = "worker"
 required-features = ["tokio"]
+
+[[example]]
+name = "worker-ntex"
+required-features = ["ntex"]
