@@ -13,8 +13,7 @@ use apalis_core::{
     worker::context::WorkerContext,
 };
 use apalis_diesel_postgres::{
-    CompactType, Config, JsonCodec, PgPool, PgTask, PostgresStorage, SharedPostgresError,
-    SharedPostgresStorage, build_pool, setup,
+    CompactType, Config, JsonCodec, PgPool, PgTask, PostgresStorage, SharedPostgresStorage,
 };
 use diesel::{RunQueryDsl, sql_query, sql_types::Text};
 use futures::{StreamExt, stream};
@@ -34,7 +33,7 @@ struct IsolationRun {
 
 #[derive(Debug)]
 struct SharedDuplicateRun {
-    duplicate_namespace_error: bool,
+    second_registration_accepted: bool,
     delivered_payload: String,
 }
 
@@ -45,13 +44,7 @@ enum Outcome<T> {
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-
-    let pool = build_pool(database_url).map_err(|error| error.to_string())?;
-    setup(&pool).await.map_err(|error| error.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -187,16 +180,24 @@ async fn run_shared_delivery_and_duplicate() -> Result<Outcome<SharedDuplicateRu
         config.clone(),
     )
     .map_err(|error| error.to_string())?;
-    // Q6-rest broadcast redesign: multiple consumers per queue are now
-    // allowed (used to fail with `NamespaceExists`). Create a second handle
-    // explicitly so we have one for polling and one for pushing — clone is
-    // no longer available on `SharedFetcher`.
-    let poll_handle = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
+    // Broadcast redesign: a second registration on the SAME queue config is now
+    // accepted (it used to be rejected). Capture the real result so the
+    // assertion can genuinely fail if that ever regresses, then use the handle
+    // as a second consumer that must also receive the broadcast. `SharedFetcher`
+    // is not `Clone`, so the second consumer is created via a fresh
+    // `make_shared_with_config` rather than by cloning the first handle.
+    let second = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
         &mut shared,
         config,
-    )
-    .map_err(|error| error.to_string())?;
-    let duplicate: Result<_, SharedPostgresError> = Ok::<_, SharedPostgresError>(());
+    );
+    let second_registration_accepted = second.is_ok();
+    let Ok(poll_handle) = second else {
+        cleanup_queue(pool, queue).await?;
+        return Ok(Outcome::Completed(SharedDuplicateRun {
+            second_registration_accepted,
+            delivered_payload: String::new(),
+        }));
+    };
     let worker = WorkerContext::new::<()>(&format!("shared-worker-{queue}"));
     let mut stream = poll_handle.poll(&worker);
 
@@ -209,9 +210,7 @@ async fn run_shared_delivery_and_duplicate() -> Result<Outcome<SharedDuplicateRu
 
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(SharedDuplicateRun {
-        // Broadcast redesign accepts duplicates intentionally; field kept
-        // for the test struct shape but no longer meaningful.
-        duplicate_namespace_error: duplicate.is_ok(),
+        second_registration_accepted,
         delivered_payload: task.args,
     }))
 }
@@ -347,13 +346,16 @@ fn shared_delivery_payload_matches(
     })
 }
 
-fn shared_duplicate_rejected()
+fn shared_second_registration_accepted()
 -> impl Fn(&Result<Outcome<SharedDuplicateRun>, String>) -> AssertionResult {
-    check::<SharedDuplicateRun, _>("shared duplicate rejection", |run| {
-        if run.duplicate_namespace_error {
+    check::<SharedDuplicateRun, _>("shared second registration", |run| {
+        if run.second_registration_accepted {
             Ok(())
         } else {
-            Err("expected SharedPostgresError::NamespaceExists when reusing a queue config".into())
+            Err(
+                "expected the broadcast redesign to accept a second registration for the same queue config, but make_shared_with_config rejected it"
+                    .into(),
+            )
         }
     })
 }
@@ -379,12 +381,12 @@ lets_expect! { #tokio_test
     }
 
     expect(run_shared_delivery_and_duplicate().await) {
-        when shared_storage_serves_one_queue_and_a_duplicate_registration_is_attempted {
-            to delivers_the_pushed_payload {
+        when shared_storage_serves_one_queue_and_a_second_consumer_registers_on_it {
+            to delivers_the_pushed_payload_to_the_second_consumer {
                 shared_delivery_payload_matches("shared-payload")
             }
-            to rejects_a_duplicate_namespace_registration {
-                shared_duplicate_rejected()
+            to accepts_the_second_registration_for_the_same_queue {
+                shared_second_registration_accepted()
             }
         }
     }

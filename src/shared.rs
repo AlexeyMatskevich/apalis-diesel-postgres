@@ -44,7 +44,9 @@ type SharedRegistry = Arc<Mutex<RegistryMap>>;
 /// Factory for shared notify-backed PostgreSQL storage instances.
 ///
 /// A shared storage factory owns one listener thread and one pooled PostgreSQL
-/// connection for notifications. Each queue can be registered once.
+/// connection for notifications. A queue may be registered multiple times: the
+/// single listener broadcasts every notification to all consumers registered on
+/// the matching queue.
 pub struct SharedPostgresStorage<Codec = JsonCodec<CompactType>> {
     pool: PgPool,
     registry: SharedRegistry,
@@ -240,10 +242,6 @@ impl<Codec> std::fmt::Debug for SharedPostgresStorage<Codec> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SharedPostgresError {
-    /// Queue namespace already exists in the shared factory.
-    #[error("namespace already exists: {0}")]
-    NamespaceExists(String),
-
     /// Shared registry lock is poisoned.
     #[error("registry lock poisoned")]
     RegistryLocked,
@@ -609,8 +607,9 @@ mod tests {
         guard.get(&queue).map(Vec::len).unwrap_or(0)
     }
 
-    /// Re-registering a namespace that already lives in the registry must fail
-    /// with `NamespaceExists` carrying the queue name.
+    /// Re-registering a namespace that already lives in the registry now
+    /// succeeds: the broadcast redesign allows multiple consumers per queue, so
+    /// the second `make_shared_with_config` must also return `Ok`.
     fn double_make_shared_same_queue() -> Result<(), SharedPostgresError> {
         let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(unchecked_pool());
         let config = Config::new("double-make-shared");
@@ -734,11 +733,11 @@ mod tests {
     }
 
     fn is_registry_locked(error: &SharedPostgresError) -> AssertionResult {
+        // `RegistryLocked` is currently the only variant, so the match is
+        // exhaustive without a catch-all; adding a variant later will surface
+        // here as a compile error, which is the right place to revisit this.
         match error {
             SharedPostgresError::RegistryLocked => Ok(()),
-            other => Err(AssertionError::new(vec![format!(
-                "expected SharedPostgresError::RegistryLocked, got {other:?}"
-            )])),
         }
     }
 
@@ -792,8 +791,8 @@ mod tests {
         expect(double_make_shared_same_queue()) {
             when the_same_queue_is_registered_twice {
                 // Q6-rest broadcast redesign: multiple consumers per queue
-                // are now allowed (was `NamespaceExists` before). Listener
-                // broadcasts each event to every registered sender.
+                // are now allowed (a second registration used to be rejected).
+                // The listener broadcasts each event to every registered sender.
                 to accepts_the_second_registration { be_ok }
             }
         }
