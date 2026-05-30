@@ -381,7 +381,16 @@ async fn run_list_tasks_default_page_size() -> Result<Outcome<DefaultLimitRun>, 
     // Seed comfortably more than the default so the limit is the binding cap.
     // Distinct run_at keeps the ordering total and the cut deterministic.
     for i in 0..(default_limit + 2) {
-        insert_job(pool.clone(), queue.clone(), "Pending", 10 + i as i64, None, 0, 3).await?;
+        insert_job(
+            pool.clone(),
+            queue.clone(),
+            "Pending",
+            10 + i as i64,
+            None,
+            0,
+            3,
+        )
+        .await?;
     }
 
     let config = Config::new(&queue);
@@ -392,7 +401,11 @@ async fn run_list_tasks_default_page_size() -> Result<Outcome<DefaultLimitRun>, 
         page: 1,
         page_size: None,
     };
-    let returned_count = storage.list_tasks(&f).await.map_err(|e| e.to_string())?.len();
+    let returned_count = storage
+        .list_tasks(&f)
+        .await
+        .map_err(|e| e.to_string())?
+        .len();
 
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(DefaultLimitRun {

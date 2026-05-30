@@ -17,9 +17,7 @@ mod support;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use apalis_diesel_postgres::{
-    Config, Error as PgError, PgPool, PgTask, PgTaskId, PostgresStorage,
-};
+use apalis_diesel_postgres::{Config, Error as PgError, PgPool, PgTask, PgTaskId, PostgresStorage};
 use apalis_sql::{DateTimeExt, context::SqlContext};
 use diesel::{
     Connection, OptionalExtension, PgConnection, QueryableByName, RunQueryDsl, sql_query,

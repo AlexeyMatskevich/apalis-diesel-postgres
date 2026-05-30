@@ -144,10 +144,8 @@ async fn run_concurrent_setup() -> Result<Outcome, String> {
     let outcomes = futures::future::join_all((0..RACERS).map(|_| {
         let temp_url = temp_url.clone();
         async move {
-            let pool = build_pool_with(&temp_url, |builder| {
-                builder.max_size(2).min_idle(Some(0))
-            })
-            .map_err(|error| error.to_string())?;
+            let pool = build_pool_with(&temp_url, |builder| builder.max_size(2).min_idle(Some(0)))
+                .map_err(|error| error.to_string())?;
             let result = setup(&pool).await.map_err(|error| error.to_string());
             drop(pool); // close this racer's sessions before the database is dropped
             result
@@ -167,8 +165,10 @@ async fn drop_temp_db(maintenance_url: &str, db_name: &str) {
     let db_name = db_name.to_owned();
     let _ = tokio::task::spawn_blocking(move || {
         if let Ok(mut conn) = maintenance_conn(&maintenance_url) {
-            let _ = sql_query(format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"))
-                .execute(&mut conn);
+            let _ = sql_query(format!(
+                "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+            ))
+            .execute(&mut conn);
         }
     })
     .await;

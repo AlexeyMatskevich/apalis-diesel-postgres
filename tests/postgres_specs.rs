@@ -986,7 +986,10 @@ fn swap_database_name(url: &str, database: &str) -> Result<String, String> {
     let authority = &rest[..path_start];
     let after_path = &rest[path_start + 1..];
     let query = after_path.find('?').map(|q| &after_path[q..]).unwrap_or("");
-    Ok(format!("{}{authority}/{database}{query}", &url[..scheme_end]))
+    Ok(format!(
+        "{}{authority}/{database}{query}",
+        &url[..scheme_end]
+    ))
 }
 
 /// Provision a throwaway database, apply migrations, delete the latest migration
@@ -1108,8 +1111,10 @@ async fn drop_temp_database(maintenance_url: &str, db_name: &str) {
     let db_name = db_name.to_owned();
     let _ = tokio::task::spawn_blocking(move || {
         if let Ok(mut conn) = PgConnection::establish(&maintenance_url) {
-            let _ = sql_query(format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"))
-                .execute(&mut conn);
+            let _ = sql_query(format!(
+                "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+            ))
+            .execute(&mut conn);
         }
     })
     .await;

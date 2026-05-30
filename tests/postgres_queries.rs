@@ -1146,7 +1146,14 @@ async fn run_lock_status_scenario(
         "pending_future" => ("Pending", 0, 25, 3600, None, None),
         "queued_by_self" => ("Queued", 0, 25, -1, Some(primary_worker.clone()), Some(now)),
         "queued_by_other" => ("Queued", 0, 25, -1, Some(other_worker.clone()), Some(now)),
-        "running_by_self" => ("Running", 0, 25, -1, Some(primary_worker.clone()), Some(past)),
+        "running_by_self" => (
+            "Running",
+            0,
+            25,
+            -1,
+            Some(primary_worker.clone()),
+            Some(past),
+        ),
         "running_by_other" => ("Running", 0, 25, -1, Some(other_worker.clone()), Some(now)),
         "failed_retryable" => ("Failed", 1, 3, -1, None, None),
         "failed_exhausted" => ("Failed", 3, 3, -1, None, None),
@@ -1200,8 +1207,17 @@ async fn run_lock_in_queue_scenario(
         .map_err(|e| e.to_string())?;
 
     // A due, lockable Pending row owned by `queue`.
-    let id = insert_status_row(pool.clone(), queue.clone(), "Pending", 0, 25, -1, None, None)
-        .await?;
+    let id = insert_status_row(
+        pool.clone(),
+        queue.clone(),
+        "Pending",
+        0,
+        25,
+        -1,
+        None,
+        None,
+    )
+    .await?;
 
     // Lock either through the row's own queue (must succeed) or through a
     // foreign queue name (must be refused — exercises `job_type = $3`).

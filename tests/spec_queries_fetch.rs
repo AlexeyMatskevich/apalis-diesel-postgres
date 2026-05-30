@@ -861,7 +861,13 @@ async fn run_queue_by_id_eligibility(setup: StatusSetup) -> Result<Outcome<Fetch
     )
     .await?;
 
-    let rows = queue_by_id_sql(pool.clone(), queue.clone(), worker_id.clone(), vec![id.to_string()]).await?;
+    let rows = queue_by_id_sql(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        vec![id.to_string()],
+    )
+    .await?;
     cleanup_queue(pool, queue.clone()).await?;
     Ok(Outcome::Completed(FetchRun {
         rows,
@@ -882,10 +888,36 @@ async fn run_queue_by_id_skips_unlisted() -> Result<Outcome<FetchRun>, String> {
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
 
     // Both rows are equally claimable; only `listed` is passed in `ids`.
-    let listed = insert_row(pool.clone(), queue.clone(), "qbi-listed", "Pending", 0, 25, -2, 0).await?;
-    let unlisted = insert_row(pool.clone(), queue.clone(), "qbi-unlisted", "Pending", 0, 25, -1, 0).await?;
+    let listed = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-listed",
+        "Pending",
+        0,
+        25,
+        -2,
+        0,
+    )
+    .await?;
+    let unlisted = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-unlisted",
+        "Pending",
+        0,
+        25,
+        -1,
+        0,
+    )
+    .await?;
 
-    let rows = queue_by_id_sql(pool.clone(), queue.clone(), worker_id.clone(), vec![listed.to_string()]).await?;
+    let rows = queue_by_id_sql(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        vec![listed.to_string()],
+    )
+    .await?;
     cleanup_queue(pool, queue.clone()).await?;
     Ok(Outcome::Completed(FetchRun {
         rows,
@@ -911,8 +943,24 @@ async fn run_queue_by_id_cross_queue() -> Result<Outcome<FetchRun>, String> {
 
     // The row lives in `queue`; we request its id scoped to `other_queue`. The
     // `job_type = $2` filter must keep it invisible to the foreign-queue claim.
-    let id = insert_row(pool.clone(), queue.clone(), "qbi-foreign", "Pending", 0, 25, -1, 0).await?;
-    let rows = queue_by_id_sql(pool.clone(), other_queue.clone(), worker_id.clone(), vec![id.to_string()]).await?;
+    let id = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-foreign",
+        "Pending",
+        0,
+        25,
+        -1,
+        0,
+    )
+    .await?;
+    let rows = queue_by_id_sql(
+        pool.clone(),
+        other_queue.clone(),
+        worker_id.clone(),
+        vec![id.to_string()],
+    )
+    .await?;
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool, other_queue).await?;
     Ok(Outcome::Completed(FetchRun {
@@ -935,8 +983,28 @@ async fn run_queue_by_id_ordering() -> Result<Outcome<FetchRun>, String> {
 
     // `low` has the older run_at but a lower priority; priority DESC must win,
     // so `high` is returned first even though `low` would sort first by run_at.
-    let high = insert_row(pool.clone(), queue.clone(), "qbi-high", "Pending", 0, 25, -1, 9).await?;
-    let low = insert_row(pool.clone(), queue.clone(), "qbi-low", "Pending", 0, 25, -2, 1).await?;
+    let high = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-high",
+        "Pending",
+        0,
+        25,
+        -1,
+        9,
+    )
+    .await?;
+    let low = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-low",
+        "Pending",
+        0,
+        25,
+        -2,
+        1,
+    )
+    .await?;
 
     // Request order deliberately reversed to prove SQL ordering, not list order.
     let rows = queue_by_id_sql(
@@ -966,9 +1034,39 @@ async fn run_queue_by_id_partial_claim() -> Result<Outcome<FetchRun>, String> {
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
 
     // Two claimable rows flank a terminal `Done` row; all three ids are listed.
-    let first = insert_row(pool.clone(), queue.clone(), "qbi-first", "Pending", 0, 25, -3, 5).await?;
-    let done = insert_row(pool.clone(), queue.clone(), "qbi-done", "Done", 0, 25, -2, 5).await?;
-    let second = insert_row(pool.clone(), queue.clone(), "qbi-second", "Pending", 0, 25, -1, 5).await?;
+    let first = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-first",
+        "Pending",
+        0,
+        25,
+        -3,
+        5,
+    )
+    .await?;
+    let done = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-done",
+        "Done",
+        0,
+        25,
+        -2,
+        5,
+    )
+    .await?;
+    let second = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-second",
+        "Pending",
+        0,
+        25,
+        -1,
+        5,
+    )
+    .await?;
 
     let rows = queue_by_id_sql(
         pool.clone(),
