@@ -154,9 +154,16 @@ where
     // at a steady 2 Hz; long-running waits also avoid wasteful re-polls.
     const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
     const MAX_BACKOFF: Duration = Duration::from_secs(2);
+    // Tolerate transient database errors mid-wait: a failed poll is retried
+    // with backoff rather than abandoning the whole batch. Only a *persistent*
+    // failure (this many consecutive errors with no successful poll in between)
+    // is surfaced to the caller, ending the stream. Any successful poll resets
+    // the streak, so a database that merely flaps keeps making progress (jobs
+    // stay durable in `apalis.jobs`, so a surfaced error is always retryable).
+    const MAX_CONSECUTIVE_DB_ERRORS: u32 = 3;
     stream::unfold(
-        (remaining, INITIAL_BACKOFF),
-        move |(remaining_ids, backoff)| {
+        (remaining, INITIAL_BACKOFF, 0u32),
+        move |(remaining_ids, backoff, error_streak)| {
             let pool = pool.clone();
             async move {
                 if remaining_ids.is_empty() {
@@ -165,16 +172,28 @@ where
                 let rows = match completed_task_rows(pool, remaining_ids.clone()).await {
                     Ok(rows) => rows,
                     Err(error) => {
+                        // Surface the error and end the stream only once the
+                        // failures persist; otherwise back off and retry the
+                        // same ids, treating the blip as transient.
+                        if error_streak + 1 >= MAX_CONSECUTIVE_DB_ERRORS {
+                            return Some((
+                                stream::iter(vec![Err(error)]),
+                                (Vec::new(), INITIAL_BACKOFF, 0),
+                            ));
+                        }
+                        apalis_core::timer::sleep(backoff).await;
+                        let next_backoff = (backoff * 2).min(MAX_BACKOFF);
                         return Some((
-                            stream::iter(vec![Err(error)]),
-                            (Vec::new(), INITIAL_BACKOFF),
+                            stream::iter(Vec::new()),
+                            (remaining_ids, next_backoff, error_streak + 1),
                         ));
                     }
                 };
                 if rows.is_empty() {
                     apalis_core::timer::sleep(backoff).await;
                     let next_backoff = (backoff * 2).min(MAX_BACKOFF);
-                    return Some((stream::iter(Vec::new()), (remaining_ids, next_backoff)));
+                    // A successful (if empty) poll clears the error streak.
+                    return Some((stream::iter(Vec::new()), (remaining_ids, next_backoff, 0)));
                 }
 
                 let mut next_remaining = remaining_ids;
@@ -188,8 +207,8 @@ where
                     results.push(task_result_from_row(row));
                 }
                 next_remaining.retain(|remaining| !completed_ids.contains(remaining));
-                // Reset backoff after observing progress.
-                Some((stream::iter(results), (next_remaining, INITIAL_BACKOFF)))
+                // Reset backoff and the error streak after observing progress.
+                Some((stream::iter(results), (next_remaining, INITIAL_BACKOFF, 0)))
             }
         },
     )

@@ -142,6 +142,16 @@ where
 {
     type ResultStream = BoxStream<'static, Result<TaskResult<O, Ulid>, Error>>;
 
+    /// Wait for the given tasks to complete, yielding each result as it lands.
+    ///
+    /// # Error handling
+    ///
+    /// A transient database error during polling does **not** abandon the
+    /// batch: the poll is retried with backoff. The stream yields an `Err` and
+    /// ends only once the failures *persist* across several consecutive polls.
+    /// Because completed results are durable in `apalis.jobs`, a surfaced error
+    /// is always safe to recover from by calling `wait_for` again with the ids
+    /// that have not yet yielded a result.
     fn wait_for(
         &self,
         task_ids: impl IntoIterator<Item = TaskId<Self::IdType>>,
