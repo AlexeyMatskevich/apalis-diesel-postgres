@@ -18,6 +18,7 @@ use apalis_core::{
 };
 use apalis_diesel_postgres::{
     Config, PgAck, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage, lock_task,
+    lock_task_in_queue,
 };
 use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
 use diesel::{
@@ -1038,6 +1039,8 @@ struct StatusOnly {
     status: String,
     #[diesel(sql_type = Nullable<Text>)]
     lock_by: Option<String>,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    lock_at: Option<DateTime>,
 }
 
 #[derive(Debug)]
@@ -1045,6 +1048,10 @@ struct LockScenarioRun {
     lock_succeeded: bool,
     final_status: String,
     final_lock_by: Option<String>,
+    /// `lock_at` after the lock attempt, as a unix timestamp. Used by the
+    /// running-by-self leaf to assert the CASE preserve arm kept the original
+    /// (clearly-past) timestamp instead of resetting it to `now()`.
+    final_lock_at: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1096,7 +1103,7 @@ async fn insert_status_row(
 
 async fn fetch_status_only(pool: PgPool, id: PgTaskId) -> Result<StatusOnly, String> {
     with_conn(pool, move |conn| {
-        sql_query("SELECT status, lock_by FROM apalis.jobs WHERE id = $1")
+        sql_query("SELECT status, lock_by, lock_at FROM apalis.jobs WHERE id = $1")
             .bind::<Text, _>(id.to_string())
             .load::<StatusOnly>(conn)
             .map_err(|error| error.to_string())?
@@ -1129,6 +1136,9 @@ async fn run_lock_status_scenario(
         .map_err(|e| e.to_string())?;
 
     let now = <DateTime as DateTimeExt>::from_unix_timestamp(now_unix() as i64);
+    // A clearly-past lock_at so the running-by-self leaf can tell the CASE
+    // preserve arm (keeps this value) apart from a reset to ~now().
+    let past = <DateTime as DateTimeExt>::from_unix_timestamp(now_unix() as i64 - 3600);
 
     // (status, attempts, max_attempts, run_at_offset_seconds, lock_by, lock_at)
     let (status, attempts, max_attempts, run_offset, lock_by, lock_at) = match scenario {
@@ -1136,6 +1146,7 @@ async fn run_lock_status_scenario(
         "pending_future" => ("Pending", 0, 25, 3600, None, None),
         "queued_by_self" => ("Queued", 0, 25, -1, Some(primary_worker.clone()), Some(now)),
         "queued_by_other" => ("Queued", 0, 25, -1, Some(other_worker.clone()), Some(now)),
+        "running_by_self" => ("Running", 0, 25, -1, Some(primary_worker.clone()), Some(past)),
         "running_by_other" => ("Running", 0, 25, -1, Some(other_worker.clone()), Some(now)),
         "failed_retryable" => ("Failed", 1, 3, -1, None, None),
         "failed_exhausted" => ("Failed", 3, 3, -1, None, None),
@@ -1164,6 +1175,51 @@ async fn run_lock_status_scenario(
         lock_succeeded: lock_result.is_ok(),
         final_status: row.status,
         final_lock_by: row.lock_by,
+        final_lock_at: row.lock_at.map(|dt| dt.to_unix_timestamp()),
+    }))
+}
+
+/// Exercises the public `lock_task_in_queue` entry point, whose queue-scoping
+/// arm (`job_type = $3`) is unreachable through `lock_task` (which always
+/// passes `queue = None`). A matching queue must lock; a foreign queue must be
+/// refused as `TaskNotFound`, leaving the row untouched.
+async fn run_lock_in_queue_scenario(
+    scenario: &'static str,
+) -> Result<Outcome<LockScenarioRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-query-lock-in-queue-{scenario}-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    let primary_worker = format!("in-queue-primary-{queue}");
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    storage
+        .register_worker(primary_worker.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // A due, lockable Pending row owned by `queue`.
+    let id = insert_status_row(pool.clone(), queue.clone(), "Pending", 0, 25, -1, None, None)
+        .await?;
+
+    // Lock either through the row's own queue (must succeed) or through a
+    // foreign queue name (must be refused — exercises `job_type = $3`).
+    let lock_queue = match scenario {
+        "matching_queue" => queue.clone(),
+        "foreign_queue" => format!("foreign-{queue}"),
+        other => return Err(format!("unknown in-queue scenario: {other}")),
+    };
+
+    let lock_result = lock_task_in_queue(&pool, id.inner(), &primary_worker, &lock_queue).await;
+    let row = fetch_status_only(pool.clone(), id).await?;
+    cleanup_queue(pool, queue).await?;
+
+    Ok(Outcome::Completed(LockScenarioRun {
+        lock_succeeded: lock_result.is_ok(),
+        final_status: row.status,
+        final_lock_by: row.lock_by,
+        final_lock_at: row.lock_at.map(|dt| dt.to_unix_timestamp()),
     }))
 }
 
@@ -1218,6 +1274,20 @@ fn lock_matrix_owned_by(
                 "expected lock_by containing {expected_substring:?}, got {other:?}"
             )),
         }
+    })
+}
+
+fn lock_matrix_preserved_past_lock_at()
+-> impl Fn(&Result<Outcome<LockScenarioRun>, String>) -> AssertionResult {
+    observe::<LockScenarioRun, _>("lock_task matrix lock_at", |run| match run.final_lock_at {
+        // Seeded ~1h in the past; the CASE preserve arm must keep it rather
+        // than reset it to ~now(). A reset would land within seconds of now.
+        Some(secs) if (now_unix() as i64) - secs > 1800 => Ok(()),
+        Some(secs) => Err(format!(
+            "expected the pre-existing lock_at (~1h old) to be preserved, but it was reset to now-{}s",
+            (now_unix() as i64) - secs
+        )),
+        None => Err("re-locking a running-by-self row cleared lock_at".into()),
     })
 }
 
@@ -2725,6 +2795,14 @@ lets_expect! { #tokio_test
             to preserves_the_other_worker_as_lock_holder { lock_matrix_owned_by("other") }
         }
 
+        when the_task_is_running_by_the_same_worker {
+            let scenario = "running_by_self";
+            to re_locks_the_already_running_row_for_the_same_worker { lock_matrix_succeeds() }
+            to keeps_the_row_in_running_state { lock_matrix_status_equals("Running") }
+            to keeps_the_lock_holder_as_the_primary_worker { lock_matrix_owned_by("primary") }
+            to preserves_the_existing_lock_at_timestamp { lock_matrix_preserved_past_lock_at() }
+        }
+
         when the_task_is_running_by_a_different_worker {
             let scenario = "running_by_other";
             to refuses_to_acquire_the_row { lock_matrix_refuses() }
@@ -2755,6 +2833,22 @@ lets_expect! { #tokio_test
             let scenario = "killed";
             to refuses_to_acquire_a_killed_row { lock_matrix_refuses() }
             to keeps_the_row_in_killed_state { lock_matrix_status_equals("Killed") }
+        }
+    }
+
+    expect(run_lock_in_queue_scenario(scenario).await) {
+        let scenario = "matching_queue";
+
+        when lock_task_in_queue_targets_the_rows_own_queue {
+            to acquires_the_row_for_the_primary_worker { lock_matrix_succeeds() }
+            to transitions_the_row_into_running_state { lock_matrix_status_equals("Running") }
+            to records_the_primary_worker_as_lock_holder { lock_matrix_owned_by("primary") }
+        }
+
+        when lock_task_in_queue_targets_a_foreign_queue {
+            let scenario = "foreign_queue";
+            to refuses_to_acquire_the_cross_queue_row { lock_matrix_refuses() }
+            to leaves_the_row_in_pending_state { lock_matrix_status_equals("Pending") }
         }
     }
 

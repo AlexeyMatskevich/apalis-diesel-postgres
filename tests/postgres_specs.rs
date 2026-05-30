@@ -1979,6 +1979,22 @@ lets_expect! { #tokio_test
             to accepts_the_push_and_persists_the_row { metadata_cap_succeeds() }
         }
 
+        // Boundary-Value-Analysis on `meta_json.len() > MAX_METADATA_PAYLOAD_LEN`
+        // (strict `>`, cap 8192). The helper serializes `{"payload":"x"*(n-16)}`,
+        // a 14-byte frame, so `serialized_len == meta_payload_len - 2`:
+        // `8194 -> 8192` must pass (8192 > 8192 is false), `8195 -> 8193` must
+        // reject. Verified against `serde_json::to_string` (compact form).
+        when the_metadata_serialization_length_is_exactly_at_the_eight_kib_cap {
+            let meta_payload_len = 8194usize;
+            to accepts_the_push_and_persists_the_row { metadata_cap_succeeds() }
+        }
+
+        when the_metadata_serialization_length_is_one_byte_over_the_eight_kib_cap {
+            let meta_payload_len = 8195usize;
+            to rejects_the_push_with_invalid_argument { metadata_cap_rejects() }
+            to does_not_persist_the_apalis_jobs_row { metadata_cap_persists_nothing() }
+        }
+
         when the_metadata_serialization_length_exceeds_the_eight_kib_cap {
             let meta_payload_len = 16384usize;
             to rejects_the_push_with_invalid_argument { metadata_cap_rejects() }

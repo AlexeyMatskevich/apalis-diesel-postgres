@@ -726,6 +726,24 @@ lets_expect! { #tokio_test
             }
         }
 
+        when the_row_is_failed_with_exactly_one_retry_left {
+            // Boundary-Value-Analysis of `attempts < max_attempts` (fetch.rs):
+            // attempts == max_attempts - 1 is the last claimable value. A
+            // `< max_attempts - 1` off-by-one would refuse this row while
+            // leaving the inside (1/3) and outside (3/3) leaves green, so pin
+            // the boundary explicitly. (Verified to fail under that mutant.)
+            let setup = StatusSetup {
+                status: "Failed",
+                attempts: 2,
+                max_attempts: 3,
+                ..STATUS_PENDING_DUE
+            };
+            to is_picked_up_for_a_retry { fetched_row_count(1) }
+            to writes_the_h4_running_invariant {
+                claimed_row_transitioned_to_running()
+            }
+        }
+
         when the_row_is_failed_with_the_retry_budget_exhausted {
             let setup = StatusSetup {
                 status: "Failed",

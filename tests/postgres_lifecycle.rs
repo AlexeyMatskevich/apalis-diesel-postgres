@@ -18,17 +18,23 @@ use futures::StreamExt;
 use lets_expect::{AssertionError, AssertionResult, *};
 use ulid::Ulid;
 
-/// Aggregated observations from running the push → poll → lock → ack → fetch
-/// pipeline once. Each field is asserted by a dedicated `to` block so the
-/// failing observable is named in the test output.
+/// Observations from running the push → poll → lock → ack → fetch pipeline.
+/// Each field is asserted by a dedicated `to` block; `lets_expect` re-runs the
+/// subject once per block, so the (idempotent, freshly-queued, self-cleaning)
+/// pipeline executes once per asserted observable.
 #[derive(Debug)]
 struct LifecycleRun {
     polled_payload: String,
-    polled_task_id_present: bool,
+    /// The task id carried by the polled row (the pipeline cannot proceed
+    /// without it; its presence is a hard precondition guarded upstream).
+    polled_task_id: String,
     lock_outcome: Result<(), String>,
     ack_outcome: Result<(), String>,
     fetched_args: Option<String>,
     fetched_status: Option<Status>,
+    /// The task id carried by the row fetched back by id, used to assert the
+    /// id round-trips through `fetch_by_id` rather than asserting a literal.
+    fetched_task_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -103,7 +109,7 @@ async fn run_lifecycle() -> Result<LifecycleOutcome, String> {
         .parts
         .task_id
         .ok_or_else(|| "polled task had no task id".to_owned())?;
-    let polled_task_id_present = true;
+    let polled_task_id = task_id.to_string();
     let ulid = *task_id.inner();
 
     let lock_outcome = lock_task(&pool, &ulid, worker.name())
@@ -127,16 +133,20 @@ async fn run_lifecycle() -> Result<LifecycleOutcome, String> {
         .map_err(|error| error.to_string())?;
     let fetched_args = fetched.as_ref().map(|task| task.args.clone());
     let fetched_status = fetched.as_ref().map(|task| task.parts.status.load());
+    let fetched_task_id = fetched
+        .as_ref()
+        .and_then(|task| task.parts.task_id.as_ref().map(|id| id.to_string()));
 
     cleanup_queue(pool, queue).await?;
 
     Ok(LifecycleOutcome::Completed(LifecycleRun {
         polled_payload,
-        polled_task_id_present,
+        polled_task_id,
         lock_outcome,
         ack_outcome,
         fetched_args,
         fetched_status,
+        fetched_task_id,
     }))
 }
 
@@ -177,13 +187,15 @@ fn polled_payload_matches_pushed() -> impl Fn(&Result<LifecycleOutcome, String>)
     })
 }
 
-fn polled_task_carries_task_id() -> impl Fn(&Result<LifecycleOutcome, String>) -> AssertionResult {
-    observe("polled task id", |run| {
-        if run.polled_task_id_present {
-            Ok(())
-        } else {
-            Err("polled task had no task id".into())
-        }
+fn fetch_by_id_round_trips_the_task_id()
+-> impl Fn(&Result<LifecycleOutcome, String>) -> AssertionResult {
+    observe("task id round-trip", |run| match &run.fetched_task_id {
+        Some(id) if *id == run.polled_task_id => Ok(()),
+        Some(other) => Err(format!(
+            "expected fetch_by_id to return task id {}, got {other}",
+            run.polled_task_id
+        )),
+        None => Err("fetch_by_id returned a task without a task id".into()),
     })
 }
 
@@ -229,8 +241,8 @@ lets_expect! { #tokio_test
             to polls_the_pushed_payload {
                 polled_payload_matches_pushed()
             }
-            to attaches_a_task_id_to_the_polled_row {
-                polled_task_carries_task_id()
+            to round_trips_the_polled_task_id_through_fetch_by_id {
+                fetch_by_id_round_trips_the_task_id()
             }
             to acquires_a_row_lock_for_the_worker {
                 lock_task_acquires_the_row()
