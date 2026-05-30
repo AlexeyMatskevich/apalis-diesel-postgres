@@ -41,10 +41,10 @@ mod support;
 use std::str::FromStr;
 
 use apalis_core::task::task_id::TaskId;
-use apalis_diesel_postgres::{PgPool, PgTaskId, build_pool, setup};
+use apalis_diesel_postgres::{PgPool, PgTaskId};
 use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
-    sql_types::{Integer, Nullable, Text},
+    sql_types::{Array, Integer, Nullable, Text},
 };
 use lets_expect::{AssertionError, AssertionResult, *};
 use ulid::Ulid;
@@ -79,12 +79,7 @@ where
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-    let pool = build_pool(database_url).map_err(|e| e.to_string())?;
-    setup(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
@@ -761,6 +756,285 @@ lets_expect! { #tokio_test
         when the_row_is_killed {
             let setup = StatusSetup { status: "Killed", ..STATUS_PENDING_DUE };
             to refuses_to_reclaim_it { fetched_no_rows() }
+        }
+    }
+}
+
+// ==========================================================================
+// queue_by_id — `src/queries/fetch.rs::queue_by_id` (the NOTIFY-path claim).
+//
+// queue_by_id reuses fetch_next's `CLAIMABLE_PREDICATE` + `run_at <= now()` +
+// `job_type = $2`, but adds `AND id = ANY($3)`: a NOTIFY wakeup claims only the
+// *listed* ids. The fetch_next spec above already pins the shared predicate,
+// ordering, and H4 invariant; this section pins what is DISTINCT to queue_by_id
+// — the id-membership filter, the queue scope at the claim layer, ordering
+// across listed ids, and partial claims — plus a focused re-check that the
+// eligibility predicate is wired into this *separate* SQL string, not only into
+// fetch_next. queue_by_id had zero direct coverage before this block.
+//
+// Mirror SQL: the CTE is kept byte-equal to fetch.rs:88-110; only the final
+// SELECT is reshaped into `FetchedRow`, exactly as `fetch_next_sql` does.
+// --------------------------------------------------------------------------
+
+async fn queue_by_id_sql(
+    pool: PgPool,
+    queue: String,
+    worker_id: String,
+    ids: Vec<String>,
+) -> Result<Vec<FetchedRow>, String> {
+    with_conn(pool, move |conn| {
+        sql_query(format!(
+            "WITH candidates AS (
+                 SELECT id
+                 FROM apalis.jobs
+                 WHERE {CLAIMABLE_PREDICATE}
+                     AND run_at <= now()
+                     AND job_type = $2
+                     AND id = ANY($3)
+                 ORDER BY priority DESC, run_at ASC
+                 FOR UPDATE SKIP LOCKED
+             ),
+             updated AS (
+                 UPDATE apalis.jobs
+                 SET status = 'Running',
+                     lock_at = date_trunc('second', now()),
+                     lock_by = $1,
+                     done_at = NULL
+                 FROM candidates
+                 WHERE apalis.jobs.id = candidates.id
+                 RETURNING apalis.jobs.*
+             )
+             SELECT id::text AS id,
+                    status,
+                    lock_by,
+                    (lock_at IS NOT NULL) AS lock_at_present,
+                    (done_at IS NULL) AS done_at_null,
+                    priority
+             FROM updated
+             ORDER BY priority DESC, run_at ASC"
+        ))
+        .bind::<Text, _>(&worker_id)
+        .bind::<Text, _>(&queue)
+        .bind::<Array<Text>, _>(ids)
+        .load::<FetchedRow>(conn)
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+async fn run_queue_by_id_eligibility(setup: StatusSetup) -> Result<Outcome<FetchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-qbi-status-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-qbi-status-{queue}");
+    insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
+
+    let id = insert_row(
+        pool.clone(),
+        queue.clone(),
+        "qbi-status-row",
+        setup.status,
+        setup.attempts,
+        setup.max_attempts,
+        setup.run_at_offset_secs,
+        0,
+    )
+    .await?;
+
+    let rows = queue_by_id_sql(pool.clone(), queue.clone(), worker_id.clone(), vec![id.to_string()]).await?;
+    cleanup_queue(pool, queue.clone()).await?;
+    Ok(Outcome::Completed(FetchRun {
+        rows,
+        worker_id,
+        queue,
+        seeded_ids: vec![id],
+        foreign_ids: vec![],
+    }))
+}
+
+async fn run_queue_by_id_skips_unlisted() -> Result<Outcome<FetchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-qbi-unlisted-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-qbi-unlisted-{queue}");
+    insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
+
+    // Both rows are equally claimable; only `listed` is passed in `ids`.
+    let listed = insert_row(pool.clone(), queue.clone(), "qbi-listed", "Pending", 0, 25, -2, 0).await?;
+    let unlisted = insert_row(pool.clone(), queue.clone(), "qbi-unlisted", "Pending", 0, 25, -1, 0).await?;
+
+    let rows = queue_by_id_sql(pool.clone(), queue.clone(), worker_id.clone(), vec![listed.to_string()]).await?;
+    cleanup_queue(pool, queue.clone()).await?;
+    Ok(Outcome::Completed(FetchRun {
+        rows,
+        worker_id,
+        queue,
+        seeded_ids: vec![listed],
+        // Eligible but absent from `ids`: the id-filter must exclude it, so it
+        // must NOT appear in the claimed set.
+        foreign_ids: vec![unlisted],
+    }))
+}
+
+async fn run_queue_by_id_cross_queue() -> Result<Outcome<FetchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-qbi-home-{}", Ulid::new());
+    let other_queue = format!("apalis-spec-qbi-other-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    cleanup_queue(pool.clone(), other_queue.clone()).await?;
+    let worker_id = format!("spec-qbi-cross-{queue}");
+    insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
+
+    // The row lives in `queue`; we request its id scoped to `other_queue`. The
+    // `job_type = $2` filter must keep it invisible to the foreign-queue claim.
+    let id = insert_row(pool.clone(), queue.clone(), "qbi-foreign", "Pending", 0, 25, -1, 0).await?;
+    let rows = queue_by_id_sql(pool.clone(), other_queue.clone(), worker_id.clone(), vec![id.to_string()]).await?;
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    cleanup_queue(pool, other_queue).await?;
+    Ok(Outcome::Completed(FetchRun {
+        rows,
+        worker_id,
+        queue,
+        seeded_ids: vec![],
+        foreign_ids: vec![id],
+    }))
+}
+
+async fn run_queue_by_id_ordering() -> Result<Outcome<FetchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-qbi-order-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-qbi-order-{queue}");
+    insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
+
+    // `low` has the older run_at but a lower priority; priority DESC must win,
+    // so `high` is returned first even though `low` would sort first by run_at.
+    let high = insert_row(pool.clone(), queue.clone(), "qbi-high", "Pending", 0, 25, -1, 9).await?;
+    let low = insert_row(pool.clone(), queue.clone(), "qbi-low", "Pending", 0, 25, -2, 1).await?;
+
+    // Request order deliberately reversed to prove SQL ordering, not list order.
+    let rows = queue_by_id_sql(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        vec![low.to_string(), high.to_string()],
+    )
+    .await?;
+    cleanup_queue(pool, queue.clone()).await?;
+    Ok(Outcome::Completed(FetchRun {
+        rows,
+        worker_id,
+        queue,
+        seeded_ids: vec![high, low], // expected returned order: priority DESC
+        foreign_ids: vec![],
+    }))
+}
+
+async fn run_queue_by_id_partial_claim() -> Result<Outcome<FetchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-qbi-partial-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-qbi-partial-{queue}");
+    insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
+
+    // Two claimable rows flank a terminal `Done` row; all three ids are listed.
+    let first = insert_row(pool.clone(), queue.clone(), "qbi-first", "Pending", 0, 25, -3, 5).await?;
+    let done = insert_row(pool.clone(), queue.clone(), "qbi-done", "Done", 0, 25, -2, 5).await?;
+    let second = insert_row(pool.clone(), queue.clone(), "qbi-second", "Pending", 0, 25, -1, 5).await?;
+
+    let rows = queue_by_id_sql(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        vec![first.to_string(), done.to_string(), second.to_string()],
+    )
+    .await?;
+    cleanup_queue(pool, queue.clone()).await?;
+    Ok(Outcome::Completed(FetchRun {
+        rows,
+        worker_id,
+        queue,
+        // Both claimable, equal priority -> run_at ASC orders first before second.
+        seeded_ids: vec![first, second],
+        foreign_ids: vec![done], // terminal -> excluded from the partial claim
+    }))
+}
+
+lets_expect! { #tokio_test
+    // ----- eligibility predicate is wired into the id-path ------------------
+    expect(run_queue_by_id_eligibility(setup).await) {
+        let setup = STATUS_PENDING_DUE;
+
+        when a_listed_id_is_pending_and_due {
+            to claims_the_row { fetched_row_count(1) }
+            to writes_the_h4_running_invariant { claimed_row_transitioned_to_running() }
+        }
+
+        when a_listed_id_is_failed_with_retries_left {
+            let setup = StatusSetup {
+                status: "Failed",
+                attempts: 1,
+                max_attempts: 3,
+                ..STATUS_PENDING_DUE
+            };
+            to claims_the_row_for_a_retry { fetched_row_count(1) }
+        }
+
+        when a_listed_id_is_failed_with_the_retry_budget_exhausted {
+            let setup = StatusSetup {
+                status: "Failed",
+                attempts: 3,
+                max_attempts: 3,
+                ..STATUS_PENDING_DUE
+            };
+            to refuses_to_claim_it { fetched_no_rows() }
+        }
+
+        when a_listed_id_is_scheduled_in_the_future {
+            let setup = StatusSetup { run_at_offset_secs: 3600, ..STATUS_PENDING_DUE };
+            to refuses_to_claim_it { fetched_no_rows() }
+        }
+    }
+
+    // ----- the id-membership filter ($3) ------------------------------------
+    expect(run_queue_by_id_skips_unlisted().await) {
+        when an_eligible_row_in_the_queue_is_absent_from_the_id_list {
+            to claims_only_the_listed_id { fetched_row_count(1) }
+            to returns_the_listed_id { all_seeded_ids_returned() }
+            to leaves_the_unlisted_row_unclaimed { no_foreign_ids_returned() }
+        }
+    }
+
+    // ----- queue scope at the claim layer -----------------------------------
+    expect(run_queue_by_id_cross_queue().await) {
+        when a_listed_id_belongs_to_a_different_queue {
+            to refuses_to_claim_across_the_queue_boundary { fetched_no_rows() }
+        }
+    }
+
+    // ----- ordering across listed ids ---------------------------------------
+    expect(run_queue_by_id_ordering().await) {
+        when several_listed_ids_carry_different_priorities {
+            to returns_them_priority_desc_then_run_at_asc { returned_ids_match_seeded_order() }
+        }
+    }
+
+    // ----- partial claim ----------------------------------------------------
+    expect(run_queue_by_id_partial_claim().await) {
+        when the_id_list_mixes_claimable_and_terminal_rows {
+            to claims_only_the_claimable_subset { fetched_row_count(2) }
+            to returns_both_claimable_ids { all_seeded_ids_returned() }
+            to skips_the_terminal_row { no_foreign_ids_returned() }
         }
     }
 }

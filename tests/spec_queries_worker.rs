@@ -29,7 +29,7 @@ use std::{
 };
 
 use apalis_core::task::task_id::TaskId;
-use apalis_diesel_postgres::{PgPool, PgTaskId, build_pool, setup};
+use apalis_diesel_postgres::{PgPool, PgTaskId};
 use apalis_sql::{DateTime, DateTimeExt};
 use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
@@ -69,12 +69,7 @@ where
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-    let pool = build_pool(database_url).map_err(|e| e.to_string())?;
-    setup(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>

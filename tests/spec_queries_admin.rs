@@ -47,7 +47,7 @@ use apalis_core::{
     backend::{Filter, ListAllTasks, ListQueues, ListTasks, Metrics},
     task::{status::Status, task_id::TaskId},
 };
-use apalis_diesel_postgres::{Config, PgPool, PostgresStorage, build_pool_with, setup};
+use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 use diesel::{
     PgConnection, RunQueryDsl, sql_query,
     sql_types::{Integer, Text},
@@ -85,20 +85,7 @@ where
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-    // Cap pool size so 23 parallel test threads × pool size don't exceed
-    // Postgres `max_connections`. Tests run sequentially within each thread
-    // so two connections per pool is more than enough.
-    let pool = build_pool_with(database_url, |builder| {
-        builder
-            .max_size(2)
-            .connection_timeout(std::time::Duration::from_secs(30))
-    })
-    .map_err(|e| e.to_string())?;
-    setup(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
@@ -326,6 +313,105 @@ fn excludes_other_status_rows()
             }
         }
         Ok(())
+    })
+}
+
+// --------------------------------------------------------------------------
+// list_tasks default branches: an unset `status` falls back to Pending, and an
+// unset `page_size` falls back to the apalis `DEFAULT_PAGE_SIZE`. Every other
+// list_tasks scenario passes `Some(status)` and `Some(page_size)`, so the two
+// `unwrap_or` defaults in `src/queries/admin.rs::list_tasks` (status default at
+// :55-59, page_size default via `filter.limit()` at :60) had no test leaf.
+// --------------------------------------------------------------------------
+
+async fn run_list_tasks_default_status() -> Result<Outcome<StatusFilterRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-default-status-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    let pending = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
+    let done = insert_job(pool.clone(), queue.clone(), "Done", 5, Some(1), 1, 3).await?;
+    let failed = insert_job(pool.clone(), queue.clone(), "Failed", 5, Some(1), 3, 3).await?;
+    let killed = insert_job(pool.clone(), queue.clone(), "Killed", 5, Some(1), 1, 3).await?;
+
+    let config = Config::new(&queue);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    // `status: None` must default to Pending.
+    let f = Filter {
+        status: None,
+        page: 1,
+        page_size: Some(20),
+    };
+    let listed = storage.list_tasks(&f).await.map_err(|e| e.to_string())?;
+    let returned_ids: Vec<String> = listed
+        .into_iter()
+        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .collect();
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(StatusFilterRun {
+        returned_ids,
+        expected_id: pending,
+        other_status_ids: vec![done, failed, killed],
+    }))
+}
+
+#[derive(Debug)]
+struct DefaultLimitRun {
+    returned_count: usize,
+    default_limit: usize,
+}
+
+async fn run_list_tasks_default_page_size() -> Result<Outcome<DefaultLimitRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-default-size-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    // Read the apalis default so the assertion tracks it instead of hardcoding.
+    let default_limit = Filter {
+        status: Some(Status::Pending),
+        page: 1,
+        page_size: None,
+    }
+    .limit() as usize;
+    // Seed comfortably more than the default so the limit is the binding cap.
+    // Distinct run_at keeps the ordering total and the cut deterministic.
+    for i in 0..(default_limit + 2) {
+        insert_job(pool.clone(), queue.clone(), "Pending", 10 + i as i64, None, 0, 3).await?;
+    }
+
+    let config = Config::new(&queue);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    // `page_size: None` must fall back to `DEFAULT_PAGE_SIZE`.
+    let f = Filter {
+        status: Some(Status::Pending),
+        page: 1,
+        page_size: None,
+    };
+    let returned_count = storage.list_tasks(&f).await.map_err(|e| e.to_string())?.len();
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(DefaultLimitRun {
+        returned_count,
+        default_limit,
+    }))
+}
+
+fn returns_default_page_size_rows()
+-> impl Fn(&Result<Outcome<DefaultLimitRun>, String>) -> AssertionResult {
+    observe::<DefaultLimitRun, _>("default page size", |run| {
+        if run.returned_count == run.default_limit {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected list_tasks to cap at the default page size {}, got {} rows",
+                run.default_limit, run.returned_count
+            ))
+        }
     })
 }
 
@@ -818,6 +904,20 @@ lets_expect! { #tokio_test
             let setup = StatusFilterSetup { filter_status: Status::Killed };
             to includes_the_killed_row { includes_expected_status_row() }
             to excludes_pending_done_and_failed { excludes_other_status_rows() }
+        }
+    }
+
+    // ----- list_tasks default filter branches ------------------------------
+    expect(run_list_tasks_default_status().await) {
+        when the_filter_status_is_unset {
+            to defaults_to_listing_pending_rows { includes_expected_status_row() }
+            to excludes_non_pending_rows { excludes_other_status_rows() }
+        }
+    }
+
+    expect(run_list_tasks_default_page_size().await) {
+        when no_page_size_is_supplied {
+            to caps_results_at_the_default_page_size { returns_default_page_size_rows() }
         }
     }
 

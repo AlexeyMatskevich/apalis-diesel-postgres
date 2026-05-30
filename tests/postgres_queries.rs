@@ -17,8 +17,7 @@ use apalis_core::{
     worker::{context::WorkerContext, ext::ack::Acknowledge},
 };
 use apalis_diesel_postgres::{
-    Config, PgAck, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage, build_pool, lock_task,
-    setup,
+    Config, PgAck, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage, lock_task,
 };
 use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
 use diesel::{
@@ -73,13 +72,7 @@ struct StatusRow {
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-
-    let pool = build_pool(database_url).map_err(|error| error.to_string())?;
-    setup(&pool).await.map_err(|error| error.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 fn invalid_pool() -> PgPool {

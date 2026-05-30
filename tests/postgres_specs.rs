@@ -24,11 +24,11 @@ use apalis_core::{
 };
 use apalis_diesel_postgres::{
     Config, Error as PgError, PgAck, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage,
-    build_pool, refresh_queue_stats_snapshot, setup, verify_schema,
+    refresh_queue_stats_snapshot, setup, verify_schema,
 };
 use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
 use diesel::{
-    PgConnection, QueryableByName, RunQueryDsl, sql_query,
+    Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz},
 };
 use futures::StreamExt;
@@ -67,12 +67,7 @@ where
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-    let pool = build_pool(database_url).map_err(|e| e.to_string())?;
-    setup(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
@@ -966,111 +961,158 @@ async fn run_verify_schema() -> Result<Outcome<VerifySchemaRun>, String> {
     // Branch 1: every migration has been applied — verify_schema returns Ok.
     let applied_result = verify_schema(&pool).await.map_err(|e| e.to_string());
 
-    // Branch 2: simulate an out-of-date schema by hiding the most recently
-    // applied migration row from `__diesel_schema_migrations` inside a
-    // serializable transaction we then ROLLBACK. The verifier opens its own
-    // connection, so we have to actually persist the deletion, run the
-    // verifier, and then restore the row. Wrapping the whole thing in a
-    // savepoint isn't possible because verify_schema borrows from the pool.
-    let removed = with_conn(pool.clone(), |conn| {
-        // Snapshot the latest migration row so we can put it back.
-        #[derive(diesel::QueryableByName)]
-        struct Row {
-            #[diesel(sql_type = Text)]
-            version: String,
-            #[diesel(sql_type = diesel::sql_types::Timestamp)]
-            run_on: chrono::NaiveDateTime,
-        }
-        let mut rows = sql_query(
-            "SELECT version, run_on FROM __diesel_schema_migrations \
-             ORDER BY version DESC LIMIT 1",
-        )
-        .load::<Row>(conn)
-        .map_err(|e| e.to_string())?;
-        let Some(row) = rows.pop() else {
-            return Err("no migrations recorded — cannot simulate pending state".into());
-        };
-        sql_query("DELETE FROM __diesel_schema_migrations WHERE version = $1")
-            .bind::<Text, _>(&row.version)
-            .execute(conn)
-            .map_err(|e| e.to_string())?;
-        Ok((row.version, row.run_on))
-    })
-    .await?;
-
-    // Drop-guard so the migration row is restored even if `verify_schema`
-    // panics or a future `?` short-circuits the function between the DELETE
-    // and the INSERT. Without this guard a hard failure would leave the
-    // shared `__diesel_schema_migrations` table corrupted for every
-    // subsequent test in the run.
-    struct RestoreGuard {
-        pool: PgPool,
-        version: Option<String>,
-        run_on: chrono::NaiveDateTime,
-    }
-    impl Drop for RestoreGuard {
-        fn drop(&mut self) {
-            let Some(version) = self.version.take() else {
-                return;
-            };
-            let pool = self.pool.clone();
-            let run_on = self.run_on;
-            // Use a fresh blocking connection — we cannot await here. Best
-            // effort: a connection-acquisition failure is logged but cannot
-            // be propagated through Drop. Using ON CONFLICT DO NOTHING keeps
-            // the restore idempotent if the row was somehow re-inserted by a
-            // parallel path before this guard fires.
-            if let Ok(mut conn) = pool.get() {
-                let _ = sql_query(
-                    "INSERT INTO __diesel_schema_migrations (version, run_on) \
-                     VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
-                )
-                .bind::<Text, _>(version)
-                .bind::<diesel::sql_types::Timestamp, _>(run_on)
-                .execute(&mut conn);
-            }
-        }
-    }
-    let mut guard = RestoreGuard {
-        pool: pool.clone(),
-        version: Some(removed.0),
-        run_on: removed.1,
-    };
-
-    let pending_result = verify_schema(&pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string());
-
-    // Restore eagerly in the happy path (consumes the guard's payload, so the
-    // Drop impl becomes a no-op) and surface any restore failure to the test.
-    let version = guard.version.take().expect("version still owned by guard");
-    let run_on = guard.run_on;
-    with_conn(pool.clone(), move |conn| {
-        sql_query(
-            "INSERT INTO __diesel_schema_migrations (version, run_on) \
-             VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
-        )
-        .bind::<Text, _>(version)
-        .bind::<diesel::sql_types::Timestamp, _>(run_on)
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    })
-    .await?;
-
-    // verify_schema in the "pending" branch is supposed to return Err — invert
-    // the Result so the assertion helper can treat the expected failure as a
-    // success.
-    let pending_inverted = match pending_result {
-        Err(_) => Ok(()),
-        Ok(()) => Err("verify_schema returned Ok despite a missing migration row".into()),
-    };
+    // Branch 2: a schema missing a migration row — verify_schema returns Err.
+    // Deleting a `__diesel_schema_migrations` row would race with concurrent
+    // setup() calls if run on the shared database (the race surfaces as a
+    // duplicate-key on `__diesel_schema_migrations_pkey`), so this branch runs
+    // against a throwaway database where the mutation is fully isolated. It is
+    // skipped (treated as a pass) when the role cannot CREATE DATABASE.
+    let url = support::database_url_or_skip()?
+        .ok_or("DATABASE_URL disappeared between the pool build and the verify branch")?;
+    let pending_result = verify_pending_branch_on_temp_db(&url).await?;
 
     Ok(Outcome::Completed(VerifySchemaRun {
         applied_result,
-        pending_result: pending_inverted,
+        pending_result,
     }))
+}
+
+/// Swap the database name in a libpq URL, preserving scheme/host/port and any
+/// `?query` parameters.
+fn swap_database_name(url: &str, database: &str) -> Result<String, String> {
+    let scheme_end = url.find("://").ok_or("database URL has no scheme")? + 3;
+    let rest = &url[scheme_end..];
+    let path_start = rest.find('/').ok_or("database URL has no path")?;
+    let authority = &rest[..path_start];
+    let after_path = &rest[path_start + 1..];
+    let query = after_path.find('?').map(|q| &after_path[q..]).unwrap_or("");
+    Ok(format!("{}{authority}/{database}{query}", &url[..scheme_end]))
+}
+
+/// Provision a throwaway database, apply migrations, delete the latest migration
+/// row, and confirm `verify_schema` rejects the out-of-date schema — fully
+/// isolated from the shared test database. Returns `Ok(())` on the expected
+/// rejection (or when skipped because the role lacks `CREATE DATABASE`); returns
+/// `Err` on an unexpected verify outcome or an infrastructure failure.
+async fn verify_pending_branch_on_temp_db(
+    maintenance_url: &str,
+) -> Result<Result<(), String>, String> {
+    let db_name = format!(
+        "apalis_verify_pending_{}",
+        Ulid::new().to_string().to_lowercase()
+    );
+
+    let provisioned = {
+        let maintenance_url = maintenance_url.to_owned();
+        let db_name = db_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let mut conn = PgConnection::establish(&maintenance_url).map_err(|e| e.to_string())?;
+            #[derive(diesel::QueryableByName)]
+            struct Flag {
+                #[diesel(sql_type = diesel::sql_types::Bool)]
+                rolcreatedb: bool,
+            }
+            let can_create =
+                sql_query("SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user")
+                    .load::<Flag>(&mut conn)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .next()
+                    .map(|row| row.rolcreatedb)
+                    .unwrap_or(false);
+            if !can_create {
+                return Ok(false);
+            }
+            sql_query(format!("CREATE DATABASE \"{db_name}\""))
+                .execute(&mut conn)
+                .map_err(|e| e.to_string())?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
+    if !provisioned {
+        return Ok(Ok(()));
+    }
+
+    let temp_url = match swap_database_name(maintenance_url, &db_name) {
+        Ok(url) => url,
+        Err(_) => {
+            // Could not derive a throwaway URL; drop the orphan DB and skip.
+            drop_temp_database(maintenance_url, &db_name).await;
+            return Ok(Ok(()));
+        }
+    };
+    let outcome: Result<Result<(), String>, String> = async {
+        let temp_pool = apalis_diesel_postgres::build_pool_with(&temp_url, |builder| {
+            builder.max_size(1).min_idle(Some(0))
+        })
+        .map_err(|e| e.to_string())?;
+        // SAFETY: confirm the pool really resolved to the throwaway database
+        // before touching `__diesel_schema_migrations`. A `DATABASE_URL` with a
+        // `?dbname=` query parameter (or other libpq forms) can make `temp_url`
+        // resolve back to the main database despite the swapped path — deleting a
+        // migration row there would corrupt the shared schema. If we are not on
+        // `db_name`, skip the branch rather than mutate the wrong database.
+        let on_temp_db = {
+            let expected = db_name.clone();
+            with_conn(temp_pool.clone(), move |conn| {
+                #[derive(diesel::QueryableByName)]
+                struct Db {
+                    #[diesel(sql_type = Text)]
+                    db: String,
+                }
+                let actual = sql_query("SELECT current_database()::text AS db")
+                    .load::<Db>(conn)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .next()
+                    .map(|row| row.db)
+                    .ok_or_else(|| "current_database() returned no row".to_owned())?;
+                Ok(actual == expected)
+            })
+            .await?
+        };
+        if !on_temp_db {
+            return Ok(Ok(()));
+        }
+        setup(&temp_pool).await.map_err(|e| e.to_string())?;
+        with_conn(temp_pool.clone(), |conn| {
+            sql_query(
+                "DELETE FROM __diesel_schema_migrations \
+                 WHERE version = ( \
+                     SELECT version FROM __diesel_schema_migrations \
+                     ORDER BY version DESC LIMIT 1)",
+            )
+            .execute(conn)
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await?;
+        Ok(match verify_schema(&temp_pool).await {
+            Err(_) => Ok(()),
+            Ok(()) => Err("verify_schema returned Ok despite a missing migration row".into()),
+        })
+    }
+    .await;
+
+    // Teardown runs on every path after CREATE so an error cannot leak the DB.
+    drop_temp_database(maintenance_url, &db_name).await;
+    outcome
+}
+
+/// Best-effort drop of a throwaway database, terminating any lingering sessions
+/// with `WITH (FORCE)`. A leaked test database is harmless but undesirable.
+async fn drop_temp_database(maintenance_url: &str, db_name: &str) {
+    let maintenance_url = maintenance_url.to_owned();
+    let db_name = db_name.to_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut conn) = PgConnection::establish(&maintenance_url) {
+            let _ = sql_query(format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"))
+                .execute(&mut conn);
+        }
+    })
+    .await;
 }
 
 fn verify_schema_accepts_a_fully_applied_database()

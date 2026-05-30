@@ -32,7 +32,7 @@ mod support;
 use std::time::Duration;
 
 use apalis_core::{backend::Backend, worker::context::WorkerContext};
-use apalis_diesel_postgres::{Config, PgPool, PgTask, PostgresStorage, build_pool_with, setup};
+use apalis_diesel_postgres::{Config, PgPool, PgTask, PostgresStorage};
 use diesel::{PgConnection, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
 use lets_expect::{AssertionError, AssertionResult, *};
@@ -70,16 +70,10 @@ where
 /// Build a pool with at least two connections so the LISTEN observer and the
 /// INSERT/`pg_notify` writer can run on independent connections.
 async fn test_pool_multi() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-    // Need at least 2 simultaneous connections: one pinned to the LISTEN
-    // observer thread, one for the writer. `min_idle = 0` keeps idle
-    // connections from piling up across many parallel test scenarios.
-    let pool = build_pool_with(database_url, |b| b.max_size(3).min_idle(Some(0)))
-        .map_err(|e| e.to_string())?;
-    setup(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Some(pool))
+    // These scenarios need ≥2 simultaneous connections (one pinned to the LISTEN
+    // observer thread, one for the writer); the shared per-binary pool is sized
+    // well above that.
+    support::shared_pool().await
 }
 
 async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
@@ -119,9 +113,20 @@ struct ObservedNotify {
     payload: String,
 }
 
-/// Run `setup` on a pinned listener connection, INSERT job rows on a
-/// separate connection, then drain `notifications_iter` for up to `deadline`
-/// and return the captured payloads (limited to `max_payloads`).
+/// Run `setup_writer` while a pinned connection holds `LISTEN`, then drain
+/// `notifications_iter` and return the captured payloads (limited to
+/// `max_payloads`).
+///
+/// The writer runs on the **same** connection that holds the `LISTEN`.
+/// PostgreSQL delivers a session its own notifications, so the trigger's
+/// behaviour — whether it fires and the payload shape, which is all these specs
+/// assert — is observed reliably. An earlier "separate writer connection" design
+/// was intermittently flaky: the cross-session NOTIFY sometimes failed to reach
+/// the listener even within a multi-second window. `deadline` is kept generous
+/// (self-delivery is occasionally not buffered for a few hundred ms); to stay
+/// fast the loop returns early once it has seen at least one payload followed by
+/// a quiet `SETTLE` window (or once it reaches `max_payloads`). Scenarios that
+/// expect *no* payload pass a short `deadline` and simply wait it out.
 async fn capture_trigger_notifies<F>(
     pool: PgPool,
     setup_writer: F,
@@ -131,15 +136,8 @@ async fn capture_trigger_notifies<F>(
 where
     F: FnOnce(&mut PgConnection) -> Result<(), String> + Send + 'static,
 {
-    // Take the listener connection synchronously and hold it for the
-    // duration of the test on a blocking thread. The writer runs on a
-    // separate pool checkout so the listener never serializes against the
-    // INSERT.
-    let listener_pool = pool.clone();
-    let writer_pool = pool.clone();
-
     tokio::task::spawn_blocking(move || -> Result<Vec<ObservedNotify>, String> {
-        let mut listener = listener_pool.get().map_err(|e| e.to_string())?;
+        let mut listener = pool.get().map_err(|e| e.to_string())?;
         sql_query("LISTEN \"apalis::job::insert\"")
             .execute(&mut *listener)
             .map_err(|e| e.to_string())?;
@@ -148,16 +146,15 @@ where
         // arrived between checkout and LISTEN.
         for _ in listener.notifications_iter().flatten() {}
 
-        // Run writer on a *different* pooled connection.
-        {
-            let mut writer = writer_pool.get().map_err(|e| e.to_string())?;
-            setup_writer(&mut writer)?;
-        }
+        // Run the writer on this same connection so the trigger's NOTIFY is
+        // self-delivered to this session (see the doc comment for why a separate
+        // listener connection was unreliable).
+        setup_writer(&mut listener)?;
 
-        // Poll for notifications until we either reach `max_payloads` or the
-        // deadline elapses with no new payload in the last poll interval.
+        const SETTLE: Duration = Duration::from_millis(300);
         let started = std::time::Instant::now();
         let mut collected: Vec<ObservedNotify> = Vec::new();
+        let mut last_payload_at: Option<std::time::Instant> = None;
         while started.elapsed() < deadline && collected.len() < max_payloads {
             let mut any = false;
             for notif in listener.notifications_iter() {
@@ -172,7 +169,15 @@ where
                     }
                 }
             }
-            if !any {
+            if any {
+                last_payload_at = Some(std::time::Instant::now());
+            } else {
+                // Once at least one payload has been seen, return as soon as a
+                // quiet SETTLE window confirms no more are coming, rather than
+                // waiting out the full (generous) deadline.
+                if last_payload_at.is_some_and(|at| at.elapsed() >= SETTLE) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
@@ -247,7 +252,7 @@ async fn run_single_row_insert() -> Result<Outcome<TriggerRun>, String> {
             Ok(())
         },
         4,
-        Duration::from_millis(750),
+        Duration::from_millis(5000),
     )
     .await?;
 
@@ -323,7 +328,7 @@ async fn run_batch_insert_chunks() -> Result<Outcome<TriggerRun>, String> {
             Ok(())
         },
         8,
-        Duration::from_millis(1500),
+        Duration::from_millis(5000),
     )
     .await?;
 

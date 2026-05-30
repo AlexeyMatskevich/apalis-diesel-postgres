@@ -18,7 +18,7 @@ mod support;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use apalis_diesel_postgres::{
-    Config, Error as PgError, PgPool, PgTask, PgTaskId, PostgresStorage, build_pool, setup,
+    Config, Error as PgError, PgPool, PgTask, PgTaskId, PostgresStorage,
 };
 use apalis_sql::{DateTimeExt, context::SqlContext};
 use diesel::{
@@ -57,12 +57,7 @@ where
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    let Some(database_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-    let pool = build_pool(database_url).map_err(|e| e.to_string())?;
-    setup(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
