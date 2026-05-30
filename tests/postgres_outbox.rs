@@ -376,6 +376,7 @@ struct CustomRun {
     db_idempotency_key: Option<String>,
     expected_run_at_secs: i64,
     expected_id: String,
+    expected_idempotency_key: String,
 }
 
 async fn run_custom_fields_scenario() -> Result<Outcome<CustomRun>, String> {
@@ -404,10 +405,11 @@ async fn run_custom_fields_scenario() -> Result<Outcome<CustomRun>, String> {
         serde_json::Value::Number(serde_json::Number::from(7)),
     );
 
+    let expected_idempotency_key = format!("idem-{queue}");
     let mut task = PgTask::<String>::new("payload".to_owned());
     task.parts.task_id = Some(preassigned_id);
     task.parts.run_at = expected_run_at_secs as u64;
-    task.parts.idempotency_key = Some(format!("idem-{queue}"));
+    task.parts.idempotency_key = Some(expected_idempotency_key.clone());
     task.parts.ctx = SqlContext::new()
         .with_max_attempts(9)
         .with_priority(5)
@@ -443,6 +445,7 @@ async fn run_custom_fields_scenario() -> Result<Outcome<CustomRun>, String> {
         db_idempotency_key: row.idempotency_key,
         expected_run_at_secs,
         expected_id: preassigned_id.to_string(),
+        expected_idempotency_key,
     }))
 }
 
@@ -519,9 +522,15 @@ fn custom_metadata_is_stored() -> impl Fn(&Result<Outcome<CustomRun>, String>) -
 fn custom_idempotency_key_is_stored()
 -> impl Fn(&Result<Outcome<CustomRun>, String>) -> AssertionResult {
     observe("custom→idempotency_key", |run: &CustomRun| {
-        match &run.db_idempotency_key {
-            Some(key) if key.starts_with("idem-apalis-outbox-custom-") => Ok(()),
-            other => Err(format!("unexpected idempotency_key in DB: {other:?}")),
+        // Exact equality: the value is fully known at construction time, so a
+        // prefix check would miss truncation or trailing corruption.
+        if run.db_idempotency_key.as_deref() == Some(run.expected_idempotency_key.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected idempotency_key {:?}, got {:?}",
+                run.expected_idempotency_key, run.db_idempotency_key
+            ))
         }
     })
 }

@@ -17,8 +17,9 @@ use std::{
 use apalis::prelude::*;
 use apalis_core::{backend::FetchById, task::status::Status};
 use apalis_diesel_postgres::{
-    Config, Error as PgError, PgPool, PostgresStorage, build_pool, setup,
+    Config, Error as PgError, PgPool, PgTask, PostgresStorage, build_pool, setup,
 };
+use apalis_sql::context::SqlContext;
 use diesel::{Connection, RunQueryDsl, sql_query, sql_types::Text};
 use lets_expect::{AssertionError, AssertionResult, *};
 use serde::{Deserialize, Serialize};
@@ -124,12 +125,17 @@ async fn run_worker_integration(handler_outcome: HandlerOutcome) -> Result<Worke
         tokio::task::spawn_blocking(move || -> Result<_, PgError> {
             let mut conn = storage.pool().get().map_err(PgError::Pool)?;
             conn.transaction(|c| {
-                storage.push_with_conn(
-                    c,
-                    SendEmail {
-                        to: "ada@example.com".to_owned(),
-                    },
-                )
+                // `max_attempts = 1` makes a single handler `Err` terminal
+                // (`Killed`), so the err-branch row is never re-fetchable. This
+                // keeps `handler_invocations == 1` deterministic instead of
+                // relying on `worker_handle.abort()` winning a race against the
+                // fetcher's next poll (a `Failed` row with attempts left would
+                // be immediately re-claimed).
+                let mut task = PgTask::<SendEmail>::new(SendEmail {
+                    to: "ada@example.com".to_owned(),
+                });
+                task.parts.ctx = SqlContext::new().with_max_attempts(1);
+                storage.push_task_with_conn(c, task)
             })
         })
         .await
@@ -191,9 +197,11 @@ async fn run_worker_integration(handler_outcome: HandlerOutcome) -> Result<Worke
         let _ = worker.run().await;
     });
 
-    let signalled = tokio::time::timeout(Duration::from_secs(10), done.notified())
-        .await
-        .is_ok();
+    // Barrier: wait until the handler has run (or 10s) before polling for the
+    // terminal row, so the poll loop observes the post-execution state. The
+    // invocation count is asserted separately, so the wait's boolean result
+    // carries no extra signal and is intentionally not captured.
+    let _ = tokio::time::timeout(Duration::from_secs(10), done.notified()).await;
 
     // Poll until apalis writes the terminal row — Done for the ok branch,
     // anything non-Running for the err branch. Deterministic on behaviour, not
@@ -226,7 +234,6 @@ async fn run_worker_integration(handler_outcome: HandlerOutcome) -> Result<Worke
         std::panic::resume_unwind(join_err.into_panic());
     }
 
-    let _ = signalled;
     let handler_invocations = invocations.load(Ordering::Relaxed);
     let in_handler_push_invocations = push_ok.load(Ordering::Relaxed);
     let activity_count = count_jobs(pool.clone(), activity_queue.clone()).await?;
@@ -292,14 +299,19 @@ fn email_terminal_status_is_done() -> impl Fn(&Result<WorkerOutcome, String>) ->
     })
 }
 
-fn email_terminal_status_is_not_done() -> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult
-{
+fn email_terminal_status_is_killed() -> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult {
     observe("email terminal status (err branch)", |run| {
+        // `max_attempts = 1` means a single handler `Err` exhausts the retry
+        // budget, so the row must reach the terminal `Killed` state and never be
+        // re-fetchable. Asserting exactly `Killed` (not merely "not Done") is
+        // what proves the de-flake invariant: a looser check would also pass on
+        // a still-`Running` row, i.e. on the very race this fix removes.
         match &run.email_status {
-            Some(Status::Done) => {
-                Err("handler returned Err but apalis still wrote Status::Done".into())
-            }
-            _ => Ok(()),
+            Some(Status::Killed) => Ok(()),
+            Some(other) => Err(format!(
+                "expected terminal Status::Killed for the exhausted err task, got {other:?}"
+            )),
+            None => Err("email row vanished after the failed ack".into()),
         }
     })
 }
@@ -343,8 +355,8 @@ lets_expect! { #tokio_test
                 // is durable independently of the handler's final result.
                 activity_queue_holds_exactly_one_row()
             }
-            to does_not_mark_the_email_task_as_done {
-                email_terminal_status_is_not_done()
+            to kills_the_email_task_after_the_exhausted_attempt {
+                email_terminal_status_is_killed()
             }
         }
     }

@@ -758,7 +758,7 @@ async fn run_metrics_terminal_mix() -> Result<Outcome<MetricsRun>, String> {
 /// the SQL builds `value AS REAL` from a COUNT(*) so the integer rendering
 /// is what Postgres chooses. Accept any representation parseable to the
 /// expected count.
-fn metric_counts_at_least(
+fn metric_count_approx_equals(
     title: &'static str,
     expected: f64,
 ) -> impl Fn(&MetricsRun) -> Result<(), String> {
@@ -791,7 +791,7 @@ fn metric_value_is(
     title: &'static str,
     expected: f64,
 ) -> impl Fn(&Result<Outcome<MetricsRun>, String>) -> AssertionResult {
-    let body = metric_counts_at_least(title, expected);
+    let body = metric_count_approx_equals(title, expected);
     observe::<MetricsRun, _>(title, body)
 }
 

@@ -199,34 +199,21 @@ struct TriggerRun {
     /// All payloads observed during the deadline window, filtered to those
     /// whose `job_type` field equals the test queue.
     payloads: Vec<Value>,
-    /// Number of NOTIFY messages observed for *other* queues (cross-talk
-    /// sanity check; informational — not currently asserted).
-    #[allow(dead_code)]
-    other_queue_payloads: usize,
 }
 
 fn parse_payloads(observed: Vec<ObservedNotify>, queue: &str) -> TriggerRun {
     let mut payloads = Vec::new();
-    let mut other = 0;
     for ObservedNotify { payload } in observed {
-        match serde_json::from_str::<Value>(&payload) {
-            Ok(v) => {
-                if v.get("job_type").and_then(Value::as_str) == Some(queue) {
-                    payloads.push(v);
-                } else {
-                    other += 1;
-                }
-            }
-            Err(_) => {
-                // Unparseable payload (e.g. the empty drop-wakeup NOTIFY).
-                // Ignore — it cannot belong to our queue.
-            }
+        // Payloads for other queues (concurrent tests share the single LISTEN
+        // channel, so cross-talk is expected and not asserted on) and
+        // unparseable drop-wakeups are both ignored — only our queue matters.
+        if let Ok(v) = serde_json::from_str::<Value>(&payload)
+            && v.get("job_type").and_then(Value::as_str) == Some(queue)
+        {
+            payloads.push(v);
         }
     }
-    TriggerRun {
-        payloads,
-        other_queue_payloads: other,
-    }
+    TriggerRun { payloads }
 }
 
 async fn run_single_row_insert() -> Result<Outcome<TriggerRun>, String> {
