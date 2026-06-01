@@ -38,6 +38,32 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// One or more tasks in an enqueue batch collided with the
+    /// `(job_type, idempotency_key)` unique constraint.
+    ///
+    /// The **whole batch is rolled back, not only the colliding rows**: the
+    /// duplicates are dropped by `ON CONFLICT DO NOTHING`, then the post-insert
+    /// check rolls the batch's SAVEPOINT back, so every task in the batch is
+    /// undone — including the non-conflicting ones. A surrounding (outer)
+    /// transaction stays alive, so the caller can decide whether to commit the
+    /// rest of its work or roll back. `conflicting_keys` lists exactly which
+    /// `idempotency_key`s collided, so a batch caller can drop them and
+    /// re-enqueue the rest. Match this variant instead of the
+    /// [`Error::InvalidArgument`] message text to tell a benign duplicate apart
+    /// from a real failure.
+    #[error(
+        "idempotency_key conflict in queue `{job_type}`: keys {conflicting_keys:?} collided with the unique constraint; {total} task(s) in the batch were all rolled back"
+    )]
+    IdempotencyConflict {
+        /// Queue (`job_type`) the conflicting batch targeted.
+        job_type: String,
+        /// The distinct `idempotency_key`s that collided — either against an
+        /// already-stored row or another task in the same batch.
+        conflicting_keys: Vec<String>,
+        /// Total tasks in the batch; all of them were rolled back.
+        total: usize,
+    },
+
     /// A task payload or task result could not be decoded.
     #[error("failed to decode task payload or result with the configured codec: {0}")]
     Decode(#[source] BoxDynError),
@@ -173,6 +199,18 @@ impl Error {
             worker_id: worker_id.into(),
             queue: queue.into(),
             hint,
+        }
+    }
+
+    pub(crate) fn idempotency_conflict(
+        job_type: impl Into<String>,
+        conflicting_keys: Vec<String>,
+        total: usize,
+    ) -> Self {
+        Self::IdempotencyConflict {
+            job_type: job_type.into(),
+            conflicting_keys,
+            total,
         }
     }
 }
@@ -348,6 +386,26 @@ mod tests {
         }
     }
 
+    fn is_idempotency_conflict(error: &Error) -> AssertionResult {
+        match error {
+            Error::IdempotencyConflict {
+                job_type,
+                conflicting_keys,
+                total,
+            } if job_type == "emails"
+                && conflicting_keys.len() == 2
+                && conflicting_keys[0] == "k-1"
+                && conflicting_keys[1] == "k-2"
+                && *total == 3 =>
+            {
+                Ok(())
+            }
+            other => Err(AssertionError::new(vec![format!(
+                "expected idempotency conflict {{emails, [k-1, k-2], 3}}, got {other:?}"
+            )])),
+        }
+    }
+
     lets_expect! {
         expect(database_error()) {
             to displays_the_operation_context { displays_as("database error while fetching jobs: Record not found") }
@@ -386,6 +444,16 @@ mod tests {
 
         expect(Error::AlreadyRegistered("worker-1".to_string())) {
             to displays_the_registration_error { displays_as("worker registration already exists or is being registered concurrently: worker-1") }
+            to has_no_error_source { has_no_source }
+        }
+
+        expect(Error::idempotency_conflict(
+            "emails",
+            vec!["k-1".to_owned(), "k-2".to_owned()],
+            3,
+        )) {
+            to identifies_the_conflicting_queue_and_keys { is_idempotency_conflict }
+            to displays_the_conflict_and_rollback_semantics { displays_as("idempotency_key conflict in queue `emails`: keys [\"k-1\", \"k-2\"] collided with the unique constraint; 3 task(s) in the batch were all rolled back") }
             to has_no_error_source { has_no_source }
         }
 

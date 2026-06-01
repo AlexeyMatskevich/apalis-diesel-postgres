@@ -578,7 +578,7 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
 
     // Conflict scenario: open an outer transaction, insert a business row,
     // attempt a second push with the same idempotency_key (expected to
-    // surface InvalidArgument via savepoint rollback), then commit the
+    // surface Error::IdempotencyConflict via savepoint rollback), then commit the
     // outer transaction. The business row must survive the savepoint
     // rollback.
     let q = queue.clone();
@@ -603,12 +603,12 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
                             "expected idempotency conflict, got success".into(),
                         ));
                     }
-                    Err(PgError::InvalidArgument(msg)) if msg.contains("idempotency_key") => {
+                    Err(PgError::IdempotencyConflict { .. }) => {
                         observed.set(true);
                     }
                     Err(other) => {
                         return Err(PgError::InvalidArgument(format!(
-                            "expected InvalidArgument(idempotency), got {other:?}"
+                            "expected Error::IdempotencyConflict, got {other:?}"
                         )));
                     }
                 }
@@ -634,13 +634,13 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
     }))
 }
 
-fn conflict_surfaces_invalid_argument()
+fn conflict_surfaces_idempotency_conflict()
 -> impl Fn(&Result<Outcome<ConflictRun>, String>) -> AssertionResult {
     observe("conflict→error kind", |run: &ConflictRun| {
         if run.second_push_was_conflict_error {
             Ok(())
         } else {
-            Err("second push did not surface an idempotency_key InvalidArgument".into())
+            Err("second push did not surface an Error::IdempotencyConflict".into())
         }
     })
 }
@@ -715,8 +715,8 @@ lets_expect! { #tokio_test
 
     expect(run_conflict_scenario().await) {
         when push_task_with_conn_collides_on_idempotency_key {
-            to surfaces_invalid_argument_with_the_idempotency_hint {
-                conflict_surfaces_invalid_argument()
+            to surfaces_an_idempotency_conflict {
+                conflict_surfaces_idempotency_conflict()
             }
             to rolls_back_only_the_apalis_batch_via_savepoint {
                 conflict_keeps_only_the_seed_job()

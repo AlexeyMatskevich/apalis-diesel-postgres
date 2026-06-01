@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use apalis_sql::{DateTime, DateTimeExt};
 use diesel::{
     Connection, PgConnection, RunQueryDsl, sql_query,
@@ -24,6 +26,15 @@ pub(crate) const MAX_QUEUE_NAME_LEN: usize = 255;
 /// bytes leaves room for prefixed/composite keys without allowing unbounded
 /// per-row storage growth.
 pub(crate) const MAX_IDEMPOTENCY_KEY_LEN: usize = 1024;
+
+/// One `RETURNING idempotency_key` row from the batch INSERT: the keys that
+/// actually landed (ON CONFLICT DO NOTHING skips duplicates). Used to recover
+/// which submitted keys collided.
+#[derive(diesel::QueryableByName)]
+struct ReturnedIdempotencyKey {
+    #[diesel(sql_type = Nullable<Text>)]
+    idempotency_key: Option<String>,
+}
 
 pub(crate) fn push_tasks(
     pool: PgPool,
@@ -109,8 +120,13 @@ pub(crate) fn push_tasks_on_conn(
 
     let task_count = ids.len();
     let any_idempotency_key = idempotency_keys.iter().any(Option::is_some);
+    // `job_type` and `idempotency_keys` are moved into the INSERT bind below;
+    // keep copies so the conflict branch can name the queue and report exactly
+    // which keys collided in `Error::IdempotencyConflict`.
+    let conflict_job_type = job_type.clone();
+    let submitted_keys: Vec<String> = idempotency_keys.iter().flatten().cloned().collect();
     conn.transaction(|conn| {
-        let inserted = sql_query(
+        let inserted_rows = sql_query(
             "INSERT INTO apalis.jobs (
                 id,
                 job_type,
@@ -136,7 +152,8 @@ pub(crate) fn push_tasks_on_conn(
                 unnest($8::text[]) AS idempotency_key
             ON CONFLICT (job_type, idempotency_key)
                 WHERE idempotency_key IS NOT NULL
-                DO NOTHING",
+                DO NOTHING
+            RETURNING idempotency_key",
         )
         .bind::<Array<Text>, _>(ids)
         .bind::<Text, _>(job_type)
@@ -146,19 +163,54 @@ pub(crate) fn push_tasks_on_conn(
         .bind::<Array<Integer>, _>(priorities)
         .bind::<Array<Text>, _>(metadata)
         .bind::<Array<Nullable<Text>>, _>(idempotency_keys)
-        .execute(conn)
+        .load::<ReturnedIdempotencyKey>(conn)
         .map_err(Error::database("inserting jobs"))?;
+        let inserted = inserted_rows.len();
         // Surface ON CONFLICT DO NOTHING as an error to the caller when
         // the batch carried any `idempotency_key`: silent dedup makes the
         // caller unable to distinguish a fresh enqueue from a rejected
         // duplicate. Without an `idempotency_key`, no conflict path is
         // possible, so the inserted count must equal the batch.
+        //
+        // Returning `Err` here rolls the whole `conn.transaction(...)`
+        // SAVEPOINT back, so a single duplicate undoes the *entire* batch —
+        // including rows that ON CONFLICT DO NOTHING had already inserted —
+        // while the caller's outer transaction stays alive. The typed
+        // `IdempotencyConflict` lets callers branch on the variant instead of
+        // parsing the message text.
         if inserted < task_count && any_idempotency_key {
-            return Err(Error::InvalidArgument(format!(
-                "idempotency_key conflict: {} of {} tasks were rejected by the unique constraint",
-                task_count - inserted,
+            // Recover the distinct keys that collided. Walk the submitted keys
+            // and consume one matching inserted row per key; any submission left
+            // without a matching inserted row is a collision (intra-batch or
+            // against an already-stored row).
+            let mut inserted_remaining: HashMap<&str, usize> = HashMap::new();
+            for row in &inserted_rows {
+                if let Some(key) = row.idempotency_key.as_deref() {
+                    *inserted_remaining.entry(key).or_insert(0) += 1;
+                }
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut conflicting_keys: Vec<String> = Vec::new();
+            for key in &submitted_keys {
+                let inserted_here = inserted_remaining
+                    .get_mut(key.as_str())
+                    .is_some_and(|count| {
+                        if *count > 0 {
+                            *count -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                if !inserted_here && seen.insert(key.as_str()) {
+                    conflicting_keys.push(key.clone());
+                }
+            }
+            return Err(Error::idempotency_conflict(
+                conflict_job_type,
+                conflicting_keys,
                 task_count,
-            )));
+            ));
         }
         Ok(())
     })

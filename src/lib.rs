@@ -284,9 +284,10 @@ where
     ///
     /// # Errors
     /// - [`Error::Decode`] if the codec rejects the task's `args`.
-    /// - [`Error::InvalidArgument`] on `idempotency_key` conflict — the
-    ///   savepoint for this batch is rolled back, but your outer transaction
-    ///   continues; decide whether to commit or roll back based on the error.
+    /// - [`Error::IdempotencyConflict`] on `idempotency_key` conflict — the
+    ///   savepoint for this batch is rolled back (the whole batch, not just the
+    ///   duplicate), but your outer transaction continues; decide whether to
+    ///   commit or roll back based on the error.
     /// - [`Error::InvalidArgument`] if serialized metadata exceeds the byte
     ///   cap.
     /// - [`Error::Database`] for SQL/driver failures.

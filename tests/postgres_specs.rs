@@ -17,7 +17,7 @@ use std::{
 
 use apalis_core::backend::{ListQueues, ListWorkers};
 use apalis_core::{
-    backend::{Backend, RegisterWorker, TaskSink},
+    backend::{Backend, RegisterWorker, TaskSink, TaskSinkError},
     error::BoxDynError,
     task::{Task, attempt::Attempt, builder::TaskBuilder, status::Status, task_id::TaskId},
     worker::{context::WorkerContext, ext::ack::Acknowledge},
@@ -1158,18 +1158,20 @@ fn verify_schema_records_both_branches()
 // --------------------------------------------------------------------------
 // push_tasks partial-batch idempotency conflict.
 //
-// `src/queries/push.rs:114` surfaces a partial-conflict batch as
-// `Error::InvalidArgument("idempotency_key conflict: M of N tasks were
-// rejected by the unique constraint")`. All existing idempotency tests push
-// one task at a time, so the `inserted < task_count` branch — and the
-// "M of N" counter in the error message — is never exercised. Drive the
-// branch with a buffered batch that shares a single `idempotency_key` plus a
-// pre-existing row that occupies it.
+// `src/queries/push.rs` surfaces a partial-conflict batch as
+// `Error::IdempotencyConflict { job_type, rejected, total }`. All single-task
+// idempotency tests push one task at a time, so the `inserted < task_count`
+// branch — and the rejected/total counters on the typed error — is never
+// exercised. Drive the branch with a buffered batch that shares a single
+// `idempotency_key` plus a pre-existing row that occupies it.
 // --------------------------------------------------------------------------
 
 #[derive(Debug)]
 struct PartialBatchRun {
-    push_error: Option<String>,
+    /// `(conflicting_keys, total)` when the push failed with `IdempotencyConflict`.
+    conflict: Option<(Vec<String>, usize)>,
+    /// `to_string()` of any other (non-conflict) push error, for diagnostics.
+    other_error: Option<String>,
     final_count: i64,
 }
 
@@ -1229,9 +1231,20 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
     })
     .await?;
 
+    let (conflict, other_error) = match push_result {
+        Ok(()) => (None, None),
+        Err(TaskSinkError::PushError(PgError::IdempotencyConflict {
+            conflicting_keys,
+            total,
+            ..
+        })) => (Some((conflicting_keys, total)), None),
+        Err(other) => (None, Some(other.to_string())),
+    };
+
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(PartialBatchRun {
-        push_error: push_result.err().map(|e| e.to_string()),
+        conflict,
+        other_error,
         final_count,
     }))
 }
@@ -1239,12 +1252,19 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
 fn partial_batch_rejects_with_count()
 -> impl Fn(&Result<Outcome<PartialBatchRun>, String>) -> AssertionResult {
     observe::<PartialBatchRun, _>("partial-batch reject", |run| {
-        match run.push_error.as_deref() {
-            Some(msg) if msg.contains("idempotency_key conflict") && msg.contains("of") => Ok(()),
-            Some(other) => Err(format!(
-                "expected InvalidArgument citing 'idempotency_key conflict: M of N', got {other:?}"
+        match (run.conflict.as_ref(), run.other_error.as_deref()) {
+            (Some((keys, total)), _)
+                if keys.len() == 1 && keys[0] == "shared-key" && *total == 3 =>
+            {
+                Ok(())
+            }
+            (Some((keys, total)), _) => Err(format!(
+                "expected conflicting_keys=[shared-key], total=3, got keys={keys:?}, total={total}"
             )),
-            None => Err(
+            (None, Some(other)) => Err(format!(
+                "expected Error::IdempotencyConflict, got {other:?}"
+            )),
+            (None, None) => Err(
                 "expected push_all to be rejected when every task in the batch conflicts".into(),
             ),
         }
@@ -1263,6 +1283,246 @@ fn partial_batch_rolls_back_inserts()
         } else {
             Err(format!(
                 "expected exactly the seed row to remain (1), got {} rows",
+                run.final_count
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// push_tasks all-or-nothing batch rollback.
+//
+// The all-dup batch above never inserts anything (every row conflicts), so it
+// does not prove that *non-conflicting* rows are also rolled back. Seed one
+// row, then push a batch of [fresh, duplicate, fresh] with distinct keys:
+// ON CONFLICT DO NOTHING inserts the two fresh rows and skips the duplicate,
+// the accountant sees `inserted (2) < task_count (3)` and returns
+// `Error::IdempotencyConflict { rejected: 1, total: 3 }` from inside
+// `conn.transaction(...)`, and the SAVEPOINT rollback then undoes the two
+// fresh rows too — so only the seed survives. That is the all-or-nothing
+// guarantee a single duplicate enforces on the whole batch.
+// --------------------------------------------------------------------------
+
+async fn run_mixed_batch_conflict() -> Result<Outcome<PartialBatchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-mixed-conflict-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    // Seed the queue with one row occupying the "shared-key" slot.
+    let mut seed_storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let seed = TaskBuilder::new("seed".to_owned())
+        .with_task_id(task_id())
+        .run_at_timestamp(now_unix())
+        .with_attempt(Attempt::new_with_value(0))
+        .with_ctx(SqlContext::new().with_max_attempts(5))
+        .with_idempotency_key("shared-key")
+        .build();
+    seed_storage
+        .push_task(seed)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // A 3-task batch with DISTINCT keys: two fresh, one colliding with the
+    // seed. buffer_size=3 flushes all three through one `push_tasks` call.
+    let config = Config::new(&queue).set_buffer_size(3);
+    let mut batch_storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let keys = ["fresh-a", "shared-key", "fresh-b"];
+    let batch: Vec<Task<String, PgContext, Ulid>> = keys
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            TaskBuilder::new(format!("mixed-{i}"))
+                .with_task_id(task_id())
+                .run_at_timestamp(now_unix())
+                .with_attempt(Attempt::new_with_value(0))
+                .with_ctx(PgContext::new().with_max_attempts(5))
+                .with_idempotency_key(key)
+                .build()
+        })
+        .collect();
+    let stream = futures::stream::iter(batch);
+    let push_result = batch_storage.push_all(stream).await;
+
+    let q = queue.clone();
+    let final_count: i64 = with_conn(pool.clone(), move |conn| {
+        #[derive(QueryableByName)]
+        struct C {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        sql_query("SELECT COUNT(*) AS n FROM apalis.jobs WHERE job_type = $1")
+            .bind::<Text, _>(&q)
+            .get_result::<C>(conn)
+            .map(|c| c.n)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    let (conflict, other_error) = match push_result {
+        Ok(()) => (None, None),
+        Err(TaskSinkError::PushError(PgError::IdempotencyConflict {
+            conflicting_keys,
+            total,
+            ..
+        })) => (Some((conflicting_keys, total)), None),
+        Err(other) => (None, Some(other.to_string())),
+    };
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(PartialBatchRun {
+        conflict,
+        other_error,
+        final_count,
+    }))
+}
+
+fn mixed_batch_reports_only_the_duplicate()
+-> impl Fn(&Result<Outcome<PartialBatchRun>, String>) -> AssertionResult {
+    observe::<PartialBatchRun, _>("mixed-batch reject key", |run| {
+        match (run.conflict.as_ref(), run.other_error.as_deref()) {
+            (Some((keys, total)), _)
+                if keys.len() == 1 && keys[0] == "shared-key" && *total == 3 =>
+            {
+                Ok(())
+            }
+            (Some((keys, total)), _) => Err(format!(
+                "expected conflicting_keys=[shared-key], total=3, got keys={keys:?}, total={total}"
+            )),
+            (None, Some(other)) => Err(format!(
+                "expected Error::IdempotencyConflict, got {other:?}"
+            )),
+            (None, None) => {
+                Err("expected the mixed batch to be rejected by the one duplicate".into())
+            }
+        }
+    })
+}
+
+fn mixed_batch_rolls_back_the_fresh_rows_too()
+-> impl Fn(&Result<Outcome<PartialBatchRun>, String>) -> AssertionResult {
+    observe::<PartialBatchRun, _>("mixed-batch all-or-nothing", |run| {
+        // The two fresh, non-colliding rows were inserted by ON CONFLICT DO
+        // NOTHING and then rolled back with the SAVEPOINT, so only the seed
+        // survives — the all-or-nothing guarantee.
+        if run.final_count == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected only the seed to survive (1) — the fresh rows must roll back with the batch — got {} rows",
+                run.final_count
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// push_tasks intra-batch duplicate interleaved with NULL keys, no seed.
+//
+// Exercises the key-recovery walk on the path with NO pre-existing row: a
+// batch [dup, <no key>, dup, unique] into an empty queue. ON CONFLICT DO
+// NOTHING inserts the first `dup`, the keyless (NULL) row, and `unique`; the
+// second `dup` collides intra-batch. `conflicting_keys` must be exactly
+// ["dup-key"] — the NULL row is never reported — and the whole batch (every
+// row that did insert included) rolls back, leaving the queue empty. This is
+// the case the seeded tests above cannot reach: a collision with no
+// pre-existing row, plus a NULL-key row that must be excluded.
+// --------------------------------------------------------------------------
+
+async fn run_intrabatch_dup_with_nulls() -> Result<Outcome<PartialBatchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-intrabatch-nulls-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    // No seed: the queue starts empty, so the only collision is intra-batch.
+    let config = Config::new(&queue).set_buffer_size(4);
+    let mut batch_storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let specs: [Option<&str>; 4] = [Some("dup-key"), None, Some("dup-key"), Some("unique-key")];
+    let batch: Vec<Task<String, PgContext, Ulid>> = specs
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let builder = TaskBuilder::new(format!("nb-{i}"))
+                .with_task_id(task_id())
+                .run_at_timestamp(now_unix())
+                .with_attempt(Attempt::new_with_value(0))
+                .with_ctx(PgContext::new().with_max_attempts(5));
+            match key {
+                Some(k) => builder.with_idempotency_key(k).build(),
+                None => builder.build(),
+            }
+        })
+        .collect();
+    let stream = futures::stream::iter(batch);
+    let push_result = batch_storage.push_all(stream).await;
+
+    let q = queue.clone();
+    let final_count: i64 = with_conn(pool.clone(), move |conn| {
+        #[derive(QueryableByName)]
+        struct C {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        sql_query("SELECT COUNT(*) AS n FROM apalis.jobs WHERE job_type = $1")
+            .bind::<Text, _>(&q)
+            .get_result::<C>(conn)
+            .map(|c| c.n)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    let (conflict, other_error) = match push_result {
+        Ok(()) => (None, None),
+        Err(TaskSinkError::PushError(PgError::IdempotencyConflict {
+            conflicting_keys,
+            total,
+            ..
+        })) => (Some((conflicting_keys, total)), None),
+        Err(other) => (None, Some(other.to_string())),
+    };
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(PartialBatchRun {
+        conflict,
+        other_error,
+        final_count,
+    }))
+}
+
+fn intrabatch_reports_only_the_repeated_key()
+-> impl Fn(&Result<Outcome<PartialBatchRun>, String>) -> AssertionResult {
+    observe::<PartialBatchRun, _>("intra-batch reject key", |run| {
+        match (run.conflict.as_ref(), run.other_error.as_deref()) {
+            (Some((keys, total)), _) if keys.len() == 1 && keys[0] == "dup-key" && *total == 4 => {
+                Ok(())
+            }
+            (Some((keys, total)), _) => Err(format!(
+                "expected conflicting_keys=[dup-key] (NULL row excluded), total=4, got keys={keys:?}, total={total}"
+            )),
+            (None, Some(other)) => Err(format!(
+                "expected Error::IdempotencyConflict, got {other:?}"
+            )),
+            (None, None) => Err(
+                "expected the intra-batch duplicate to be rejected even with no pre-existing row"
+                    .into(),
+            ),
+        }
+    })
+}
+
+fn intrabatch_dup_rolls_back_the_whole_batch()
+-> impl Fn(&Result<Outcome<PartialBatchRun>, String>) -> AssertionResult {
+    observe::<PartialBatchRun, _>("intra-batch all-or-nothing", |run| {
+        // The first `dup`, the NULL-key row, and `unique` all inserted, then
+        // rolled back with the SAVEPOINT — the queue ends empty.
+        if run.final_count == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected an empty queue (0) — every row, even the non-colliding ones, must roll back — got {} rows",
                 run.final_count
             ))
         }
@@ -1963,11 +2223,33 @@ lets_expect! { #tokio_test
 
     expect(run_partial_batch_conflict().await) {
         when a_buffered_batch_collides_on_a_shared_idempotency_key {
-            to surfaces_an_invalid_argument_with_a_conflict_count {
+            to surfaces_an_idempotency_conflict_with_the_rejected_count {
                 partial_batch_rejects_with_count()
             }
             to rolls_back_every_partial_insertion_in_the_batch {
                 partial_batch_rolls_back_inserts()
+            }
+        }
+    }
+
+    expect(run_mixed_batch_conflict().await) {
+        when a_batch_mixes_fresh_keys_with_one_duplicate {
+            to reports_only_the_duplicate_as_rejected {
+                mixed_batch_reports_only_the_duplicate()
+            }
+            to rolls_back_the_fresh_rows_with_the_whole_batch {
+                mixed_batch_rolls_back_the_fresh_rows_too()
+            }
+        }
+    }
+
+    expect(run_intrabatch_dup_with_nulls().await) {
+        when a_batch_repeats_a_key_and_interleaves_a_null_key_with_no_seed {
+            to reports_only_the_repeated_key_excluding_the_null {
+                intrabatch_reports_only_the_repeated_key()
+            }
+            to rolls_back_every_row_leaving_the_queue_empty {
+                intrabatch_dup_rolls_back_the_whole_batch()
             }
         }
     }

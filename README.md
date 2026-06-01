@@ -29,7 +29,7 @@ compatible with Apalis SQL storage (`apalis.jobs`, `apalis.workers`).
 
 ```toml
 [dependencies]
-apalis-diesel-postgres = { version = "0.2", features = ["tokio"] }
+apalis-diesel-postgres = { version = "0.3", features = ["tokio"] }
 diesel = { version = "2.3", features = ["postgres", "r2d2", "chrono", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -276,7 +276,10 @@ storage.push_task_with_conn(conn, task)
   (fetch/ack/heartbeat) — those live on the apalis pool.
 - **Idempotency conflict** rolls back only the apalis batch via SAVEPOINT;
   the outer transaction stays alive. Decide whether to commit your business
-  writes or roll the whole transaction back from `Err(InvalidArgument)`.
+  writes or roll the whole transaction back when you get
+  `Err(Error::IdempotencyConflict { .. })` — match the variant, not the
+  message text. One duplicate key rolls back the *whole* enqueue batch, not
+  just the colliding row.
 - **No outer transaction** → Diesel auto-commits the INSERT; the call still
   works, but you lose the outbox guarantee.
 
@@ -388,6 +391,16 @@ worker logs point at the failed lifecycle step:
 - Notification listener failures surface as stream errors. Polling still
   fetches jobs; `LISTEN`/`NOTIFY` wakeups stop until the notify stream is
   recreated.
+- Idempotency conflicts: `Error::IdempotencyConflict { job_type,
+  conflicting_keys, total }` when an enqueue collides with the
+  `(job_type, idempotency_key)` unique constraint. `conflicting_keys` names the
+  exact keys that collided, so a batch caller can drop them and re-enqueue the
+  rest. Match the variant (not the message text) to treat a duplicate as
+  benign. One duplicate rolls back the *whole* batch, not just the colliding
+  row; a surrounding transaction stays alive. The `push_*_with_conn` outbox
+  methods return this directly; the `Sink` / `TaskSink` enqueue APIs wrap it
+  (like every push error) as
+  `TaskSinkError::PushError(Error::IdempotencyConflict { .. })`.
 
 ## Public types
 

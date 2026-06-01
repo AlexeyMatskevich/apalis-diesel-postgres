@@ -15,7 +15,8 @@
 //! 2. **Rollback** — the same flow returning `Err` from the closure leaves
 //!    both tables empty.
 //! 3. **Idempotency conflict** — a duplicate `idempotency_key` surfaces
-//!    `Error::InvalidArgument`; the surrounding business write still commits.
+//!    `Error::IdempotencyConflict`; the surrounding business write still
+//!    commits.
 //!
 //! Two separate r2d2 pools are built against the same database: a "backend"
 //! pool that the imagined HTTP handler uses, and a smaller "apalis" pool that
@@ -235,7 +236,7 @@ async fn scenario_idempotency_conflict(
                 task.parts.idempotency_key = Some(idempotency_key);
                 match storage.push_task_with_conn(c, task) {
                     Ok(_) => Ok("no conflict observed"),
-                    Err(PgError::InvalidArgument(_)) => {
+                    Err(PgError::IdempotencyConflict { .. }) => {
                         // The savepoint already rolled back the apalis batch.
                         // We commit the surrounding business write anyway.
                         Ok("conflict surfaced; business write committed")
