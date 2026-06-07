@@ -135,6 +135,20 @@ pub(crate) fn register_worker(
     register_worker_admin(pool, worker_id, worker_type)
 }
 
+/// Double the wait-for-completion poll backoff, capped at `max`. Extracted from
+/// `wait_for_completion` so the exponential-backoff progression is unit-testable
+/// without driving the whole poll stream.
+fn next_backoff(backoff: Duration, max: Duration) -> Duration {
+    (backoff * 2).min(max)
+}
+
+/// Whether the consecutive-DB-error streak, after counting the current failure,
+/// has reached the threshold at which the error is surfaced and the wait stream
+/// ends. Extracted so the threshold arithmetic is unit-testable.
+fn db_errors_exhausted(error_streak: u32, max_consecutive: u32) -> bool {
+    error_streak + 1 >= max_consecutive
+}
+
 pub(crate) fn wait_for_completion<O>(
     pool: PgPool,
     task_ids: impl IntoIterator<Item = TaskId<Ulid>>,
@@ -175,25 +189,25 @@ where
                         // Surface the error and end the stream only once the
                         // failures persist; otherwise back off and retry the
                         // same ids, treating the blip as transient.
-                        if error_streak + 1 >= MAX_CONSECUTIVE_DB_ERRORS {
+                        if db_errors_exhausted(error_streak, MAX_CONSECUTIVE_DB_ERRORS) {
                             return Some((
                                 stream::iter(vec![Err(error)]),
                                 (Vec::new(), INITIAL_BACKOFF, 0),
                             ));
                         }
                         apalis_core::timer::sleep(backoff).await;
-                        let next_backoff = (backoff * 2).min(MAX_BACKOFF);
+                        let new_backoff = next_backoff(backoff, MAX_BACKOFF);
                         return Some((
                             stream::iter(Vec::new()),
-                            (remaining_ids, next_backoff, error_streak + 1),
+                            (remaining_ids, new_backoff, error_streak + 1),
                         ));
                     }
                 };
                 if rows.is_empty() {
                     apalis_core::timer::sleep(backoff).await;
-                    let next_backoff = (backoff * 2).min(MAX_BACKOFF);
+                    let new_backoff = next_backoff(backoff, MAX_BACKOFF);
                     // A successful (if empty) poll clears the error streak.
-                    return Some((stream::iter(Vec::new()), (remaining_ids, next_backoff, 0)));
+                    return Some((stream::iter(Vec::new()), (remaining_ids, new_backoff, 0)));
                 }
 
                 let mut next_remaining = remaining_ids;
@@ -648,4 +662,51 @@ pub(crate) fn completed_task_rows(
         .load::<TaskResultRow>(conn)
         .map_err(Error::database("fetching completed task results"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use lets_expect::*;
+
+    use super::*;
+
+    lets_expect! {
+        expect(next_backoff(backoff, Duration::from_secs(2))) {
+            let backoff = Duration::from_millis(100);
+
+            when the_backoff_is_below_the_cap {
+                to doubles_the_backoff { equal(Duration::from_millis(200)) }
+            }
+
+            when doubling_would_exceed_the_cap {
+                let backoff = Duration::from_millis(1_500);
+                to clamps_to_the_maximum { equal(Duration::from_secs(2)) }
+            }
+
+            when the_backoff_already_sits_at_the_cap {
+                let backoff = Duration::from_secs(2);
+                to stays_at_the_maximum { equal(Duration::from_secs(2)) }
+            }
+        }
+
+        expect(db_errors_exhausted(error_streak, 3)) {
+            let error_streak = 0u32;
+
+            when only_the_first_failure_has_occurred {
+                to keeps_retrying_with_backoff { be_false }
+            }
+
+            when one_more_failure_would_reach_the_threshold {
+                let error_streak = 1u32;
+                to keeps_retrying_with_backoff { be_false }
+            }
+
+            when the_failure_streak_reaches_the_threshold {
+                let error_streak = 2u32;
+                to surfaces_the_error_and_ends_the_wait { be_true }
+            }
+        }
+    }
 }

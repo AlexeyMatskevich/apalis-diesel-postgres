@@ -130,43 +130,28 @@ impl<Codec> SharedPostgresStorage<Codec> {
                             listener_alive.store(false, Ordering::Release);
                             return;
                         };
-                        if let Some(senders) = registry.get_mut(&event_queue) {
-                            // Broadcast each id to every consumer registered
-                            // on this queue. Senders whose receivers have been
-                            // dropped (e.g. fetcher went away) are pruned in
-                            // place via retain.
-                            for id in ids {
-                                senders.retain_mut(|(_, sender)| {
-                                    match sender.try_send(Ok(id)) {
-                                        Ok(()) => true,
-                                        Err(error) if error.is_disconnected() => false,
-                                        // Channel full: keep the sender (the
-                                        // job is durable, poll fetcher will
-                                        // pick it up) but stop pushing this
-                                        // event into a saturated channel.
-                                        Err(_) => true,
-                                    }
-                                });
-                            }
-                            if senders.is_empty() {
-                                registry.remove(&event_queue);
-                            }
-                        }
+                        deliver_to_queue(&mut registry, &event_queue, &ids);
                     }
                     match registry.lock() {
-                        Ok(registry) if registry.is_empty() => {
+                        Ok(registry) => {
                             // Store `false` while still holding the registry
                             // lock: a concurrent `make_shared_with_config`
                             // must observe either (a) `listener_alive == true`
                             // (we haven't exited yet) AND see itself appended
                             // to the registry on our next loop iteration, or
                             // (b) `listener_alive == false` AND therefore
-                            // spawn a fresh listener.
-                            listener_alive.store(false, Ordering::Release);
-                            drop(registry);
-                            return;
+                            // spawn a fresh listener. The exit decision is
+                            // factored into `listener_should_exit` (unit-tested)
+                            // and applied as a plain `if` rather than a match
+                            // guard so the only mutable point is that function,
+                            // which the tests pin — an in-thread guard would be
+                            // unreachable from a unit test.
+                            if listener_should_exit(&registry) {
+                                listener_alive.store(false, Ordering::Release);
+                                drop(registry);
+                                return;
+                            }
                         }
-                        Ok(_) => {}
                         Err(_) => {
                             // Poisoned: synchronization is no longer possible.
                             listener_alive.store(false, Ordering::Release);
@@ -209,6 +194,53 @@ fn exit_listener(registry: &SharedRegistry, listener_alive: &AtomicBool, error: 
             listener_alive.store(false, Ordering::Release);
         }
     }
+}
+
+/// Broadcast every id in `ids` to all senders registered on `queue`.
+///
+/// A sender whose receiver has been dropped (`disconnected`) is pruned; a sender
+/// whose channel is merely full is **kept** — the job is durable and the poll
+/// fetcher will pick it up, so transient back-pressure must not sever the
+/// consumer. When the queue's last sender is pruned the queue entry is removed
+/// so the listener's empty-registry exit check can fire.
+///
+/// Extracted from the listener closure so the broadcast/prune decision is
+/// unit-testable against a hand-built registry, without spawning the listener
+/// thread (mirrors `broadcast_notify_error_locked`).
+fn deliver_to_queue(registry: &mut RegistryMap, queue: &str, ids: &[PgTaskId]) {
+    if let Some(senders) = registry.get_mut(queue) {
+        for &id in ids {
+            senders.retain_mut(|(_, sender)| match sender.try_send(Ok(id)) {
+                Ok(()) => true,
+                Err(error) if error.is_disconnected() => false,
+                // Channel full: keep the sender (the job is durable, the poll
+                // fetcher will pick it up) but stop pushing this event into a
+                // saturated channel.
+                Err(_) => true,
+            });
+        }
+        if senders.is_empty() {
+            registry.remove(queue);
+        }
+    }
+}
+
+/// Whether the shared listener should exit. It stops once no consumers remain
+/// registered, releasing its pooled connection and thread. Extracted so the
+/// empty-registry decision is unit-testable without spawning the listener.
+fn listener_should_exit(registry: &RegistryMap) -> bool {
+    registry.is_empty()
+}
+
+/// Whether THIS registration must spawn the shared listener: it does iff it
+/// observed `listener_alive` transition false→true, i.e. it is the first live
+/// registration. The atomic swap is the single source of truth, so exactly one
+/// registration spawns. Extracted so the false→true edge is unit-testable — the
+/// notify integration tests register two-or-more consumers, which masks an
+/// off-by-one in *which* registration spawns (the listener still ends up
+/// running, just claimed by the wrong call).
+fn claim_listener_spawn(listener_alive: &AtomicBool) -> bool {
+    !listener_alive.swap(true, Ordering::AcqRel)
 }
 
 #[cfg(test)]
@@ -291,7 +323,7 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
             .entry(queue)
             .or_default()
             .push((registration_id, sender));
-        let should_spawn_listener = !self.listener_alive.swap(true, Ordering::AcqRel);
+        let should_spawn_listener = claim_listener_spawn(&self.listener_alive);
         drop(registry);
 
         if should_spawn_listener {
@@ -665,12 +697,14 @@ mod tests {
         Ok(())
     }
 
-    /// `broadcast_notify_error` walks the registry and either preserves or
-    /// removes each sender depending on whether the channel has been
-    /// disconnected. The returned tuple is `(retained_after_broadcast,
-    /// initial_count)` so the test can verify the disconnected sender was
-    /// removed without touching the listener thread.
-    fn broadcast_notify_error_observation() -> (usize, usize) {
+    /// `broadcast_notify_error` walks the registry, delivers the error to each
+    /// sender, then keeps only the queues whose sender vec is still non-empty.
+    /// The returned tuple is `(retained_after_broadcast,
+    /// alive_is_the_sole_survivor)`: the count alone cannot catch an inverted
+    /// keep-predicate (it would retain the wrong queue but the same total), so
+    /// the bool pins that the *live* queue — not the pruned-empty "dead" one —
+    /// is what survives. No listener thread is touched.
+    fn broadcast_notify_error_observation() -> (usize, bool) {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (alive_sender, _alive_receiver) = mpsc::channel(1);
         let (dead_sender, dead_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
@@ -681,10 +715,98 @@ mod tests {
             reg.insert("dead".to_owned(), vec![(Ulid::new(), dead_sender)]);
         }
 
-        let initial = registry.lock().expect("registry is not poisoned").len();
         broadcast_notify_error(&registry, "synthetic listener failure".to_owned());
-        let retained = registry.lock().expect("registry is not poisoned").len();
-        (retained, initial)
+        let reg = registry.lock().expect("registry is not poisoned");
+        let retained = reg.len();
+        let alive_is_the_sole_survivor = reg.contains_key("alive") && !reg.contains_key("dead");
+        (retained, alive_is_the_sole_survivor)
+    }
+
+    fn new_task_id() -> PgTaskId {
+        PgTaskId::new(Ulid::new())
+    }
+
+    /// `deliver_to_queue` must prune a sender whose receiver was dropped
+    /// (disconnected) and, being the queue's last consumer, remove the now-empty
+    /// queue so the listener's empty-registry exit can fire. Returns the registry
+    /// length after delivery — 0 once the dead sender and its queue are gone.
+    fn deliver_prunes_disconnected_sender() -> usize {
+        let mut registry: RegistryMap = HashMap::new();
+        let (dead_sender, dead_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        drop(dead_receiver);
+        registry.insert(
+            "shared-deliver-dead".to_owned(),
+            vec![(Ulid::new(), dead_sender)],
+        );
+        deliver_to_queue(&mut registry, "shared-deliver-dead", &[new_task_id()]);
+        registry.len()
+    }
+
+    /// `deliver_to_queue` must KEEP a sender whose channel is full (transient
+    /// back-pressure) — only a disconnected sender is pruned, because the job is
+    /// durable and the poll fetcher will pick it up. The receiver is held open so
+    /// `try_send` reports `Full`, not `Disconnected`; more ids than the channel
+    /// can ever buffer are delivered so at least one send hits the full path.
+    /// Returns the number of senders still registered on the queue.
+    fn deliver_keeps_full_sender() -> usize {
+        let mut registry: RegistryMap = HashMap::new();
+        let (full_sender, _full_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        registry.insert(
+            "shared-deliver-full".to_owned(),
+            vec![(Ulid::new(), full_sender)],
+        );
+        let ids = [new_task_id(), new_task_id(), new_task_id(), new_task_id()];
+        deliver_to_queue(&mut registry, "shared-deliver-full", &ids);
+        registry
+            .get("shared-deliver-full")
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    fn empty_registry() -> RegistryMap {
+        HashMap::new()
+    }
+
+    fn registry_with_one_consumer() -> RegistryMap {
+        let mut registry: RegistryMap = HashMap::new();
+        let (sender, _receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        registry.insert(
+            "shared-still-active".to_owned(),
+            vec![(Ulid::new(), sender)],
+        );
+        registry
+    }
+
+    /// `exit_listener` must both flip `listener_alive` to false and broadcast the
+    /// failure to every registered sender. Returns `(alive_after, error_delivered)`
+    /// — `(false, true)` when both effects happen; the live receiver is kept so the
+    /// broadcast lands.
+    fn exit_listener_observation() -> (bool, bool) {
+        let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, mut receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        registry
+            .lock()
+            .expect("fresh registry is not poisoned")
+            .insert("shared-exit".to_owned(), vec![(Ulid::new(), sender)]);
+        let listener_alive = AtomicBool::new(true);
+        exit_listener(
+            &registry,
+            &listener_alive,
+            Some("synthetic listener spawn failure".to_owned()),
+        );
+        let alive_after = listener_alive.load(Ordering::Acquire);
+        let error_delivered = matches!(receiver.try_recv(), Ok(Err(_)));
+        (alive_after, error_delivered)
+    }
+
+    /// First claim on a fresh flag must spawn (false→true edge), the second must
+    /// not. Returns `(first_claim, second_claim)` — `(true, false)` when exactly
+    /// the first registration owns the spawn.
+    fn listener_spawn_claims() -> (bool, bool) {
+        let listener_alive = AtomicBool::new(false);
+        let first = claim_listener_spawn(&listener_alive);
+        let second = claim_listener_spawn(&listener_alive);
+        (first, second)
     }
 
     // Q6-rest removed `Arc<Mutex<Receiver>>`: each fetcher owns its receiver
@@ -848,7 +970,44 @@ mod tests {
 
         expect(broadcast_notify_error_observation()) {
             when listener_broadcasts_an_error_to_a_mixed_registry {
-                to drops_disconnected_senders_and_keeps_live_ones { equal((1_usize, 2_usize)) }
+                to keeps_the_live_queue_and_drops_the_disconnected_one { equal((1_usize, true)) }
+            }
+        }
+
+        expect(deliver_prunes_disconnected_sender()) {
+            when a_queues_only_sender_has_a_dropped_receiver {
+                to prunes_the_disconnected_sender_and_removes_the_empty_queue { equal(0) }
+            }
+        }
+
+        expect(deliver_keeps_full_sender()) {
+            when a_queues_sender_channel_is_full_but_still_connected {
+                to keeps_the_back_pressured_sender_registered { equal(1) }
+            }
+        }
+
+        expect(listener_should_exit(&registry)) {
+            let registry = empty_registry();
+
+            when no_consumers_remain_registered {
+                to signals_the_listener_to_exit { be_true }
+            }
+
+            when a_consumer_is_still_registered {
+                let registry = registry_with_one_consumer();
+                to keeps_the_listener_running { be_false }
+            }
+        }
+
+        expect(exit_listener_observation()) {
+            when the_listener_exits_after_a_spawn_or_connection_failure {
+                to clears_the_alive_flag_and_broadcasts_the_error { equal((false, true)) }
+            }
+        }
+
+        expect(listener_spawn_claims()) {
+            when two_registrations_race_to_claim_the_listener_spawn {
+                to spawns_on_the_first_registration_only { equal((true, false)) }
             }
         }
 

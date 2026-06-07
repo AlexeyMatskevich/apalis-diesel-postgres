@@ -181,21 +181,33 @@ pub(crate) fn keep_alive(
         .bind::<Text, _>(&*lease_token)
         .execute(conn)
         .map_err(Error::database("updating worker heartbeat"))?;
-        if count == 0 {
-            // Either no row exists for this (worker_id, queue) OR the stored
-            // lease_token does not match — both mean *this* process is no
-            // longer the authoritative heartbeater (e.g. another registration
-            // took over). Recreating the worker stream rotates the token.
-            Err(Error::worker_not_registered(
-                "updating worker heartbeat",
-                worker.name(),
-                config.queue().to_string(),
-                "the worker may not be registered for this queue, or another process has re-registered with a different lease token; recreate the worker stream",
-            ))
-        } else {
-            Ok(())
-        }
+        // Either no row exists for this (worker_id, queue) OR the stored
+        // lease_token does not match — both mean *this* process is no longer
+        // the authoritative heartbeater (e.g. another registration took over).
+        // Recreating the worker stream rotates the token.
+        heartbeat_outcome(count, &worker, config.queue().to_string())
     })
+}
+
+/// Map the heartbeat UPDATE's affected-row count to a result: zero rows means
+/// this process is no longer the authoritative heartbeater (unregistered or a
+/// rotated lease token), any positive count is a successful heartbeat. Extracted
+/// so the zero/non-zero decision is unit-testable without a database.
+fn heartbeat_outcome(
+    updated_rows: usize,
+    worker: &WorkerContext,
+    queue: String,
+) -> Result<(), Error> {
+    if updated_rows == 0 {
+        Err(Error::worker_not_registered(
+            "updating worker heartbeat",
+            worker.name(),
+            queue,
+            "the worker may not be registered for this queue, or another process has re-registered with a different lease token; recreate the worker stream",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn keep_alive_stream(
@@ -214,4 +226,61 @@ pub(crate) fn keep_alive_stream(
             Some((keep_alive(pool, config, worker, lease_token).await, ()))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use lets_expect::{AssertionError, AssertionResult, *};
+    use ulid::Ulid;
+
+    use super::*;
+
+    fn minted_lease_token_parses_as_ulid() -> bool {
+        Ulid::from_string(&mint_lease_token()).is_ok()
+    }
+
+    fn two_minted_lease_tokens_differ() -> bool {
+        mint_lease_token() != mint_lease_token()
+    }
+
+    fn worker_not_registered(error: &Error) -> AssertionResult {
+        match error {
+            Error::WorkerNotRegistered { .. } => Ok(()),
+            other => Err(AssertionError::new(vec![format!(
+                "expected WorkerNotRegistered, got {other:?}"
+            )])),
+        }
+    }
+
+    fn heartbeat(updated_rows: usize) -> Result<(), Error> {
+        let worker = WorkerContext::new::<()>("heartbeat-worker");
+        heartbeat_outcome(updated_rows, &worker, "heartbeat-queue".to_owned())
+    }
+
+    lets_expect! {
+        expect(minted_lease_token_parses_as_ulid()) {
+            when a_lease_token_is_minted {
+                to is_a_well_formed_ulid_rather_than_a_constant { be_true }
+            }
+        }
+
+        expect(two_minted_lease_tokens_differ()) {
+            when two_lease_tokens_are_minted {
+                to each_call_mints_a_distinct_token { be_true }
+            }
+        }
+
+        expect(heartbeat(rows)) {
+            let rows = 1;
+
+            when the_update_affected_a_worker_row {
+                to reports_a_successful_heartbeat { be_ok }
+            }
+
+            when the_update_affected_no_rows {
+                let rows = 0;
+                to reports_the_worker_is_no_longer_registered { be_err_and worker_not_registered }
+            }
+        }
+    }
 }

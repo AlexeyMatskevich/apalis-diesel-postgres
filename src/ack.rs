@@ -273,6 +273,38 @@ mod tests {
     }
 
     lets_expect! {
+        expect(is_preclaimed(lock_by, worker_id, has_lock_at)) {
+            let lock_by: Option<&str> = Some("worker-1");
+            let worker_id: Option<&str> = Some("worker-1");
+            let has_lock_at = true;
+
+            when the_owner_matches_and_a_lock_timestamp_is_present {
+                to recognizes_the_preclaimed_task_and_skips_the_sql_lock { be_true }
+            }
+
+            when the_lock_timestamp_is_absent {
+                let has_lock_at = false;
+                to is_not_preclaimed_so_the_sql_lock_still_runs { be_false }
+            }
+
+            when the_stored_owner_differs_from_the_current_worker {
+                let lock_by = Some("other-worker");
+                to is_not_preclaimed_when_another_worker_holds_the_lock { be_false }
+            }
+
+            when the_context_carries_no_lock_owner {
+                let lock_by: Option<&str> = None;
+                to is_not_preclaimed_without_a_stored_owner { be_false }
+            }
+
+            when there_is_no_current_worker_context {
+                let worker_id: Option<&str> = None;
+                to is_not_preclaimed_without_a_current_worker { be_false }
+            }
+        }
+    }
+
+    lets_expect! {
         expect(calculate_status(&parts, &result)) {
             let parts = parts_for_ack(attempts, max_attempts);
             let result: Result<(), BoxDynError> = Ok(());
@@ -926,6 +958,21 @@ pub struct LockTaskService<S> {
     pool: PgPool,
 }
 
+/// Whether a task arriving at `LockTaskService` was already locked to this
+/// worker by the fetcher's dequeue UPDATE (`fetch_next` / `queue_by_id` set both
+/// `lock_by` and `lock_at`), so the SQL `lock_task` round-trip can be skipped.
+///
+/// Pre-claimed requires BOTH that the stored lock owner equals the current
+/// worker AND that a lock timestamp is present — a half-populated context (only
+/// one of the two) must still go through the SQL path. Extracted as a pure
+/// predicate so that conjunction is unit-testable without a backend.
+fn is_preclaimed(lock_by: Option<&str>, worker_id: Option<&str>, has_lock_at: bool) -> bool {
+    matches!(
+        (lock_by, worker_id),
+        (Some(stored), Some(current)) if stored == current
+    ) && has_lock_at
+}
+
 impl<S, Args> Service<PgTask<Args>> for LockTaskService<S>
 where
     S: Service<PgTask<Args>> + Clone + Send + 'static,
@@ -961,10 +1008,11 @@ where
         // for nothing. External `lock_task` callers (and any future fetcher
         // that does not pre-lock) still go through the SQL path because they
         // arrive without `lock_by`/`lock_at` populated in the context.
-        let preclaimed = matches!(
-            (req.parts.ctx.lock_by().as_deref(), worker_id.as_deref()),
-            (Some(stored), Some(current)) if stored == current
-        ) && req.parts.ctx.lock_at().is_some();
+        let preclaimed = is_preclaimed(
+            req.parts.ctx.lock_by().as_deref(),
+            worker_id.as_deref(),
+            req.parts.ctx.lock_at().is_some(),
+        );
         // Tower service contract: `poll_ready` reserves capacity on
         // `self.inner`; that exact instance MUST be the one that consumes the
         // reservation via `call`. Take ownership of the ready instance and

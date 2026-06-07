@@ -34,6 +34,29 @@ pub(crate) const NOTIFY_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis
 /// polling fetcher recovers any wakeups dropped past this cap.
 pub(crate) const NOTIFY_CHANNEL_CAPACITY_MAX: usize = 8192;
 
+/// Outcome of a single `try_send` from the LISTEN thread to a fetcher channel.
+/// Extracted (with `classify_delivery`) so the disconnected-vs-full distinction
+/// is unit-testable: the listener loop runs on a spawned thread, so an inline
+/// match guard there would be unreachable from a unit test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOutcome {
+    /// The id was queued for the fetcher.
+    Delivered,
+    /// The channel is full; the wakeup is dropped. The job stays durable in
+    /// `apalis.jobs`, so the polling fetcher picks it up on its next tick.
+    ChannelFull,
+    /// The receiver has been dropped; the listener should stop.
+    ReceiverGone,
+}
+
+fn classify_delivery<T>(result: Result<(), mpsc::TrySendError<T>>) -> DeliveryOutcome {
+    match result {
+        Ok(()) => DeliveryOutcome::Delivered,
+        Err(error) if error.is_disconnected() => DeliveryOutcome::ReceiverGone,
+        Err(_) => DeliveryOutcome::ChannelFull,
+    }
+}
+
 pub(crate) fn notify_task_ids(
     pool: PgPool,
     queue: String,
@@ -90,15 +113,15 @@ pub(crate) fn notify_task_ids(
                         continue;
                     }
                     for id in ids {
-                        match sender.try_send(Ok(id)) {
-                            Ok(()) => {}
-                            Err(error) if error.is_disconnected() => break 'listen,
+                        match classify_delivery(sender.try_send(Ok(id))) {
+                            DeliveryOutcome::Delivered => {}
+                            DeliveryOutcome::ReceiverGone => break 'listen,
                             // Channel full: drop the wakeup. The job is durable
                             // in `apalis.jobs`, and the polling fetcher will
                             // pick it up on its next tick. Logging is left to
                             // the application via tracing wrappers around the
                             // returned stream.
-                            Err(_) => break,
+                            DeliveryOutcome::ChannelFull => break,
                         }
                     }
                 }
@@ -158,5 +181,53 @@ impl Drop for NotifyTaskIds {
                         sql_query("SELECT pg_notify('apalis::job::insert', '')").execute(&mut conn);
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lets_expect::*;
+
+    use super::*;
+
+    fn classify_a_delivered_send() -> DeliveryOutcome {
+        let (mut sender, _receiver) = mpsc::channel::<i32>(1);
+        classify_delivery(sender.try_send(1))
+    }
+
+    fn classify_a_full_channel() -> DeliveryOutcome {
+        let (mut sender, _receiver) = mpsc::channel::<i32>(1);
+        // Fill the channel past capacity; the receiver is never drained, so the
+        // next send reports `Full` (connected) rather than `Disconnected`.
+        while sender.try_send(1).is_ok() {}
+        classify_delivery(sender.try_send(1))
+    }
+
+    fn classify_a_dropped_receiver() -> DeliveryOutcome {
+        let (mut sender, receiver) = mpsc::channel::<i32>(1);
+        drop(receiver);
+        classify_delivery(sender.try_send(1))
+    }
+
+    lets_expect! {
+        expect(classify_a_delivered_send()) {
+            when the_channel_accepts_the_id {
+                to reports_the_id_as_delivered { equal(DeliveryOutcome::Delivered) }
+            }
+        }
+
+        expect(classify_a_full_channel()) {
+            when the_channel_is_full_but_still_connected {
+                to drops_the_wakeup_without_stopping_the_listener {
+                    equal(DeliveryOutcome::ChannelFull)
+                }
+            }
+        }
+
+        expect(classify_a_dropped_receiver()) {
+            when the_receiver_has_been_dropped {
+                to signals_the_listener_to_stop { equal(DeliveryOutcome::ReceiverGone) }
+            }
+        }
     }
 }

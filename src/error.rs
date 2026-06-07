@@ -584,6 +584,23 @@ mod tests {
                 to returns_no_hint { equal("") }
             }
 
+            // The setup-hint predicate is a conjunction: BOTH the table-name
+            // signal ("apalis.jobs") AND a missing-relation signal
+            // ("does not exist" / "relation") must be present. These two
+            // siblings pin each operand alone so the `&&` cannot silently
+            // degrade to `||` — which would over-eagerly recommend `setup` on
+            // any unrelated relation/lookup error or on a benign mention of the
+            // jobs table.
+            when message_names_apalis_jobs_without_a_missing_relation_signal {
+                let message = "could not obtain lock on apalis.jobs";
+                to returns_no_hint { equal("") }
+            }
+
+            when message_signals_a_missing_relation_for_a_different_table {
+                let message = "relation \"audit_log\" does not exist";
+                to returns_no_hint { equal("") }
+            }
+
             when structured_constraint_matches_an_fk_name_but_table_is_not_jobs {
                 // The combined predicate at error.rs:177-184 requires BOTH
                 // table_name == "jobs" AND constraint matching a known FK.
