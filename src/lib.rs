@@ -438,6 +438,21 @@ mod tests {
         }
     }
 
+    fn compact_task_omits_idempotency_key(
+        result: &Result<PgTask<CompactType>, FromRowError>,
+    ) -> AssertionResult {
+        match result {
+            Ok(task) if task.parts.idempotency_key.is_none() => Ok(()),
+            Ok(task) => Err(AssertionError::new(vec![format!(
+                "expected idempotency_key None, got {:?}",
+                task.parts.idempotency_key
+            )])),
+            Err(error) => Err(AssertionError::new(vec![format!(
+                "expected successful conversion, got {error:?}"
+            )])),
+        }
+    }
+
     fn column_not_found(column: &'static str) -> impl Fn(&FromRowError) -> AssertionResult {
         move |error| match error {
             FromRowError::ColumnNotFound(found) if found == column => Ok(()),
@@ -627,6 +642,11 @@ mod tests {
 
             when row_has_all_required_fields {
                 to preserves_task_payload_and_context { compact_task_has_expected_parts }
+            }
+
+            when idempotency_key_is_absent {
+                let idempotency_key = None;
+                to omits_the_idempotency_key { compact_task_omits_idempotency_key }
             }
 
             when run_time_is_missing {

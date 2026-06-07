@@ -1140,17 +1140,6 @@ fn verify_schema_rejects_a_database_with_unrecorded_migrations()
     })
 }
 
-fn verify_schema_records_both_branches()
--> impl Fn(&Result<Outcome<VerifySchemaRun>, String>) -> AssertionResult {
-    let applied = verify_schema_accepts_a_fully_applied_database();
-    let pending = verify_schema_rejects_a_database_with_unrecorded_migrations();
-    move |result| {
-        applied(result)?;
-        pending(result)?;
-        Ok(())
-    }
-}
-
 // --------------------------------------------------------------------------
 // expectations
 // --------------------------------------------------------------------------
@@ -1624,6 +1613,86 @@ fn metadata_cap_persists_nothing()
     observe::<MetadataCapRun, _>("metadata cap row absent", |run| {
         if run.row_present {
             Err("expected no apalis.jobs row after a rejected oversize push".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// push_tasks run_at overflow.
+//
+// `push_tasks_on_conn` rejects a `run_at` that does not fit `i64` seconds
+// (`i64::try_from(task.parts.run_at)` at src/queries/push.rs:88) with
+// `Error::InvalidArgument`. The positive direction (a normal future run_at is
+// stored) is covered by the outbox custom-fields spec; only the rejection
+// branch is pinned here. The accepted boundary cannot be `i64::MAX` itself,
+// because such a timestamp overflows PostgreSQL's `timestamptz` range for an
+// unrelated reason, so this scenario only drives the rejected side.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RunAtCapRun {
+    push_error: Option<String>,
+    row_present: bool,
+}
+
+async fn run_run_at_cap(run_at: u64) -> Result<Outcome<RunAtCapRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-run-at-cap-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    let task = TaskBuilder::new("run-at-cap-target".to_owned())
+        .with_task_id(task_id())
+        .run_at_timestamp(run_at)
+        .with_attempt(Attempt::new_with_value(0))
+        .with_ctx(PgContext::new().with_max_attempts(5))
+        .build();
+
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let push_result = storage.push_task(task).await;
+
+    let q = queue.clone();
+    let row_count: i64 = with_conn(pool.clone(), move |conn| {
+        #[derive(QueryableByName)]
+        struct C {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        sql_query("SELECT COUNT(*) AS n FROM apalis.jobs WHERE job_type = $1")
+            .bind::<Text, _>(&q)
+            .get_result::<C>(conn)
+            .map(|c| c.n)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(RunAtCapRun {
+        push_error: push_result.err().map(|e| e.to_string()),
+        row_present: row_count > 0,
+    }))
+}
+
+fn run_at_cap_rejects() -> impl Fn(&Result<Outcome<RunAtCapRun>, String>) -> AssertionResult {
+    observe::<RunAtCapRun, _>("run_at over i64::MAX", |run| {
+        match run.push_error.as_deref() {
+            Some(msg) if msg.contains("run_at") && msg.contains("i64::MAX") => Ok(()),
+            Some(other) => Err(format!(
+                "expected InvalidArgument citing the run_at i64::MAX overflow, got {other:?}"
+            )),
+            None => Err("expected push to be rejected for a run_at above i64::MAX".into()),
+        }
+    })
+}
+
+fn run_at_cap_persists_nothing() -> impl Fn(&Result<Outcome<RunAtCapRun>, String>) -> AssertionResult
+{
+    observe::<RunAtCapRun, _>("run_at cap row absent", |run| {
+        if run.row_present {
+            Err("expected no apalis.jobs row after a rejected run_at overflow push".into())
         } else {
             Ok(())
         }
@@ -2208,15 +2277,18 @@ lets_expect! { #tokio_test
         }
     }
 
-    // `run_verify_schema` mutates shared state (it temporarily removes a row
-    // from `__diesel_schema_migrations` and restores it) so the two
-    // assertions live in one `to` block to avoid re-running the scenario
-    // twice in parallel under `cargo test`'s default threading — the second
-    // run would observe a half-restored migrations table.
+    // Each `to` re-runs `run_verify_schema()`, which is safe to run twice in
+    // parallel: the applied branch only reads the shared database, and the
+    // pending branch mutates a throwaway database named with a fresh ULID per
+    // call (see `verify_pending_branch_on_temp_db`), so the two runs never
+    // touch the same migrations table.
     expect(run_verify_schema().await) {
         when verify_schema_is_called_against_a_freshly_migrated_database {
-            to records_both_branches_of_the_pending_predicate {
-                verify_schema_records_both_branches()
+            to accepts_a_fully_applied_database {
+                verify_schema_accepts_a_fully_applied_database()
+            }
+            to rejects_a_database_with_an_unrecorded_migration {
+                verify_schema_rejects_a_database_with_unrecorded_migrations()
             }
         }
     }
@@ -2286,6 +2358,15 @@ lets_expect! { #tokio_test
             let meta_payload_len = 16384usize;
             to rejects_the_push_with_invalid_argument { metadata_cap_rejects() }
             to does_not_persist_the_apalis_jobs_row { metadata_cap_persists_nothing() }
+        }
+    }
+
+    expect(run_run_at_cap(run_at).await) {
+        let run_at = u64::MAX;
+
+        when the_run_at_timestamp_exceeds_i64_max_seconds {
+            to rejects_the_push_with_invalid_argument { run_at_cap_rejects() }
+            to does_not_persist_the_apalis_jobs_row { run_at_cap_persists_nothing() }
         }
     }
 

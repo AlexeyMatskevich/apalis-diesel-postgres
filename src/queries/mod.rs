@@ -361,6 +361,17 @@ mod tests {
                     be_err_and invalid_argument_message
                 }
             }
+
+            when the_computed_offset_fits_u32_but_exceeds_i32_max {
+                // page-1 times limit stays inside u32 (2_147_483_648) but the
+                // final `i32_from_u32` cast rejects it: this is the second,
+                // distinct error branch from the u32-multiply overflow above.
+                let page = (i32::MAX as u32) + 2;
+                let page_size = Some(1_u32);
+                to returns_invalid_argument_for_i32_overflow {
+                    be_err_and invalid_argument_with("exceeds i32::MAX")
+                }
+            }
         }
 
         expect(task_result_for(id, status, result)) {

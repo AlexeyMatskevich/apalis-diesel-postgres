@@ -19,7 +19,8 @@
 //! What we DO pin here (each `expect` block enumerates one scenario):
 //!   - `list_tasks` status filter (Done / Failed / Killed / Pending) scopes
 //!     correctly per queue.
-//!   - `list_tasks` `ORDER BY done_at DESC, run_at DESC` tie-break on run_at.
+//!   - `list_tasks` `ORDER BY done_at DESC, run_at DESC`: primary done_at DESC
+//!     across terminal rows, secondary run_at DESC tie-break.
 //!   - `list_tasks` pagination — page=1/page=2 carve disjoint slices, page=0
 //!     surfaces `InvalidArgument`.
 //!   - `list_all_tasks` — same filter+pagination, but cross-queue: rows from
@@ -493,6 +494,67 @@ fn newer_run_at_listed_first() -> impl Fn(&Result<Outcome<OrderRun>, String>) ->
 }
 
 // --------------------------------------------------------------------------
+// list_tasks ORDER BY primary key: same status, different done_at => later
+// done_at first, isolated from the run_at tie-break via crossed offsets.
+// --------------------------------------------------------------------------
+
+async fn run_order_by_done_at() -> Result<Outcome<OrderRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-order-done-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    // Two terminal Done rows with CROSSED offsets (offset = seconds in the
+    // past, so a SMALLER offset is MORE recent). `recent_done` has a recent
+    // done_at but an OLD run_at; `old_done` has an old done_at but a RECENT
+    // run_at. SQL is `ORDER BY done_at DESC, run_at DESC`: the primary done_at
+    // key must list `recent_done` first. If the primary key regressed to
+    // run_at DESC, `old_done` (recent run_at) would lead instead — so this
+    // pins the primary key, not the tie-break.
+    let recent_done = insert_job(pool.clone(), queue.clone(), "Done", 600, Some(10), 0, 3).await?;
+    let old_done = insert_job(pool.clone(), queue.clone(), "Done", 10, Some(600), 0, 3).await?;
+
+    let config = Config::new(&queue);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let listed = storage
+        .list_tasks(&filter(Status::Done, 1, Some(20)))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let ids: Vec<String> = listed
+        .into_iter()
+        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .collect();
+    if ids.len() < 2 {
+        return Err(format!("expected at least 2 rows, got {ids:?}"));
+    }
+    let first_id = ids[0].clone();
+    let second_id = ids[1].clone();
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(OrderRun {
+        first_id,
+        second_id,
+        older_id: old_done,
+        newer_id: recent_done,
+    }))
+}
+
+fn later_done_at_listed_first() -> impl Fn(&Result<Outcome<OrderRun>, String>) -> AssertionResult {
+    observe::<OrderRun, _>("order by done_at DESC", |run| {
+        if run.first_id == run.newer_id && run.second_id == run.older_id {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected later-done_at first then earlier, got first={} second={} (later={} earlier={})",
+                run.first_id, run.second_id, run.newer_id, run.older_id
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // list_tasks pagination matrix
 // --------------------------------------------------------------------------
 
@@ -938,6 +1000,12 @@ lets_expect! { #tokio_test
     expect(run_order_by_run_at().await) {
         when two_pending_rows_differ_only_in_run_at {
             to ranks_the_newer_run_at_row_first { newer_run_at_listed_first() }
+        }
+    }
+
+    expect(run_order_by_done_at().await) {
+        when two_terminal_rows_differ_in_done_at {
+            to ranks_the_later_done_at_row_first { later_done_at_listed_first() }
         }
     }
 

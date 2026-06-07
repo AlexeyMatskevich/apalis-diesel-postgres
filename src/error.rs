@@ -489,6 +489,20 @@ mod tests {
             to has_no_error_source { has_no_source }
         }
 
+        expect(Error::InvalidArgument("limit 99 exceeds i32::MAX".to_owned())) {
+            to displays_the_invalid_argument_error {
+                displays_as("invalid argument: limit 99 exceeds i32::MAX")
+            }
+            to has_no_error_source { has_no_source }
+        }
+
+        expect(Error::from(diesel::result::Error::NotFound)) {
+            to labels_the_unlabeled_transaction_path {
+                displays_as("database error while diesel transaction begin/commit/rollback (unlabeled — use map_err inside the closure): Record not found")
+            }
+            to exposes_the_diesel_error_as_the_source { has_source_containing("Record not found") }
+        }
+
         expect(non_database_hint()) {
             when diesel_error_is_not_a_database_variant {
                 to returns_no_hint { equal("") }

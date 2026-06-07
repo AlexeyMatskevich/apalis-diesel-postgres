@@ -52,3 +52,77 @@ impl InsertEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use lets_expect::lets_expect;
+    use ulid::Ulid;
+
+    use super::*;
+
+    fn task_id() -> PgTaskId {
+        PgTaskId::new(Ulid::new())
+    }
+
+    /// Build an `InsertEvent` carrying `ids_len` distinct batched ids plus an
+    /// optional legacy `id`. Sizing the id vector is data preparation and lives
+    /// here in the fixture, never inside the spec.
+    fn event(id: Option<PgTaskId>, ids_len: usize) -> InsertEvent {
+        InsertEvent {
+            job_type: "emails".to_string(),
+            id,
+            ids: (0..ids_len).map(|_| task_id()).collect(),
+        }
+    }
+
+    fn resolved_id_count(id: Option<PgTaskId>, ids_len: usize) -> usize {
+        event(id, ids_len).into_ids().1.len()
+    }
+
+    fn resolved_job_type(id: Option<PgTaskId>, ids_len: usize) -> String {
+        event(id, ids_len).into_ids().0
+    }
+
+    lets_expect! {
+        expect(resolved_id_count(id, ids_len)) {
+            let id: Option<PgTaskId> = None;
+            let ids_len = 3_usize;
+
+            // Default state: a batched ids array comfortably below the cap.
+            to returns_every_id { equal(3) }
+
+            when the_ids_array_length_equals_the_cap {
+                // `ids.len() > CAP` is strict, so exactly CAP is NOT truncated.
+                let ids_len = INSERT_EVENT_IDS_CAP;
+                to keeps_every_id_without_truncating { equal(INSERT_EVENT_IDS_CAP) }
+            }
+
+            when the_ids_array_length_is_one_above_the_cap {
+                let ids_len = INSERT_EVENT_IDS_CAP + 1;
+                to truncates_to_exactly_the_cap { equal(INSERT_EVENT_IDS_CAP) }
+            }
+
+            when both_an_ids_array_and_a_legacy_id_are_present {
+                // Precedence: a non-empty `ids` wins and the legacy `id` is
+                // dropped (result is the 3 ids, not 1 and not 4).
+                let id = Some(task_id());
+                to prefers_the_ids_array_and_ignores_the_legacy_id { equal(3) }
+            }
+
+            when only_a_legacy_id_is_present {
+                let ids_len = 0;
+                let id = Some(task_id());
+                to falls_back_to_the_single_legacy_id { equal(1) }
+            }
+
+            when neither_an_ids_array_nor_a_legacy_id_is_present {
+                let ids_len = 0;
+                to returns_no_ids { equal(0) }
+            }
+        }
+
+        expect(resolved_job_type(None, 1)) {
+            to passes_the_job_type_through_unchanged { equal("emails".to_string()) }
+        }
+    }
+}

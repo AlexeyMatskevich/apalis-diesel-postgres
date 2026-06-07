@@ -209,13 +209,17 @@ mod tests {
         }
     }
 
-    fn worker_row(started_at: Option<DateTime>, layers: Option<String>) -> WorkerRow {
+    fn worker_row(
+        last_seen: DateTime,
+        started_at: Option<DateTime>,
+        layers: Option<String>,
+    ) -> WorkerRow {
         WorkerRow {
             id: "worker-1".to_string(),
             worker_type: "email".to_string(),
             storage_name: "postgres".to_string(),
             layers,
-            last_seen: DateTime::now(),
+            last_seen,
             started_at,
         }
     }
@@ -398,9 +402,24 @@ mod tests {
             }
         }
 
-        expect(RunningWorker::from(worker_row(started_at, layers))) {
+        expect(RunningWorker::from(worker_row(last_seen, started_at, layers))) {
+            let last_seen = DateTime::now();
             let started_at = Some(DateTime::now());
             let layers = Some("layer-a,layer-b".to_string());
+
+            when last_seen_is_present {
+                to converts_last_seen_to_a_unix_timestamp { have(last_heartbeat) be_greater_than(0) }
+            }
+
+            when last_seen_is_a_negative_unix_timestamp {
+                // Mirror of started_at below: `u64::try_from(negative).unwrap_or(0)`
+                // (src/models.rs:95) collapses a pre-epoch heartbeat to zero
+                // rather than surfacing an error. The DB schema never produces
+                // such values, but the clamp is asserted so any future change is
+                // intentional rather than accidental.
+                let last_seen = <DateTime as DateTimeExt>::from_unix_timestamp(-1);
+                to silently_clamps_pre_epoch_heartbeat_to_zero { have(last_heartbeat) equal(0) }
+            }
 
             when started_at_is_present {
                 to converts_started_at_to_a_unix_timestamp { have(started_at) be_greater_than(0) }

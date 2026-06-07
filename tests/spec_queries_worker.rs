@@ -214,15 +214,22 @@ struct JobStatusRow {
     last_result: Option<Value>,
     #[diesel(sql_type = Nullable<Text>)]
     lock_by: Option<String>,
+    /// `done_at IS NOT NULL`: the terminal (`Killed`) re-enqueue branch stamps a
+    /// completion timestamp, the retry (`Pending`) branch leaves it NULL.
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    done_at_present: bool,
 }
 
 async fn job_status_row(pool: PgPool, id: PgTaskId) -> Result<JobStatusRow, String> {
     let id_s = id.to_string();
     with_conn(pool, move |conn| {
-        sql_query("SELECT status, attempts, last_result, lock_by FROM apalis.jobs WHERE id = $1")
-            .bind::<Text, _>(&id_s)
-            .get_result::<JobStatusRow>(conn)
-            .map_err(|e| e.to_string())
+        sql_query(
+            "SELECT status, attempts, last_result, lock_by, done_at IS NOT NULL AS done_at_present
+             FROM apalis.jobs WHERE id = $1",
+        )
+        .bind::<Text, _>(&id_s)
+        .get_result::<JobStatusRow>(conn)
+        .map_err(|e| e.to_string())
     })
     .await
 }
@@ -414,6 +421,7 @@ struct ReenqueueRun {
     attempts: i32,
     lock_by: Option<String>,
     last_result_value: Option<Value>,
+    done_at_present: bool,
 }
 
 async fn run_reenqueue(setup: ReenqueueSetup) -> Result<Outcome<ReenqueueRun>, String> {
@@ -471,6 +479,7 @@ async fn run_reenqueue(setup: ReenqueueSetup) -> Result<Outcome<ReenqueueRun>, S
         attempts: row.attempts,
         lock_by: row.lock_by,
         last_result_value: row.last_result,
+        done_at_present: row.done_at_present,
     }))
 }
 
@@ -536,6 +545,17 @@ fn reenqueue_clears_lock_by() -> impl Fn(&Result<Outcome<ReenqueueRun>, String>)
             Ok(())
         } else {
             Err(format!("expected lock_by NULL, got {:?}", run.lock_by))
+        }
+    })
+}
+
+fn reenqueue_stamped_completion_timestamp()
+-> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
+    observe::<ReenqueueRun, _>("reenqueue stamps done_at", |run| {
+        if run.done_at_present {
+            Ok(())
+        } else {
+            Err("expected the Killed branch to stamp done_at (non-NULL), got NULL".into())
         }
     })
 }
@@ -866,6 +886,9 @@ lets_expect! { #tokio_test
             to transitions_to_killed { reenqueue_row_status("Killed") }
             to overwrites_last_result_with_the_marker {
                 reenqueue_writes_heartbeat_marker()
+            }
+            to stamps_the_completion_timestamp {
+                reenqueue_stamped_completion_timestamp()
             }
         }
 

@@ -74,6 +74,17 @@ mod tests {
         }
     }
 
+    /// Build a pool that eagerly opens its initial connection (default
+    /// `min_idle`), so an unreachable server surfaces the `Err(Error::Pool(_))`
+    /// path that `lazy_pool_with` deliberately avoids.
+    fn eager_pool(url: &'static str) -> Result<PgPool, Error> {
+        build_pool_with(url, |builder| {
+            builder
+                .max_size(1)
+                .connection_timeout(Duration::from_millis(50))
+        })
+    }
+
     fn equals_connection_timeout(expected: Duration) -> impl Fn(&PgPool) -> AssertionResult {
         move |pool| {
             if pool.connection_timeout() == expected {
@@ -120,6 +131,21 @@ mod tests {
                 let max_size = 1;
                 to keeps_the_supplied_capacity {
                     be_ok_and equals_max_size(1)
+                }
+            }
+        }
+
+        // Unlike the blocks above (which use `lazy_pool_with`'s `min_idle(0)` to
+        // inspect the builder without opening a connection), `eager_pool` drives
+        // an EAGER build: with default `min_idle`, r2d2 establishes its initial
+        // connection during `build()`, so an unreachable server surfaces the
+        // `Err(Error::Pool(_))` path — otherwise unreachable in a unit test.
+        expect(eager_pool(url)) {
+            let url = "postgres://127.0.0.1:1/unused";
+
+            when the_server_is_unreachable_and_initialization_is_eager {
+                to returns_a_pool_error {
+                    be_err_and match_pattern!(Error::Pool(_))
                 }
             }
         }

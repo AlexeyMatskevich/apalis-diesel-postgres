@@ -607,6 +607,47 @@ mod tests {
         guard.get(&queue).map(Vec::len).unwrap_or(0)
     }
 
+    /// Poison the registry mutex (panic while holding the lock, like
+    /// `make_shared_with_poisoned_registry`), then drop a `SharedRegistration`
+    /// pointing at an existing queue. The `Err(_) => false` arm of `Drop`
+    /// (src/shared.rs:356) must run: it prunes nothing and fires no best-effort
+    /// wake-up NOTIFY, so the queue's sender Vec is left untouched at length 1.
+    /// The helper returning at all proves the drop did not panic on the poison.
+    fn drop_with_poisoned_registry() -> usize {
+        let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let queue = "shared-poisoned-drop".to_owned();
+        let id = Ulid::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        registry
+            .lock()
+            .expect("fresh registry is not poisoned")
+            .insert(queue.clone(), vec![(id, sender)]);
+
+        let poison_target = registry.clone();
+        let join = std::thread::spawn(move || {
+            let _guard = poison_target
+                .lock()
+                .expect("fresh registry lock is not poisoned");
+            panic!("synthetic poisoning panic");
+        });
+        let _ = join.join();
+
+        drop(SharedRegistration {
+            id,
+            queue: queue.clone(),
+            registry: registry.clone(),
+            pool: unchecked_pool(),
+        });
+
+        // Recover past the poison to confirm the sender was left in place.
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&queue)
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
     /// Re-registering a namespace that already lives in the registry now
     /// succeeds: the broadcast redesign allows multiple consumers per queue, so
     /// the second `make_shared_with_config` must also return `Ok`.
@@ -785,6 +826,14 @@ mod tests {
         expect(drop_one_of_two_keeps_sibling_sender()) {
             when dropping_one_of_two_consumers_on_the_same_queue {
                 to leaves_the_other_senders_sender_in_place { equal(1) }
+            }
+        }
+
+        expect(drop_with_poisoned_registry()) {
+            when the_registry_mutex_is_poisoned {
+                to leaves_the_registration_in_place_without_waking_the_listener {
+                    equal(1)
+                }
             }
         }
 

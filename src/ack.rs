@@ -146,6 +146,20 @@ mod tests {
         truncate_error_payload("x".repeat(input_len)).ends_with("…[truncated]")
     }
 
+    // `€` is a 3-byte UTF-8 codepoint, so a string of `char_count` of them is
+    // `3 * char_count` bytes. With the 8 KiB cap, `MAX_ERROR_PAYLOAD_LEN` (8192)
+    // is not a multiple of 3 (`8192 % 3 == 2`), so byte index 8192 lands inside
+    // a codepoint and forces the walk-back loop in `truncate_error_payload` to
+    // step back to the nearest boundary (8190). ASCII fixtures can never reach
+    // this branch because every byte is its own char boundary.
+    fn truncated_three_byte_char_payload_length(char_count: usize) -> usize {
+        truncate_error_payload("€".repeat(char_count)).len()
+    }
+
+    fn truncated_three_byte_char_payload_is_valid_utf8(char_count: usize) -> bool {
+        std::str::from_utf8(truncate_error_payload("€".repeat(char_count)).as_bytes()).is_ok()
+    }
+
     fn poll_lock_ready(state: ReadyState) -> Poll<Result<(), BoxDynError>> {
         let mut service = LockTaskService {
             inner: ReadyService { state },
@@ -425,6 +439,28 @@ mod tests {
             when payload_overflows_the_budget {
                 let input_len = 8 * 1024 + 1;
                 to appends_the_truncation_marker { equal(true) }
+            }
+        }
+
+        expect(truncated_three_byte_char_payload_length(char_count)) {
+            // 12_000 bytes of `€`, well over the 8 KiB cap; the cut at byte 8192
+            // splits a codepoint (8192 % 3 == 2) so the walk-back fires.
+            let char_count = 4000;
+
+            when the_truncation_cut_falls_in_the_middle_of_a_multibyte_codepoint {
+                to walks_back_to_the_nearest_char_boundary_before_appending_the_marker {
+                    // Cut walks 8192 -> 8190 (the boundary), then the marker is
+                    // appended. A naive `truncate(8192)` would instead panic.
+                    equal(8190 + "…[truncated]".len())
+                }
+            }
+        }
+
+        expect(truncated_three_byte_char_payload_is_valid_utf8(char_count)) {
+            let char_count = 4000;
+
+            when the_truncation_cut_falls_in_the_middle_of_a_multibyte_codepoint {
+                to never_splits_a_codepoint_and_stays_valid_utf8 { equal(true) }
             }
         }
     }

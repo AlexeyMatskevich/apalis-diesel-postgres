@@ -464,6 +464,15 @@ mod tests {
                 to buffers_the_task { be_ok_and equal(1) }
             }
 
+            when buffer_has_exactly_one_slot_left {
+                // len == capacity - 1: the boundary push that exactly fills the
+                // buffer must still be accepted (pins the `>= cap` guard, not
+                // `> cap` or `>= cap - 1`).
+                let buffer_size = 2;
+                let existing_items = 1;
+                to accepts_the_final_task_and_fills_the_buffer { be_ok_and equal(2) }
+            }
+
             when buffer_is_at_capacity_already {
                 let buffer_size = 1;
                 let existing_items = 1;
