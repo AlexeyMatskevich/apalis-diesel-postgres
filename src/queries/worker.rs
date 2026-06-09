@@ -54,7 +54,17 @@ pub(crate) fn reenqueue_orphaned_blocking(
                      THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
                  ELSE last_result
              END
-         WHERE id IN (
+         -- The status predicate is repeated outside the sub-select on purpose.
+         -- Under READ COMMITTED, a row that a concurrent transaction already
+         -- re-enqueued (or acked) between our sub-select snapshot and our row
+         -- lock is re-checked here against its NEW version (EvalPlanQual);
+         -- without the outer predicate this sweep would apply twice — burning
+         -- an extra attempt, prematurely killing the job, or flipping an
+         -- already-acked 'Done' row back to 'Pending'. `FOR UPDATE SKIP
+         -- LOCKED` below additionally keeps concurrent sweeps from queueing
+         -- behind each other's row locks.
+         WHERE (status = 'Running' OR status = 'Queued')
+           AND id IN (
              SELECT jobs.id
              FROM apalis.jobs
              INNER JOIN apalis.workers
@@ -63,6 +73,7 @@ pub(crate) fn reenqueue_orphaned_blocking(
              WHERE (status = 'Running' OR status = 'Queued')
                  AND now() - apalis.workers.last_seen >= ($1 * INTERVAL '1 second')
                  AND jobs.job_type = $2
+             FOR UPDATE OF jobs SKIP LOCKED
          )",
     )
     .bind::<Integer, _>(clamp_i32(config.reenqueue_orphaned_after().as_secs()))

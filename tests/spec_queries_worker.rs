@@ -7,8 +7,9 @@
 //! contracts from the source and the spec must be updated in lock-step.
 //!
 //! The driver SQL is centralised in the helper functions
-//! `reenqueue_orphaned_sql`, `register_worker_sql`, and `keep_alive_sql` —
-//! keep them byte-equal to the SQL in `src/queries/worker.rs`.
+//! `reenqueue_orphaned_sql_on`, `register_worker_sql`, and `keep_alive_sql` —
+//! keep them semantically identical to the SQL in `src/queries/worker.rs`
+//! (only SQL comments and indentation may differ).
 //!
 //! Behaviour already covered elsewhere is not re-tested here:
 //!   - `mark_worker_stale` + `register_worker` admin path → `postgres_specs::run_concurrent_admin_register`
@@ -32,7 +33,7 @@ use apalis_core::task::task_id::TaskId;
 use apalis_diesel_postgres::{PgPool, PgTaskId};
 use apalis_sql::{DateTime, DateTimeExt};
 use diesel::{
-    PgConnection, QueryableByName, RunQueryDsl, sql_query,
+    Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text, Timestamptz},
 };
 use lets_expect::{AssertionError, AssertionResult, *};
@@ -270,19 +271,21 @@ async fn worker_row(
 // --------------------------------------------------------------------------
 // SQL mirrors of the private functions in src/queries/worker.rs.
 //
-// IMPORTANT: keep these byte-equal to the production SQL. If
-// `src/queries/worker.rs` changes, update these helpers in lock-step.
+// IMPORTANT: keep these semantically identical to the production SQL —
+// same statements, predicates, and bind order; only SQL comments and
+// indentation may differ. If `src/queries/worker.rs` changes, update these
+// helpers in lock-step.
 // --------------------------------------------------------------------------
 
-/// Mirror of `reenqueue_orphaned_blocking`.
-async fn reenqueue_orphaned_sql(
-    pool: PgPool,
+/// Mirror of `reenqueue_orphaned_blocking`, connection-bound so the
+/// concurrency scenarios below can interleave two sweeps on two connections.
+fn reenqueue_orphaned_sql_on(
+    conn: &mut PgConnection,
     threshold_secs: i32,
-    queue: String,
-) -> Result<usize, String> {
-    with_conn(pool, move |conn| {
-        sql_query(
-            "UPDATE apalis.jobs
+    queue: &str,
+) -> Result<usize, diesel::result::Error> {
+    sql_query(
+        "UPDATE apalis.jobs
              SET status = CASE
                      WHEN attempts + 1 >= max_attempts THEN 'Killed'
                      ELSE 'Pending'
@@ -301,7 +304,8 @@ async fn reenqueue_orphaned_sql(
                          THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
                      ELSE last_result
                  END
-             WHERE id IN (
+             WHERE (status = 'Running' OR status = 'Queued')
+               AND id IN (
                  SELECT jobs.id
                  FROM apalis.jobs
                  INNER JOIN apalis.workers
@@ -310,12 +314,22 @@ async fn reenqueue_orphaned_sql(
                  WHERE (status = 'Running' OR status = 'Queued')
                      AND now() - apalis.workers.last_seen >= ($1 * INTERVAL '1 second')
                      AND jobs.job_type = $2
+                 FOR UPDATE OF jobs SKIP LOCKED
              )",
-        )
-        .bind::<Integer, _>(threshold_secs)
-        .bind::<Text, _>(&queue)
-        .execute(conn)
-        .map_err(|e| e.to_string())
+    )
+    .bind::<Integer, _>(threshold_secs)
+    .bind::<Text, _>(queue.to_owned())
+    .execute(conn)
+}
+
+/// Mirror of `reenqueue_orphaned_blocking`.
+async fn reenqueue_orphaned_sql(
+    pool: PgPool,
+    threshold_secs: i32,
+    queue: String,
+) -> Result<usize, String> {
+    with_conn(pool, move |conn| {
+        reenqueue_orphaned_sql_on(conn, threshold_secs, &queue).map_err(|e| e.to_string())
     })
     .await
 }
@@ -601,6 +615,184 @@ fn reenqueue_writes_heartbeat_marker()
             other => Err(format!(
                 "expected heartbeat-timeout marker in last_result, got {other:?}"
             )),
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// reenqueue_orphaned: concurrent sweeps apply exactly once
+//
+// Regression for the round-11 audit fix. The production UPDATE repeats the
+// status predicate outside the candidate sub-select (EvalPlanQual re-check)
+// and the sub-select claims rows with `FOR UPDATE OF jobs SKIP LOCKED`.
+// Without both, a sweep racing another sweep on the same stale row would
+// queue on its row lock and re-apply the UPDATE after the first committed —
+// burning a second attempt (or prematurely killing the job).
+//
+// Pruned: there is no separate red for the *outer* predicate alone. The
+// sub-select's FOR UPDATE already serializes competing sweeps (its locking
+// re-check re-evaluates the sub-select's own predicates on the latest row
+// version), so with SKIP LOCKED in place the outer predicate is unreachable
+// defense-in-depth against a future edit removing the locking clause — it
+// cannot be triggered deterministically from SQL level.
+// --------------------------------------------------------------------------
+
+/// Timing of the competing sweep relative to the first one. The remaining
+/// reenqueue characteristics (status, attempt boundaries, staleness, queue
+/// scope) are already exhausted by the single-sweep matrix above and stay at
+/// their defaults here.
+#[derive(Debug, Clone, Copy)]
+enum CompetingSweep {
+    /// Runs while the first sweep's transaction still holds the row locks it
+    /// acquired — the in-flight race `SKIP LOCKED` must short-circuit.
+    WhileFirstHoldsRowLocks,
+    /// Runs only after the first sweep committed — the rerun must find no
+    /// eligible row (`lock_by` is NULL, status is no longer Running/Queued).
+    AfterFirstCommitted,
+}
+
+#[derive(Debug)]
+struct ConcurrentReenqueueRun {
+    first_affected: usize,
+    competing_affected: usize,
+    status: String,
+    attempts: i32,
+}
+
+async fn run_concurrent_reenqueue(
+    timing: CompetingSweep,
+) -> Result<Outcome<ConcurrentReenqueueRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-worker-reenq-conc-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-reenq-conc-worker-{queue}");
+
+    // One stale-worker Running row with attempts left: eligible for exactly
+    // one re-enqueue (threshold 1s, worker last seen 10s ago).
+    insert_worker_row(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        Some(format!("token-{}", Ulid::new())),
+        10,
+    )
+    .await?;
+    let id = insert_running_row(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        "Running",
+        0,
+        3,
+        None,
+    )
+    .await?;
+
+    let sweep_pool = pool.clone();
+    let sweep_queue = queue.clone();
+    let (first_affected, competing_affected) =
+        tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
+            let mut first_conn = sweep_pool.get().map_err(|e| e.to_string())?;
+            let mut competing_conn = sweep_pool.get().map_err(|e| e.to_string())?;
+            // `SET LOCAL lock_timeout` bounds the wait so a regression (the
+            // competing sweep queueing on the first sweep's row locks instead
+            // of skipping them) fails fast with a lock-timeout error instead
+            // of stalling the suite; LOCAL scoping resets it at COMMIT so the
+            // pooled connection returns clean.
+            let competing_sweep =
+                |conn: &mut PgConnection| -> Result<usize, diesel::result::Error> {
+                    conn.transaction(|tx| {
+                        sql_query("SET LOCAL lock_timeout = '2s'").execute(tx)?;
+                        reenqueue_orphaned_sql_on(tx, 1, &sweep_queue)
+                    })
+                };
+            match timing {
+                CompetingSweep::WhileFirstHoldsRowLocks => {
+                    let mut first_affected = 0;
+                    let mut competing_affected = 0;
+                    first_conn
+                        .transaction::<_, diesel::result::Error, _>(|tx| {
+                            first_affected = reenqueue_orphaned_sql_on(tx, 1, &sweep_queue)?;
+                            competing_affected = competing_sweep(&mut competing_conn)?;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    Ok((first_affected, competing_affected))
+                }
+                CompetingSweep::AfterFirstCommitted => {
+                    let first_affected =
+                        reenqueue_orphaned_sql_on(&mut first_conn, 1, &sweep_queue)
+                            .map_err(|e| e.to_string())?;
+                    let competing_affected =
+                        competing_sweep(&mut competing_conn).map_err(|e| e.to_string())?;
+                    Ok((first_affected, competing_affected))
+                }
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let row = job_status_row(pool.clone(), id).await?;
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(ConcurrentReenqueueRun {
+        first_affected,
+        competing_affected,
+        status: row.status,
+        attempts: row.attempts,
+    }))
+}
+
+fn concurrent_first_sweep_claimed_the_row()
+-> impl Fn(&Result<Outcome<ConcurrentReenqueueRun>, String>) -> AssertionResult {
+    observe::<ConcurrentReenqueueRun, _>("first sweep affected", |run| {
+        if run.first_affected == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the first sweep to re-enqueue the row, got affected={}",
+                run.first_affected
+            ))
+        }
+    })
+}
+
+fn concurrent_competing_sweep_touched_nothing()
+-> impl Fn(&Result<Outcome<ConcurrentReenqueueRun>, String>) -> AssertionResult {
+    observe::<ConcurrentReenqueueRun, _>("competing sweep affected", |run| {
+        if run.competing_affected == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the competing sweep to touch nothing, got affected={}",
+                run.competing_affected
+            ))
+        }
+    })
+}
+
+fn concurrent_attempts_incremented_exactly_once()
+-> impl Fn(&Result<Outcome<ConcurrentReenqueueRun>, String>) -> AssertionResult {
+    observe::<ConcurrentReenqueueRun, _>("attempts after both sweeps", |run| {
+        if run.attempts == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected attempts=1 (applied exactly once), got {}",
+                run.attempts
+            ))
+        }
+    })
+}
+
+fn concurrent_row_landed_in_pending()
+-> impl Fn(&Result<Outcome<ConcurrentReenqueueRun>, String>) -> AssertionResult {
+    observe::<ConcurrentReenqueueRun, _>("status after both sweeps", |run| {
+        if run.status == "Pending" {
+            Ok(())
+        } else {
+            Err(format!("expected status Pending, got {:?}", run.status))
         }
     })
 }
@@ -921,6 +1113,34 @@ lets_expect! { #tokio_test
                 ..REENQUEUE_DEFAULT
             };
             to leaves_the_terminal_row_alone { reenqueue_left_row_untouched() }
+        }
+    }
+
+    // ----- reenqueue_orphaned: concurrent sweeps apply exactly once -------
+    expect(run_concurrent_reenqueue(timing).await) {
+        let timing = CompetingSweep::WhileFirstHoldsRowLocks;
+
+        when a_competing_sweep_runs_while_the_first_holds_row_locks {
+            to the_first_sweep_claims_the_row { concurrent_first_sweep_claimed_the_row() }
+            to the_competing_sweep_skips_the_locked_row {
+                concurrent_competing_sweep_touched_nothing()
+            }
+            to attempts_increment_exactly_once {
+                concurrent_attempts_incremented_exactly_once()
+            }
+            to the_row_lands_in_pending { concurrent_row_landed_in_pending() }
+        }
+
+        when the_sweep_reruns_after_the_first_committed {
+            let timing = CompetingSweep::AfterFirstCommitted;
+            to the_first_sweep_claims_the_row { concurrent_first_sweep_claimed_the_row() }
+            to the_rerun_finds_no_eligible_row {
+                concurrent_competing_sweep_touched_nothing()
+            }
+            to attempts_increment_exactly_once {
+                concurrent_attempts_incremented_exactly_once()
+            }
+            to the_row_lands_in_pending { concurrent_row_landed_in_pending() }
         }
     }
 
