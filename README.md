@@ -37,12 +37,15 @@ serde = { version = "1", features = ["derive"] }
 Runtime features (pick one):
 
 - `tokio` (default) — Diesel work runs on `tokio::task::spawn_blocking`.
-- `ntex` — Diesel work runs on `ntex_rt::spawn_blocking`.
-- no feature — Diesel work runs on the calling thread (compile-time
-  compatibility only; can stall an async executor under load).
+- `ntex` — Diesel work runs on `ntex_rt::spawn_blocking`. Enable with
+  `--no-default-features --features ntex`.
+- no feature — compile error: without a runtime every Diesel query would
+  execute inline on the async caller and stall the executor.
 
-If both `tokio` and `ntex` are enabled, `tokio` wins. Treat `--all-features`
-as a compatibility check, not a runtime shape.
+If both `tokio` and `ntex` are enabled, `tokio` wins while a Tokio runtime
+is present; outside one (e.g. on the ntex executor) the work falls back to
+ntex's blocking pool. Treat `--all-features` as a compatibility check, not
+a runtime shape.
 
 ## Quick start
 
@@ -395,8 +398,8 @@ worker logs point at the failed lifecycle step:
   conflicting_keys, total }` when an enqueue collides with the
   `(job_type, idempotency_key)` unique constraint. `conflicting_keys` names the
   exact keys that collided, so a batch caller can drop them and re-enqueue the
-  rest. Match the variant (not the message text) to treat a duplicate as
-  benign. One duplicate rolls back the *whole* batch, not just the colliding
+  rest. Match the variant (not
+  the message text) to treat a duplicate as benign. One duplicate rolls back the *whole* batch, not just the colliding
   row; a surrounding transaction stays alive. The `push_*_with_conn` outbox
   methods return this directly; the `Sink` / `TaskSink` enqueue APIs wrap it
   (like every push error) as

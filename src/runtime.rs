@@ -17,6 +17,17 @@ where
     F: FnOnce() -> Result<T, Error> + Send + 'static,
     T: Send + 'static,
 {
+    // `tokio::task::spawn_blocking` panics when no Tokio runtime is entered.
+    // With both runtime features enabled and the caller running on the ntex
+    // executor that panic would be guaranteed on the very first query, so
+    // "tokio wins" only while its runtime is actually present — otherwise
+    // fall back to ntex's blocking pool.
+    #[cfg(feature = "ntex")]
+    if tokio::runtime::Handle::try_current().is_err() {
+        return ntex_rt::spawn_blocking(work)
+            .await
+            .map_err(|error| Error::Blocking(Box::new(error)))?;
+    }
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| Error::Blocking(Box::new(error)))?
