@@ -148,7 +148,6 @@ impl<Args, Codec> PgSink<Args, Codec> {
 
 impl<Args, Encode, Fetcher> Sink<PgTask<CompactType>> for PostgresStorage<Args, Encode, Fetcher>
 where
-    Args: Send + Sync + 'static,
     Fetcher: Unpin,
 {
     type Error = Error;
