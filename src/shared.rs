@@ -21,14 +21,13 @@ use apalis_codec::json::JsonCodec;
 use apalis_core::{backend::shared::MakeShared, worker::context::WorkerContext};
 use diesel::RunQueryDsl;
 use futures::{
-    Stream, StreamExt, TryFutureExt,
+    Stream,
     channel::mpsc::{self, Receiver, Sender},
 };
 use ulid::Ulid;
 
 use crate::{
-    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, fetcher::PgPollFetcher,
-    queries, sink::PgSink,
+    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, queries, sink::PgSink,
 };
 
 /// Per-registration sender entry.
@@ -470,27 +469,14 @@ impl crate::fetcher::PgFetcherSource for SharedFetcher {
         worker: WorkerContext,
         lease_token: std::sync::Arc<str>,
     ) -> apalis_core::backend::TaskStream<PgTask<CompactType>, Error> {
-        let register_worker = queries::initial_heartbeat(
-            pool.clone(),
-            config.clone(),
-            worker.clone(),
+        crate::fetcher::notify_backed_compact_stream(
             Self::STORAGE_NAME,
+            self,
+            pool,
+            config,
+            worker,
             lease_token,
         )
-        .map_ok(|_| None);
-
-        let lazy_fetcher = queries::batch_ids_into_tasks(
-            pool.clone(),
-            config.queue().to_string(),
-            worker.name().to_owned(),
-            config.buffer_size().max(1),
-            self,
-        )
-        .boxed();
-
-        let eager_fetcher = PgPollFetcher::<CompactType>::new(&pool, &config, &worker);
-        let combined = futures::stream::select(lazy_fetcher, eager_fetcher);
-        crate::fetcher::register_then_stream(register_worker, combined)
     }
 }
 

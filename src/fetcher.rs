@@ -26,7 +26,7 @@ use futures::{
     stream,
 };
 
-use crate::{CompactType, Config, Error, PgContext, PgPool, PgTask, queries};
+use crate::{CompactType, Config, Error, PgContext, PgPool, PgTask, PgTaskId, queries};
 
 /// A fetcher that waits for PostgreSQL NOTIFY events.
 #[derive(Debug, Clone, Default)]
@@ -97,38 +97,59 @@ impl PgFetcherSource for PgNotify {
         worker: WorkerContext,
         lease_token: Arc<str>,
     ) -> TaskStream<PgTask<CompactType>, Error> {
-        let register_worker = queries::initial_heartbeat(
-            pool.clone(),
-            config.clone(),
-            worker.clone(),
-            Self::STORAGE_NAME,
-            lease_token,
-        )
-        .map_ok(|_| None);
-
-        // Real batching is provided upstream by the statement-level NOTIFY
-        // trigger (migration 20260521000001), which emits one event per
-        // (queue, INSERT statement) carrying all inserted ids in `ids`. By
-        // the time those ids land in the mpsc channel they are already
-        // contiguous, so `ready_chunks` (inside `batch_ids_into_tasks`)
-        // folds them into one batch in the common bursty case.
-        let lazy_fetcher = queries::batch_ids_into_tasks(
+        let ids = queries::notify_task_ids(
             pool.clone(),
             config.queue().to_string(),
-            worker.name().to_owned(),
             config.buffer_size().max(1),
-            queries::notify_task_ids(
-                pool.clone(),
-                config.queue().to_string(),
-                config.buffer_size().max(1),
-            ),
-        )
-        .boxed();
-
-        let eager_fetcher = PgPollFetcher::<CompactType>::new(&pool, &config, &worker);
-        let combined = futures::stream::select(lazy_fetcher, eager_fetcher);
-        register_then_stream(register_worker, combined)
+        );
+        notify_backed_compact_stream(Self::STORAGE_NAME, ids, pool, config, worker, lease_token)
     }
+}
+
+/// Shared pipeline composition for the two notify-driven fetcher modes
+/// (`PgNotify` and `SharedFetcher`): initial registration gate, the id→task
+/// batching fetcher fed by `ids`, and the eager polling fetcher merged
+/// alongside as the durable fallback. Factored out so the two impls cannot
+/// drift apart — only the source of notified ids differs between them.
+///
+/// Real batching is provided upstream by the statement-level NOTIFY trigger
+/// (migration 20260521000001), which emits one event per (queue, INSERT
+/// statement) carrying all inserted ids in `ids`. By the time those ids land
+/// in the mpsc channel they are already contiguous, so `ready_chunks` (inside
+/// `batch_ids_into_tasks`) folds them into one batch in the common bursty
+/// case.
+pub(crate) fn notify_backed_compact_stream<Ids>(
+    storage_name: &'static str,
+    ids: Ids,
+    pool: PgPool,
+    config: Config,
+    worker: WorkerContext,
+    lease_token: Arc<str>,
+) -> TaskStream<PgTask<CompactType>, Error>
+where
+    Ids: Stream<Item = Result<PgTaskId, Error>> + Send + 'static,
+{
+    let register_worker = queries::initial_heartbeat(
+        pool.clone(),
+        config.clone(),
+        worker.clone(),
+        storage_name,
+        lease_token,
+    )
+    .map_ok(|_| None);
+
+    let lazy_fetcher = queries::batch_ids_into_tasks(
+        pool.clone(),
+        config.queue().to_string(),
+        worker.name().to_owned(),
+        config.buffer_size().max(1),
+        ids,
+    )
+    .boxed();
+
+    let eager_fetcher = PgPollFetcher::<CompactType>::new(&pool, &config, &worker);
+    let combined = futures::stream::select(lazy_fetcher, eager_fetcher);
+    register_then_stream(register_worker, combined)
 }
 
 /// Internal contract for the concrete fetcher modes (`PgFetcher`, `PgNotify`,
