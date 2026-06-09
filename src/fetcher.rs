@@ -206,9 +206,9 @@ enum StreamState<Args> {
 }
 
 /// Marker fetcher used by the default polling backend.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PgFetcher<Compact, Decode> {
-    pub _marker: PhantomData<(Compact, Decode)>,
+    _marker: PhantomData<(Compact, Decode)>,
 }
 
 /// Polling stream that fetches and buffers queued tasks.

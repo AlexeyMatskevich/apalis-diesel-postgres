@@ -147,9 +147,7 @@ impl<Args> PostgresStorage<Args> {
             _marker: PhantomData,
             pool: pool.clone(),
             config: config.clone(),
-            fetcher: PgFetcher {
-                _marker: PhantomData,
-            },
+            fetcher: PgFetcher::default(),
             sink: PgSink::new(pool, config),
             lease_token: queries::worker::mint_lease_token().into(),
         }
