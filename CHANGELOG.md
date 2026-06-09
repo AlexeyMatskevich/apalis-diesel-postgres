@@ -5,6 +5,69 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While
 the crate is pre-1.0, a minor version bump may carry breaking changes.
 
+## [Unreleased]
+
+### Fixed
+
+- Concurrent `reenqueue_orphaned` sweeps could double-apply to the same stale
+  row under READ COMMITTED (EvalPlanQual re-check): burning an extra attempt,
+  prematurely killing a job, or flipping an already-acked row back to
+  `Pending`. The sweep now repeats the status predicate on the outer UPDATE
+  and claims candidates with `FOR UPDATE OF jobs SKIP LOCKED`, so competing
+  sweeps skip each other instead of queueing and re-applying.
+- The shared notify listener returned its pooled connection to r2d2 without
+  `UNLISTEN`, so the next pool user inherited the subscription and
+  notifications accumulated unread in libpq's receive buffer. Every listener
+  exit now removes the subscription before the connection is recycled.
+- `Debug` output of `PgAck` (and therefore of the public `PgMiddleware`
+  returned by `Backend::middleware()`) printed the per-process `lease_token`
+  verbatim; it is now redacted, matching `PostgresStorage`'s `Debug`.
+- `with_codec` rebuilt the sink from scratch, silently dropping buffered
+  tasks and any in-flight flush; both now carry over (the buffer holds
+  codec-independent compact tasks).
+- With both `tokio` and `ntex` features enabled, calling the backend from the
+  ntex executor panicked inside `tokio::task::spawn_blocking`; the backend
+  now falls back to ntex's blocking pool when no Tokio runtime is present.
+
+### Changed (breaking)
+
+- `PgFetcher`'s phantom `_marker` field is no longer public; construct the
+  marker fetcher via `Default` instead.
+
+### Changed
+
+- Pool-path enqueue batches without an `idempotency_key` skip the
+  conflict-recovery machinery (transaction wrapper, `RETURNING`
+  materialization, key copies) on the sink's hot flush path — no conflict is
+  possible without a key. The outbox path (`push_with_conn` /
+  `push_task_with_conn`) keeps every batch inside `conn.transaction(...)`:
+  a failing INSERT — idempotency conflict or a PK violation on a
+  caller-supplied task id — rolls back only the batch's SAVEPOINT and never
+  aborts the caller's outer transaction.
+- apalis RC dependencies are pinned exactly (`=…-rc.9`): cargo treats
+  prereleases as caret-compatible, so an unpinned requirement would let
+  `cargo update` pull a breaking `rc.10` silently. Dropped the unused direct
+  `pin-project` dependency and trimmed production tokio features to `rt`.
+- The admin worker registration dropped its unreachable `AlreadyRegistered`
+  branch (the statement always upserts; dashboards re-registering an
+  existing worker is the expected idempotent case).
+- The `Sink` impl on `PostgresStorage` no longer requires
+  `Args: Send + Sync + 'static`.
+- The notify-driven fetcher pipeline composition is shared between
+  `PgNotify` and `SharedFetcher` (`notify_backed_compact_stream`), removing
+  the duplication that had already let the two LISTEN loops drift.
+
+### Documentation
+
+- `Error::IdempotencyConflict` recovery guidance now explains that
+  `conflicting_keys` also covers intra-batch duplicates: deduplicate (keep
+  one task per conflicting key) instead of dropping every task with the key.
+- The dequeue-index migration comment no longer claims the partial predicate
+  "exactly matches" the fetch WHERE clause: `run_at <= now()` remains a
+  residual filter, and the trade-off is now documented.
+- README runtime-feature matrix corrected: building with no runtime feature
+  is a compile error, and the tokio/ntex precedence is runtime-aware.
+
 ## [0.3.0]
 
 ### Changed (breaking)
