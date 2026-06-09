@@ -100,7 +100,6 @@ dependencies = [
  "lets_expect",
  "ntex",
  "ntex-rt",
- "pin-project",
  "serde",
  "serde_json",
  "thiserror",

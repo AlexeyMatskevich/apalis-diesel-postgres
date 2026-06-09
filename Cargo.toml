@@ -36,17 +36,20 @@ diesel = { version = "2.3", features = ["postgres", "r2d2", "chrono", "serde_jso
 diesel_migrations = "2.3"
 futures = "0.3"
 ntex-rt = { version = "3.12", optional = true }
-pin-project = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"], optional = true }
+# Production code only ever calls `tokio::task::spawn_blocking` (src/runtime.rs);
+# the macros/multi-thread/time features tests and examples need live in
+# [dev-dependencies] below.
+tokio = { version = "1", features = ["rt"], optional = true }
 ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 apalis = "=1.0.0-rc.9"
 lets_expect = { version = "0.5", features = ["tokio"] }
 ntex = { version = "3", default-features = false, features = ["neon-polling"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [features]
 default = ["tokio"]
