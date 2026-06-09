@@ -14,8 +14,9 @@ use apalis_core::{
 };
 use apalis_diesel_postgres::{
     CompactType, Config, JsonCodec, PgPool, PgTask, PostgresStorage, SharedPostgresStorage,
+    build_pool_with,
 };
-use diesel::{RunQueryDsl, sql_query, sql_types::Text};
+use diesel::{QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
 use futures::{StreamExt, stream};
 use lets_expect::{AssertionError, AssertionResult, *};
 use ulid::Ulid;
@@ -360,7 +361,124 @@ fn shared_second_registration_accepted()
     })
 }
 
+// --------------------------------------------------------------------------
+// shared listener returns its pooled connection without a LISTEN subscription
+//
+// Regression for the round-11 audit fix: every exit path of the shared
+// listener thread now funnels through a single boundary that executes
+// `UNLISTEN` before the pooled connection drops back into r2d2. Without it,
+// the next pool user inherits the subscription and notifications accumulate
+// in libpq's receive buffer with no consumer. Only the normal (empty
+// registry) exit is driven here: the error exits (connection failure,
+// poisoned registry) cannot be triggered deterministically from an
+// integration test, and all paths share the same single cleanup boundary.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct UnlistenRun {
+    /// Channels the recycled connection still listens on. Must be empty.
+    leaked_channels: Vec<String>,
+}
+
+#[derive(QueryableByName)]
+struct ChannelRow {
+    #[diesel(sql_type = Text)]
+    channel: String,
+}
+
+async fn wait_until(
+    what: &'static str,
+    deadline: Duration,
+    predicate: impl Fn() -> bool,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    while !predicate() {
+        if started.elapsed() > deadline {
+            return Err(format!("timed out waiting for {what}"));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+async fn run_listener_recycles_a_clean_connection() -> Result<Outcome<UnlistenRun>, String> {
+    // Consult the shared pool first so migrations have run and the
+    // DATABASE_URL-skip path stays uniform with the other scenarios…
+    if test_pool().await?.is_none() {
+        return Ok(Outcome::Skipped);
+    }
+    // …but observe the listener through a dedicated single-connection pool:
+    // with `max_size = 1` the connection handed back by `pool.get()` below is
+    // the very connection the listener thread used for LISTEN.
+    let url = support::database_url_or_skip()?
+        .ok_or_else(|| "DATABASE_URL vanished between checks".to_owned())?;
+    let pool = build_pool_with(url, |builder| builder.max_size(1).min_idle(Some(0)))
+        .map_err(|e| e.to_string())?;
+
+    let queue = format!("apalis-shared-unlisten-{}", Ulid::new());
+    let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
+        SharedPostgresStorage::new(pool.clone());
+    let storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
+        &mut shared,
+        notify_only_config(&queue),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // The listener thread claims the pool's only connection and LISTENs.
+    wait_until(
+        "the shared listener to claim the pool's only connection",
+        Duration::from_secs(5),
+        || pool.state().connections == 1,
+    )
+    .await?;
+
+    // Dropping the only registration empties the registry; the listener
+    // notices within its poll interval, exits, and recycles the connection.
+    drop(storage);
+    wait_until(
+        "the shared listener to exit and return its connection to the pool",
+        Duration::from_secs(5),
+        || pool.state().idle_connections == 1,
+    )
+    .await?;
+
+    let check_pool = pool.clone();
+    let leaked_channels = tokio::task::spawn_blocking(move || {
+        let mut conn = check_pool.get().map_err(|e| e.to_string())?;
+        sql_query("SELECT channel FROM pg_listening_channels() AS t(channel)")
+            .load::<ChannelRow>(&mut conn)
+            .map(|rows| rows.into_iter().map(|row| row.channel).collect::<Vec<_>>())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    Ok(Outcome::Completed(UnlistenRun { leaked_channels }))
+}
+
+fn recycled_connection_has_no_subscriptions()
+-> impl Fn(&Result<Outcome<UnlistenRun>, String>) -> AssertionResult {
+    check::<UnlistenRun, _>("recycled connection subscriptions", |run| {
+        if run.leaked_channels.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the connection returned to the pool still LISTENs on {:?}",
+                run.leaked_channels
+            ))
+        }
+    })
+}
+
 lets_expect! { #tokio_test
+    expect(run_listener_recycles_a_clean_connection().await) {
+        when the_last_registration_drops_and_the_listener_exits {
+            to returns_the_connection_without_a_listen_subscription {
+                recycled_connection_has_no_subscriptions()
+            }
+        }
+    }
+
     expect(run_notify_delivery().await) {
         when notify_storage_observes_a_pushed_job {
             to delivers_the_payload_to_the_waiting_worker {

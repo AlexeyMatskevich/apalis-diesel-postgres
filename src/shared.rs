@@ -105,61 +105,15 @@ impl<Codec> SharedPostgresStorage<Codec> {
                     );
                     return;
                 }
-                loop {
-                    for notification in conn.notifications_iter() {
-                        let notification = match notification {
-                            Ok(notification) => notification,
-                            Err(error) => {
-                                exit_listener(
-                                    &registry,
-                                    &listener_alive,
-                                    Some(format!("failed to receive shared notification: {error}")),
-                                );
-                                return;
-                            }
-                        };
-                        let Ok(event) =
-                            serde_json::from_str::<crate::InsertEvent>(&notification.payload)
-                        else {
-                            continue;
-                        };
-                        let (event_queue, ids) = event.into_ids();
-                        let Ok(mut registry) = registry.lock() else {
-                            // Poisoned: we cannot synchronize with registrants
-                            // any longer, fall back to a bare store.
-                            listener_alive.store(false, Ordering::Release);
-                            return;
-                        };
-                        deliver_to_queue(&mut registry, &event_queue, &ids);
-                    }
-                    match registry.lock() {
-                        Ok(registry) => {
-                            // Store `false` while still holding the registry
-                            // lock: a concurrent `make_shared_with_config`
-                            // must observe either (a) `listener_alive == true`
-                            // (we haven't exited yet) AND see itself appended
-                            // to the registry on our next loop iteration, or
-                            // (b) `listener_alive == false` AND therefore
-                            // spawn a fresh listener. The exit decision is
-                            // factored into `listener_should_exit` (unit-tested)
-                            // and applied as a plain `if` rather than a match
-                            // guard so the only mutable point is that function,
-                            // which the tests pin — an in-thread guard would be
-                            // unreachable from a unit test.
-                            if listener_should_exit(&registry) {
-                                listener_alive.store(false, Ordering::Release);
-                                drop(registry);
-                                return;
-                            }
-                        }
-                        Err(_) => {
-                            // Poisoned: synchronization is no longer possible.
-                            listener_alive.store(false, Ordering::Release);
-                            return;
-                        }
-                    }
-                    std::thread::sleep(queries::NOTIFY_LISTENER_POLL_INTERVAL);
-                }
+                run_listener_loop(&mut conn, &registry, &listener_alive);
+                // Remove the subscription before the pooled connection drops
+                // back into r2d2: the next pool user would otherwise inherit
+                // it and notifications would silently accumulate in libpq's
+                // receive buffer with no consumer draining them (mirrors the
+                // single-queue listener cleanup in `queries/notify.rs`).
+                // Best-effort: on failure the connection is in an unknown
+                // state and r2d2's checkout health check decides its fate.
+                let _ = diesel::sql_query("UNLISTEN \"apalis::job::insert\"").execute(&mut conn);
             })
         {
             exit_listener(
@@ -168,6 +122,74 @@ impl<Codec> SharedPostgresStorage<Codec> {
                 Some(format!("failed to spawn listener: {error}")),
             );
         }
+    }
+}
+
+/// Body of the shared listener thread, between a successful `LISTEN` and the
+/// `UNLISTEN` cleanup. Factored out of `spawn_registry_listener` so every exit
+/// path — notification error, poisoned registry, empty registry — funnels
+/// through a single return boundary, after which the caller removes the
+/// LISTEN subscription before the pooled connection is returned to r2d2.
+fn run_listener_loop(
+    conn: &mut diesel::r2d2::PooledConnection<
+        diesel::r2d2::ConnectionManager<diesel::PgConnection>,
+    >,
+    registry: &SharedRegistry,
+    listener_alive: &AtomicBool,
+) {
+    loop {
+        for notification in conn.notifications_iter() {
+            let notification = match notification {
+                Ok(notification) => notification,
+                Err(error) => {
+                    exit_listener(
+                        registry,
+                        listener_alive,
+                        Some(format!("failed to receive shared notification: {error}")),
+                    );
+                    return;
+                }
+            };
+            let Ok(event) = serde_json::from_str::<crate::InsertEvent>(&notification.payload)
+            else {
+                continue;
+            };
+            let (event_queue, ids) = event.into_ids();
+            let Ok(mut registry) = registry.lock() else {
+                // Poisoned: we cannot synchronize with registrants
+                // any longer, fall back to a bare store.
+                listener_alive.store(false, Ordering::Release);
+                return;
+            };
+            deliver_to_queue(&mut registry, &event_queue, &ids);
+        }
+        match registry.lock() {
+            Ok(registry) => {
+                // Store `false` while still holding the registry
+                // lock: a concurrent `make_shared_with_config`
+                // must observe either (a) `listener_alive == true`
+                // (we haven't exited yet) AND see itself appended
+                // to the registry on our next loop iteration, or
+                // (b) `listener_alive == false` AND therefore
+                // spawn a fresh listener. The exit decision is
+                // factored into `listener_should_exit` (unit-tested)
+                // and applied as a plain `if` rather than a match
+                // guard so the only mutable point is that function,
+                // which the tests pin — an in-thread guard would be
+                // unreachable from a unit test.
+                if listener_should_exit(&registry) {
+                    listener_alive.store(false, Ordering::Release);
+                    drop(registry);
+                    return;
+                }
+            }
+            Err(_) => {
+                // Poisoned: synchronization is no longer possible.
+                listener_alive.store(false, Ordering::Release);
+                return;
+            }
+        }
+        std::thread::sleep(queries::NOTIFY_LISTENER_POLL_INTERVAL);
     }
 }
 
