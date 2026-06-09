@@ -1,9 +1,15 @@
 -- Tighten `jobs_dequeue_idx` so terminal `Failed` rows (attempts at
 -- max_attempts) do not pile up at the head of the dequeue index ordering
--- and force `SKIP LOCKED` to walk past them on every fetch. The new
--- predicate exactly matches the WHERE clause used by `fetch_next` /
--- `queue_by_id` / `apalis.get_jobs`, so the planner can do a pure index
--- scan with no residual filter on the dequeue path.
+-- and force `SKIP LOCKED` to walk past them on every fetch. The partial
+-- predicate matches the status/attempts filter used by `fetch_next` /
+-- `queue_by_id` / `apalis.get_jobs`, so terminal rows are excluded from the
+-- index entirely. Note `run_at <= now()` is NOT covered: `run_at` is a sort
+-- column here (after the unconstrained `priority DESC`), so it remains a
+-- residual filter — future-scheduled rows with a higher priority are still
+-- walked and filtered out on every fetch. That trade-off is deliberate: it
+-- keeps one index serving both the ordering and the predicate, and
+-- delay-heavy/high-priority workloads were not measured to need a second
+-- index. Revisit only with workload evidence.
 DROP INDEX IF EXISTS apalis.jobs_dequeue_idx;
 CREATE INDEX IF NOT EXISTS jobs_dequeue_idx
     ON apalis.jobs(job_type, priority DESC, run_at ASC, id)
