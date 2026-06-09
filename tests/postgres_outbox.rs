@@ -680,6 +680,159 @@ fn conflict_lets_outer_business_writes_commit()
 }
 
 // --------------------------------------------------------------------------
+// push_task_with_conn: PK conflict without idempotency keys must not poison
+// the outer transaction.
+//
+// Regression for the round-11 audit follow-up: the key-less enqueue path
+// briefly ran as a bare INSERT on the caller's connection, so a PK violation
+// on a caller-supplied task id aborted the caller's *outer* transaction (its
+// business writes were silently rolled back on COMMIT). The outbox path now
+// wraps key-less batches in `conn.transaction(...)` again, so the failure is
+// contained in the batch's SAVEPOINT. The happy path (unique caller-supplied
+// id) is already pinned by `run_custom_fields_scenario`.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct PkConflictRun {
+    second_push_was_database_error: bool,
+    db_jobs_after_outer_commit: i64,
+    db_business_after_outer_commit: i64,
+}
+
+async fn run_pk_conflict_scenario() -> Result<Outcome<PkConflictRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    ensure_business_table(pool.clone()).await?;
+    let queue = format!("apalis-outbox-pk-conflict-{}", Ulid::new());
+    let key = format!("marker-{queue}");
+    cleanup(pool.clone(), queue.clone()).await?;
+
+    let storage =
+        PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(1));
+    let duplicate_id = PgTaskId::new(Ulid::new());
+
+    // Seed: a first task occupying the caller-supplied id, committed in its
+    // own transaction before the conflict scenario starts. No idempotency
+    // keys anywhere — this drives the key-less enqueue branch.
+    {
+        let storage = storage.clone();
+        let pool_for_seed = pool.clone();
+        let seed_id = duplicate_id;
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let mut conn = pool_for_seed.get().map_err(|e| e.to_string())?;
+            let mut task = PgTask::<String>::new("payload-1".to_owned());
+            task.parts.task_id = Some(seed_id);
+            conn.transaction::<_, PgError, _>(|c| storage.push_task_with_conn(c, task).map(|_| ()))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    }
+
+    // Scenario: open an outer transaction, insert a business row, attempt a
+    // second push reusing the same task id (PK violation inside the batch's
+    // SAVEPOINT), then commit the outer transaction. The business row must
+    // survive — i.e. the outer transaction must still be usable after the
+    // failed push.
+    let q = queue.clone();
+    let k = key.clone();
+    let storage_for_run = storage.clone();
+    let pool_for_run = pool.clone();
+    let second_push_was_database_error =
+        tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let mut conn = pool_for_run.get().map_err(|e| e.to_string())?;
+            let observed = std::cell::Cell::new(false);
+            conn.transaction::<_, PgError, _>(|c| {
+                sql_query("INSERT INTO apalis_outbox_test_marker (key, queue) VALUES ($1, $2)")
+                    .bind::<Text, _>(&k)
+                    .bind::<Text, _>(&q)
+                    .execute(c)?;
+                let mut task = PgTask::<String>::new("payload-2".to_owned());
+                task.parts.task_id = Some(duplicate_id);
+                match storage_for_run.push_task_with_conn(c, task) {
+                    Ok(_) => {
+                        return Err(PgError::InvalidArgument(
+                            "expected a primary-key conflict, got success".into(),
+                        ));
+                    }
+                    Err(PgError::Database { .. }) => {
+                        observed.set(true);
+                    }
+                    Err(other) => {
+                        return Err(PgError::InvalidArgument(format!(
+                            "expected Error::Database from the PK violation, got {other:?}"
+                        )));
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(observed.get())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let q2 = queue.clone();
+    let (db_jobs, db_business) = with_conn(pool.clone(), move |conn| {
+        Ok::<_, String>((count_jobs(conn, &q2)?, count_business(conn, &q2)?))
+    })
+    .await?;
+
+    cleanup(pool, queue).await?;
+    Ok(Outcome::Completed(PkConflictRun {
+        second_push_was_database_error,
+        db_jobs_after_outer_commit: db_jobs,
+        db_business_after_outer_commit: db_business,
+    }))
+}
+
+fn pk_conflict_surfaces_a_database_error()
+-> impl Fn(&Result<Outcome<PkConflictRun>, String>) -> AssertionResult {
+    observe("pk-conflict→error kind", |run: &PkConflictRun| {
+        if run.second_push_was_database_error {
+            Ok(())
+        } else {
+            Err("second push did not surface an Error::Database for the PK violation".into())
+        }
+    })
+}
+
+fn pk_conflict_keeps_only_the_seed_job()
+-> impl Fn(&Result<Outcome<PkConflictRun>, String>) -> AssertionResult {
+    observe(
+        "pk-conflict→job count after outer commit",
+        |run: &PkConflictRun| {
+            if run.db_jobs_after_outer_commit == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected 1 job (seed survives, conflicting batch rolled back via savepoint), got {}",
+                    run.db_jobs_after_outer_commit
+                ))
+            }
+        },
+    )
+}
+
+fn pk_conflict_lets_outer_business_writes_commit()
+-> impl Fn(&Result<Outcome<PkConflictRun>, String>) -> AssertionResult {
+    observe(
+        "pk-conflict→business row after outer commit",
+        |run: &PkConflictRun| {
+            if run.db_business_after_outer_commit == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected the outer transaction's business write to survive the failed push, got {} rows",
+                    run.db_business_after_outer_commit
+                ))
+            }
+        },
+    )
+}
+
+// --------------------------------------------------------------------------
 // Test entry points
 // --------------------------------------------------------------------------
 
@@ -723,6 +876,20 @@ lets_expect! { #tokio_test
             }
             to leaves_the_outer_business_writes_intact {
                 conflict_lets_outer_business_writes_commit()
+            }
+        }
+    }
+
+    expect(run_pk_conflict_scenario().await) {
+        when push_task_with_conn_collides_on_a_caller_supplied_id_without_idempotency_keys {
+            to surfaces_a_database_error {
+                pk_conflict_surfaces_a_database_error()
+            }
+            to rolls_back_only_the_apalis_batch_via_savepoint {
+                pk_conflict_keeps_only_the_seed_job()
+            }
+            to leaves_the_outer_business_writes_intact {
+                pk_conflict_lets_outer_business_writes_commit()
             }
         }
     }

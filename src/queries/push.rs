@@ -36,28 +36,149 @@ struct ReturnedIdempotencyKey {
     idempotency_key: Option<String>,
 }
 
+/// Batch INSERT shared by both enqueue paths. The conflict-recovery path
+/// appends `RETURNING idempotency_key` to this literal; keeping one copy of
+/// the statement (and one bind site, [`JobBatchBinds::into_query`]) prevents
+/// the two paths from drifting apart.
+const INSERT_JOBS_SQL: &str = "INSERT INTO apalis.jobs (
+        id,
+        job_type,
+        job,
+        status,
+        attempts,
+        max_attempts,
+        run_at,
+        priority,
+        metadata,
+        idempotency_key
+    )
+    SELECT
+        unnest($1::text[]) AS id,
+        $2::text AS job_type,
+        unnest($3::bytea[]) AS job,
+        'Pending' AS status,
+        0 AS attempts,
+        unnest($4::integer[]) AS max_attempts,
+        unnest($5::timestamptz[]) AS run_at,
+        unnest($6::integer[]) AS priority,
+        unnest($7::text[])::jsonb AS metadata,
+        unnest($8::text[]) AS idempotency_key
+    ON CONFLICT (job_type, idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+        DO NOTHING";
+
+/// Column-major bind arrays for [`INSERT_JOBS_SQL`], collected by the prep
+/// loop in [`push_tasks_on_conn`]. Bundled into a struct so the `$1..$8`
+/// bind order lives in exactly one place regardless of which SQL tail
+/// (with or without `RETURNING`) executes.
+struct JobBatchBinds {
+    ids: Vec<String>,
+    job_type: String,
+    jobs: Vec<CompactType>,
+    max_attempts: Vec<i32>,
+    run_ats: Vec<DateTime>,
+    priorities: Vec<i32>,
+    metadata: Vec<String>,
+    idempotency_keys: Vec<Option<String>>,
+}
+
+impl JobBatchBinds {
+    fn into_query(
+        self,
+        sql: String,
+    ) -> diesel::query_builder::BoxedSqlQuery<
+        'static,
+        diesel::pg::Pg,
+        diesel::query_builder::SqlQuery,
+    > {
+        sql_query(sql)
+            .into_boxed()
+            .bind::<Array<Text>, _>(self.ids)
+            .bind::<Text, _>(self.job_type)
+            .bind::<Array<Binary>, _>(self.jobs)
+            .bind::<Array<Integer>, _>(self.max_attempts)
+            .bind::<Array<Timestamptz>, _>(self.run_ats)
+            .bind::<Array<Integer>, _>(self.priorities)
+            .bind::<Array<Text>, _>(self.metadata)
+            .bind::<Array<Nullable<Text>>, _>(self.idempotency_keys)
+    }
+}
+
 pub(crate) fn push_tasks(
     pool: PgPool,
     config: Config,
     tasks: Vec<PgTask<CompactType>>,
 ) -> impl Future<Output = Result<(), Error>> + Send {
-    with_conn(pool, move |conn| push_tasks_on_conn(conn, &config, tasks))
+    with_conn(pool, move |conn| push_tasks_pooled(conn, &config, tasks))
 }
 
-/// Synchronous, connection-bound batch enqueue. Holds the `INSERT ... ON
-/// CONFLICT DO NOTHING` and the post-check `inserted < task_count` together
-/// inside `conn.transaction(...)` so that an `idempotency_key` conflict
-/// rolls the partial INSERT back even when the caller already runs inside
-/// its own outer transaction (Diesel uses a SAVEPOINT in that case). Without
-/// this inner wrapper, a caller that catches the conflict error and commits
-/// the outer transaction would silently keep the partially-inserted batch.
+/// Pool-path batch enqueue — the sink's flush hot path.
+///
+/// The connection is freshly checked out from the pool and is never inside a
+/// caller transaction, so a batch without idempotency keys runs as one bare,
+/// statement-atomic INSERT with no BEGIN/COMMIT round-trips, `RETURNING`
+/// materialization, or key copies. Keyed batches share the conflict-recovery
+/// transaction with the outbox path.
+fn push_tasks_pooled(
+    conn: &mut PgConnection,
+    config: &Config,
+    tasks: Vec<PgTask<CompactType>>,
+) -> Result<(), Error> {
+    let Some(batch) = prepare_batch(config, tasks)? else {
+        return Ok(());
+    };
+    if batch.any_idempotency_key {
+        conn.transaction(|conn| insert_reporting_conflicts(conn, batch))
+    } else {
+        insert_batch(conn, batch)
+    }
+}
+
+/// Synchronous, connection-bound batch enqueue for the outbox API
+/// ([`crate::PostgresStorage::push_with_conn`] /
+/// [`crate::PostgresStorage::push_task_with_conn`]).
+///
+/// The caller may run inside its own transaction, so every batch — keyed or
+/// not — executes inside `conn.transaction(...)` (a SAVEPOINT in that case):
+/// any insert error, be it an idempotency conflict or a PK violation on a
+/// caller-supplied task id, rolls back only this batch and leaves the outer
+/// transaction usable. Without the wrapper a failing INSERT would abort the
+/// caller's transaction outright, and a caught idempotency conflict would
+/// silently keep the partially-inserted batch.
 pub(crate) fn push_tasks_on_conn(
     conn: &mut PgConnection,
     config: &Config,
     tasks: Vec<PgTask<CompactType>>,
 ) -> Result<(), Error> {
-    if tasks.is_empty() {
+    let Some(batch) = prepare_batch(config, tasks)? else {
         return Ok(());
+    };
+    if batch.any_idempotency_key {
+        conn.transaction(|conn| insert_reporting_conflicts(conn, batch))
+    } else {
+        // No key ⇒ no conflict bookkeeping needed, but the SAVEPOINT
+        // protection for the caller's outer transaction still applies.
+        conn.transaction(|conn| insert_batch(conn, batch))
+    }
+}
+
+/// A validated, column-major batch ready to bind. Produced by
+/// [`prepare_batch`], consumed by [`insert_batch`] /
+/// [`insert_reporting_conflicts`].
+struct PreparedBatch {
+    binds: JobBatchBinds,
+    task_count: usize,
+    any_idempotency_key: bool,
+}
+
+/// Validate caps and collect the batch into column-major bind arrays.
+/// Returns `None` for an empty batch.
+fn prepare_batch(
+    config: &Config,
+    tasks: Vec<PgTask<CompactType>>,
+) -> Result<Option<PreparedBatch>, Error> {
+    if tasks.is_empty() {
+        return Ok(None);
     }
 
     let job_type = config.queue().to_string();
@@ -120,98 +241,96 @@ pub(crate) fn push_tasks_on_conn(
 
     let task_count = ids.len();
     let any_idempotency_key = idempotency_keys.iter().any(Option::is_some);
+    Ok(Some(PreparedBatch {
+        binds: JobBatchBinds {
+            ids,
+            job_type,
+            jobs,
+            max_attempts,
+            run_ats,
+            priorities,
+            metadata,
+            idempotency_keys,
+        },
+        task_count,
+        any_idempotency_key,
+    }))
+}
+
+/// Bare batch INSERT for key-less batches: the partial unique index
+/// `(job_type, idempotency_key) WHERE idempotency_key IS NOT NULL` cannot
+/// conflict when every key is NULL, so no `RETURNING` bookkeeping is needed.
+fn insert_batch(conn: &mut PgConnection, batch: PreparedBatch) -> Result<(), Error> {
+    batch
+        .binds
+        .into_query(INSERT_JOBS_SQL.to_owned())
+        .execute(conn)
+        .map_err(Error::database("inserting jobs"))?;
+    Ok(())
+}
+
+/// Keyed-batch INSERT with the `inserted < task_count` conflict accountant.
+///
+/// Must run inside `conn.transaction(...)`: returning `Err` relies on the
+/// surrounding rollback to undo the rows `ON CONFLICT DO NOTHING` already
+/// inserted, so a single duplicate undoes the *entire* batch while the
+/// caller's outer transaction stays alive. The typed `IdempotencyConflict`
+/// lets callers branch on the variant instead of parsing the message text —
+/// silent dedup would make a fresh enqueue indistinguishable from a rejected
+/// duplicate.
+fn insert_reporting_conflicts(conn: &mut PgConnection, batch: PreparedBatch) -> Result<(), Error> {
     // `job_type` and `idempotency_keys` are moved into the INSERT bind below;
     // keep copies so the conflict branch can name the queue and report exactly
     // which keys collided in `Error::IdempotencyConflict`.
-    let conflict_job_type = job_type.clone();
-    let submitted_keys: Vec<String> = idempotency_keys.iter().flatten().cloned().collect();
-    conn.transaction(|conn| {
-        let inserted_rows = sql_query(
-            "INSERT INTO apalis.jobs (
-                id,
-                job_type,
-                job,
-                status,
-                attempts,
-                max_attempts,
-                run_at,
-                priority,
-                metadata,
-                idempotency_key
-            )
-            SELECT
-                unnest($1::text[]) AS id,
-                $2::text AS job_type,
-                unnest($3::bytea[]) AS job,
-                'Pending' AS status,
-                0 AS attempts,
-                unnest($4::integer[]) AS max_attempts,
-                unnest($5::timestamptz[]) AS run_at,
-                unnest($6::integer[]) AS priority,
-                unnest($7::text[])::jsonb AS metadata,
-                unnest($8::text[]) AS idempotency_key
-            ON CONFLICT (job_type, idempotency_key)
-                WHERE idempotency_key IS NOT NULL
-                DO NOTHING
-            RETURNING idempotency_key",
-        )
-        .bind::<Array<Text>, _>(ids)
-        .bind::<Text, _>(job_type)
-        .bind::<Array<Binary>, _>(jobs)
-        .bind::<Array<Integer>, _>(max_attempts)
-        .bind::<Array<Timestamptz>, _>(run_ats)
-        .bind::<Array<Integer>, _>(priorities)
-        .bind::<Array<Text>, _>(metadata)
-        .bind::<Array<Nullable<Text>>, _>(idempotency_keys)
+    let conflict_job_type = batch.binds.job_type.clone();
+    let submitted_keys: Vec<String> = batch
+        .binds
+        .idempotency_keys
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let inserted_rows = batch
+        .binds
+        .into_query(format!(
+            "{INSERT_JOBS_SQL}\n            RETURNING idempotency_key"
+        ))
         .load::<ReturnedIdempotencyKey>(conn)
         .map_err(Error::database("inserting jobs"))?;
-        let inserted = inserted_rows.len();
-        // Surface ON CONFLICT DO NOTHING as an error to the caller when
-        // the batch carried any `idempotency_key`: silent dedup makes the
-        // caller unable to distinguish a fresh enqueue from a rejected
-        // duplicate. Without an `idempotency_key`, no conflict path is
-        // possible, so the inserted count must equal the batch.
-        //
-        // Returning `Err` here rolls the whole `conn.transaction(...)`
-        // SAVEPOINT back, so a single duplicate undoes the *entire* batch —
-        // including rows that ON CONFLICT DO NOTHING had already inserted —
-        // while the caller's outer transaction stays alive. The typed
-        // `IdempotencyConflict` lets callers branch on the variant instead of
-        // parsing the message text.
-        if inserted < task_count && any_idempotency_key {
-            // Recover the distinct keys that collided. Walk the submitted keys
-            // and consume one matching inserted row per key; any submission left
-            // without a matching inserted row is a collision (intra-batch or
-            // against an already-stored row).
-            let mut inserted_remaining: HashMap<&str, usize> = HashMap::new();
-            for row in &inserted_rows {
-                if let Some(key) = row.idempotency_key.as_deref() {
-                    *inserted_remaining.entry(key).or_insert(0) += 1;
-                }
+    let inserted = inserted_rows.len();
+    if inserted < batch.task_count {
+        // Recover the distinct keys that collided. Walk the submitted keys
+        // and consume one matching inserted row per key; any submission left
+        // without a matching inserted row is a collision (intra-batch or
+        // against an already-stored row).
+        let mut inserted_remaining: HashMap<&str, usize> = HashMap::new();
+        for row in &inserted_rows {
+            if let Some(key) = row.idempotency_key.as_deref() {
+                *inserted_remaining.entry(key).or_insert(0) += 1;
             }
-            let mut seen: HashSet<&str> = HashSet::new();
-            let mut conflicting_keys: Vec<String> = Vec::new();
-            for key in &submitted_keys {
-                let inserted_here = inserted_remaining
-                    .get_mut(key.as_str())
-                    .is_some_and(|count| {
-                        if *count > 0 {
-                            *count -= 1;
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                if !inserted_here && seen.insert(key.as_str()) {
-                    conflicting_keys.push(key.clone());
-                }
-            }
-            return Err(Error::idempotency_conflict(
-                conflict_job_type,
-                conflicting_keys,
-                task_count,
-            ));
         }
-        Ok(())
-    })
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut conflicting_keys: Vec<String> = Vec::new();
+        for key in &submitted_keys {
+            let inserted_here = inserted_remaining
+                .get_mut(key.as_str())
+                .is_some_and(|count| {
+                    if *count > 0 {
+                        *count -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            if !inserted_here && seen.insert(key.as_str()) {
+                conflicting_keys.push(key.clone());
+            }
+        }
+        return Err(Error::idempotency_conflict(
+            conflict_job_type,
+            conflicting_keys,
+            batch.task_count,
+        ));
+    }
+    Ok(())
 }
