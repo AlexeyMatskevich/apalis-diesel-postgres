@@ -47,8 +47,13 @@ pub enum Error {
     /// undone — including the non-conflicting ones. A surrounding (outer)
     /// transaction stays alive, so the caller can decide whether to commit the
     /// rest of its work or roll back. `conflicting_keys` lists exactly which
-    /// `idempotency_key`s collided, so a batch caller can drop them and
-    /// re-enqueue the rest. Match this variant instead of the
+    /// `idempotency_key`s collided. A key collides either against an
+    /// already-stored row or against another task **in the same batch**, so to
+    /// re-enqueue, *deduplicate* rather than drop: keep exactly one task per
+    /// conflicting key (dropping every task carrying the key would silently
+    /// lose intra-batch duplicates that have no stored row yet) and resubmit;
+    /// keys that still collide on the retry are duplicates of stored rows and
+    /// can then be dropped. Match this variant instead of the
     /// [`Error::InvalidArgument`] message text to tell a benign duplicate apart
     /// from a real failure.
     #[error(

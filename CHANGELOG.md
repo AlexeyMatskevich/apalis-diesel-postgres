@@ -17,8 +17,9 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   Error::IdempotencyConflict { job_type: String, conflicting_keys: Vec<String>, total: usize }
   ```
 
-  `conflicting_keys` lists exactly which keys collided, so a batch caller can
-  drop them and re-enqueue the rest.
+  `conflicting_keys` lists exactly which keys collided — against stored rows
+  or between tasks in the same batch — so a batch caller can deduplicate
+  (keep one task per conflicting key) and re-enqueue the rest.
 
   Match the variant to tell a benign duplicate apart from a real failure,
   rather than matching the message text (which could change in any release):

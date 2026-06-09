@@ -397,8 +397,10 @@ worker logs point at the failed lifecycle step:
 - Idempotency conflicts: `Error::IdempotencyConflict { job_type,
   conflicting_keys, total }` when an enqueue collides with the
   `(job_type, idempotency_key)` unique constraint. `conflicting_keys` names the
-  exact keys that collided, so a batch caller can drop them and re-enqueue the
-  rest. Match the variant (not
+  exact keys that collided — against stored rows *or between tasks in the same
+  batch* — so to re-enqueue, deduplicate rather than drop: keep one task per
+  conflicting key (dropping all of them would silently lose intra-batch
+  duplicates that have no stored row yet) and resubmit. Match the variant (not
   the message text) to treat a duplicate as benign. One duplicate rolls back the *whole* batch, not just the colliding
   row; a surrounding transaction stays alive. The `push_*_with_conn` outbox
   methods return this directly; the `Sink` / `TaskSink` enqueue APIs wrap it
