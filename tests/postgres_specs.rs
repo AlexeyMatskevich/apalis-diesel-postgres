@@ -1148,11 +1148,12 @@ fn verify_schema_rejects_a_database_with_unrecorded_migrations()
 // push_tasks partial-batch idempotency conflict.
 //
 // `src/queries/push.rs` surfaces a partial-conflict batch as
-// `Error::IdempotencyConflict { job_type, rejected, total }`. All single-task
-// idempotency tests push one task at a time, so the `inserted < task_count`
-// branch — and the rejected/total counters on the typed error — is never
-// exercised. Drive the branch with a buffered batch that shares a single
-// `idempotency_key` plus a pre-existing row that occupies it.
+// `Error::IdempotencyConflict { job_type, conflicting_keys, total }`. All
+// single-task idempotency tests push one task at a time, so the
+// `inserted < task_count` branch — and the conflicting_keys/total fields on
+// the typed error — is never exercised. Drive the branch with a buffered
+// batch that shares a single `idempotency_key` plus a pre-existing row that
+// occupies it.
 // --------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1188,7 +1189,7 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
     // Build a 3-task batch with the same idempotency_key. With buffer_size=3
     // and a single `send_all` the entire batch flushes through one
     // `push_tasks` call — which is what exercises the `inserted < task_count`
-    // accountant on src/queries/push.rs:114.
+    // accountant in `push_tasks_on_conn` (src/queries/push.rs).
     let config = Config::new(&queue).set_buffer_size(3);
     let mut batch_storage = PostgresStorage::<String>::new_with_config(&pool, &config);
     let batch: Vec<Task<String, PgContext, Ulid>> = (0..3)
@@ -1286,8 +1287,8 @@ fn partial_batch_rolls_back_inserts()
 // row, then push a batch of [fresh, duplicate, fresh] with distinct keys:
 // ON CONFLICT DO NOTHING inserts the two fresh rows and skips the duplicate,
 // the accountant sees `inserted (2) < task_count (3)` and returns
-// `Error::IdempotencyConflict { rejected: 1, total: 3 }` from inside
-// `conn.transaction(...)`, and the SAVEPOINT rollback then undoes the two
+// `Error::IdempotencyConflict { conflicting_keys: [the duplicate's key],
+// total: 3 }` from inside `conn.transaction(...)`, and the SAVEPOINT rollback then undoes the two
 // fresh rows too — so only the seed survives. That is the all-or-nothing
 // guarantee a single duplicate enforces on the whole batch.
 // --------------------------------------------------------------------------
