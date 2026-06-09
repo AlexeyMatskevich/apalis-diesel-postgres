@@ -26,10 +26,23 @@ use crate::{Error, PgContext, PgPool, PgTask, queries};
 /// guards ack writes. Callers that hold only `(task_id, queue, worker_id,
 /// lock_at, attempts)` — values that appear in dashboards and admin payloads —
 /// cannot forge an ack without also possessing the token.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PgAck {
     pool: PgPool,
     lease_token: Option<Arc<str>>,
+}
+
+// Manual impl so the lease token never reaches log output: `PgAck` is
+// embedded in the public `PgMiddleware` (whose derived `Debug` recurses down
+// to here via `AcknowledgeLayer`), and a derived impl would print the
+// per-process secret verbatim — defeating the redaction `PostgresStorage`'s
+// own `Debug` already performs.
+impl std::fmt::Debug for PgAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgAck")
+            .field("lease_token", &self.lease_token.as_ref().map(|_| "<set>"))
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +272,52 @@ mod tests {
         }
     }
 
+    /// Sentinel secret for the Debug-redaction specs below: must never appear
+    /// in any Debug output reachable from the public API.
+    const SECRET_LEASE_TOKEN: &str = "01SECRET-LEASE-TOKEN-MUST-NOT-LEAK";
+
+    fn pg_ack_debug(with_token: bool) -> String {
+        let ack = if with_token {
+            PgAck::with_lease_token(unchecked_pool(), Arc::from(SECRET_LEASE_TOKEN))
+        } else {
+            PgAck::new(unchecked_pool())
+        };
+        format!("{ack:?}")
+    }
+
+    /// The leak path the round-11 audit found: `Backend::middleware()` returns
+    /// a `PgMiddleware` whose derived Debug recurses through
+    /// `AcknowledgeLayer<PgAck>` down to `PgAck` — the public surface a user
+    /// would actually `dbg!`/`tracing::debug!`.
+    fn middleware_debug() -> String {
+        format!(
+            "{:?}",
+            PgMiddleware::with_lease_token(unchecked_pool(), true, Arc::from(SECRET_LEASE_TOKEN))
+        )
+    }
+
+    fn never_contains_the_secret(output: &String) -> AssertionResult {
+        if output.contains(SECRET_LEASE_TOKEN) {
+            Err(AssertionError::new(vec![format!(
+                "expected the lease token to be redacted, but Debug output leaked it: {output}"
+            )]))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mentions(needle: &'static str) -> impl Fn(&String) -> AssertionResult {
+        move |output| {
+            if output.contains(needle) {
+                Ok(())
+            } else {
+                Err(AssertionError::new(vec![format!(
+                    "expected Debug output to mention {needle:?}, got {output}"
+                )]))
+            }
+        }
+    }
+
     fn abort_contains(expected: &'static str) -> impl Fn(&BoxDynError) -> AssertionResult {
         move |error| {
             let message = error.to_string();
@@ -300,6 +359,28 @@ mod tests {
             when there_is_no_current_worker_context {
                 let worker_id: Option<&str> = None;
                 to is_not_preclaimed_without_a_current_worker { be_false }
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(pg_ack_debug(with_token)) {
+            let with_token = true;
+
+            when the_ack_carries_a_lease_token {
+                to never_prints_the_token_value { never_contains_the_secret }
+                to marks_the_token_as_set { mentions("<set>") }
+            }
+
+            when the_ack_has_no_lease_token {
+                let with_token = false;
+                to shows_the_token_as_absent { mentions("None") }
+            }
+        }
+
+        expect(middleware_debug()) {
+            when the_public_middleware_with_a_lease_token_is_formatted {
+                to never_prints_the_token_value { never_contains_the_secret }
             }
         }
     }
