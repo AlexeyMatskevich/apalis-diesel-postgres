@@ -23,9 +23,14 @@ exclude = [
 ]
 
 [dependencies]
-apalis-codec = { version = "0.1.0-rc.9", features = ["json"] }
-apalis-core = { version = "1.0.0-rc.9", default-features = false, features = ["sleep"] }
-apalis-sql = { version = "1.0.0-rc.9" }
+# The apalis RC crates are pinned exactly: cargo treats prerelease versions
+# as caret-compatible within the same x.y.z, so an unpinned `1.0.0-rc.9`
+# would let a plain `cargo update` pull in `rc.10` — which may break public
+# trait shapes this crate implements (`Backend`, `Acknowledge`, …) without
+# any semver signal. Bump the pins deliberately, together with a release.
+apalis-codec = { version = "=0.1.0-rc.9", features = ["json"] }
+apalis-core = { version = "=1.0.0-rc.9", default-features = false, features = ["sleep"] }
+apalis-sql = { version = "=1.0.0-rc.9" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2.3", features = ["postgres", "r2d2", "chrono", "serde_json"] }
 diesel_migrations = "2.3"
@@ -39,7 +44,7 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"],
 ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
-apalis = "1.0.0-rc.9"
+apalis = "=1.0.0-rc.9"
 lets_expect = { version = "0.5", features = ["tokio"] }
 ntex = { version = "3", default-features = false, features = ["neon-polling"] }
 
