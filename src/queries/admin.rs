@@ -613,7 +613,13 @@ fn register_worker_admin(
         // (heartbeat-spoofing through admin path is closed) and uses
         // `CASE WHEN lease_token IS NULL` so live worker's `layers` /
         // `storage_name` are preserved (observability-poisoning closed).
-        let count = sql_query(
+        // Unlike the worker path (`register_worker_blocking`), this statement
+        // always upserts exactly one row: the advisory lock is the *blocking*
+        // variant (no `acquired` filter) and the conflict UPDATE carries no
+        // WHERE gate, so the affected-row count is always 1 and cannot signal
+        // an `AlreadyRegistered` condition. Dashboards re-registering an
+        // existing worker is the expected idempotent case.
+        sql_query(
             "WITH registration_lock AS (
                  SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))
              )
@@ -637,11 +643,7 @@ fn register_worker_admin(
         .bind::<Text, _>(crate::STORAGE_NAME)
         .execute(conn)
         .map_err(Error::database("registering worker"))?;
-        if count == 0 {
-            Err(Error::AlreadyRegistered(worker_id))
-        } else {
-            Ok(())
-        }
+        Ok(())
     })
 }
 
