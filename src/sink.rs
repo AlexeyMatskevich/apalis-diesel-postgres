@@ -67,6 +67,21 @@ impl<Args, Codec> PgSink<Args, Codec> {
 }
 
 impl<Args, Codec> PgSink<Args, Codec> {
+    /// Re-type the sink's `Args`/`Codec` markers while carrying over the
+    /// buffered tasks and any in-flight flush. The buffer stores
+    /// codec-independent `PgTask<CompactType>` values, so a codec swap via
+    /// [`crate::PostgresStorage::with_codec`] must not silently drop pending
+    /// work — only the phantom markers change.
+    pub(crate) fn retype<NewArgs, NewCodec>(self) -> PgSink<NewArgs, NewCodec> {
+        PgSink {
+            pool: self.pool,
+            config: self.config,
+            buffer: self.buffer,
+            flush_future: self.flush_future,
+            _marker: PhantomData,
+        }
+    }
+
     /// Buffer capacity from the underlying config (clamped to ≥1 so a
     /// misconfigured `buffer_size(0)` does not deadlock the sink).
     fn capacity(&self) -> usize {
@@ -335,6 +350,77 @@ mod tests {
         sink(buffer_size).clone().config.buffer_size()
     }
 
+    /// State of the sink after `PostgresStorage::with_codec` re-types the
+    /// storage. The buffer holds already-encoded `PgTask<CompactType>`
+    /// values, so — unlike `clone`, which deliberately starts empty — a codec
+    /// swap must carry both the buffer and any in-flight flush over.
+    struct RetypedObservation {
+        buffer_len: usize,
+        kept_in_flight_flush: bool,
+        first_payload: Option<CompactType>,
+    }
+
+    const RETYPE_SENTINEL: &[u8] = b"retype-sentinel";
+
+    fn with_codec_observation(buffered_items: usize, flush_in_flight: bool) -> RetypedObservation {
+        let mut storage = storage(3);
+        for _ in 0..buffered_items {
+            storage
+                .sink
+                .buffer
+                .push(PgTask::new(RETYPE_SENTINEL.to_vec()));
+        }
+        if flush_in_flight {
+            storage.sink.flush_future =
+                Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
+        }
+        let mut retyped = storage.with_codec::<()>();
+        let kept_in_flight_flush = retyped
+            .sink
+            .flush_future
+            .get_mut()
+            .expect("flush_future mutex poisoned")
+            .is_some();
+        RetypedObservation {
+            buffer_len: retyped.sink.buffer.len(),
+            kept_in_flight_flush,
+            first_payload: retyped.sink.buffer.first().map(|t| t.args.clone()),
+        }
+    }
+
+    fn carried_buffer_len(expected: usize) -> impl Fn(&RetypedObservation) -> AssertionResult {
+        move |obs| {
+            if obs.buffer_len == expected {
+                Ok(())
+            } else {
+                Err(AssertionError::new(vec![format!(
+                    "expected {expected} buffered task(s) to survive with_codec, got {}",
+                    obs.buffer_len
+                )]))
+            }
+        }
+    }
+
+    fn kept_the_in_flight_flush(obs: &RetypedObservation) -> AssertionResult {
+        if obs.kept_in_flight_flush {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![
+                "expected with_codec to carry the in-flight flush over, but it was dropped"
+                    .to_owned(),
+            ]))
+        }
+    }
+
+    fn carried_the_exact_task_bytes(obs: &RetypedObservation) -> AssertionResult {
+        match obs.first_payload.as_deref() {
+            Some(RETYPE_SENTINEL) => Ok(()),
+            other => Err(AssertionError::new(vec![format!(
+                "expected the buffered task's payload bytes to survive with_codec verbatim, got {other:?}"
+            )])),
+        }
+    }
+
     fn sink_debug(buffered_items: usize) -> String {
         let mut sink = sink(3);
         for _ in 0..buffered_items {
@@ -571,6 +657,35 @@ mod tests {
                 to describes_the_sink_without_exposing_the_pool {
                     debug_mentions_public_fields
                 }
+            }
+        }
+
+        expect(with_codec_observation(buffered_items, flush_in_flight)) {
+            let buffered_items = 1;
+            let flush_in_flight = false;
+
+            when the_sink_holds_buffered_tasks {
+                to carries_the_buffer_into_the_retyped_storage { carried_buffer_len(1) }
+                to carries_the_exact_task_bytes { carried_the_exact_task_bytes }
+            }
+
+            when a_flush_is_in_flight {
+                let flush_in_flight = true;
+                to keeps_the_in_flight_flush { kept_the_in_flight_flush }
+            }
+
+            when the_buffer_already_drained_into_an_in_flight_flush {
+                // Realistic mid-flush state: `poll_flush_inner` has taken the
+                // buffer into the future, nothing is left behind it.
+                let buffered_items = 0;
+                let flush_in_flight = true;
+                to keeps_the_in_flight_flush { kept_the_in_flight_flush }
+                to has_no_buffered_tasks_left { carried_buffer_len(0) }
+            }
+
+            when the_sink_is_empty {
+                let buffered_items = 0;
+                to starts_the_retyped_storage_with_an_empty_buffer { carried_buffer_len(0) }
             }
         }
     }

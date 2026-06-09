@@ -194,12 +194,15 @@ impl<Args> PostgresStorage<Args> {
 }
 
 impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
-    /// Change the task codec while retaining pool, config, and fetcher.
+    /// Change the task codec while retaining pool, config, fetcher, and the
+    /// sink's pipeline state (buffered tasks and any in-flight flush — the
+    /// buffer holds already-encoded compact tasks, so switching the codec
+    /// must not silently drop them).
     #[must_use]
     pub fn with_codec<NewCodec>(self) -> PostgresStorage<Args, NewCodec, Fetcher> {
         PostgresStorage {
             _marker: PhantomData,
-            sink: PgSink::new(&self.pool, &self.config),
+            sink: self.sink.retype(),
             pool: self.pool,
             config: self.config,
             fetcher: self.fetcher,
