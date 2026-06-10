@@ -9,6 +9,24 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- A claimed row whose payload failed to decode was stranded in `Running` for
+  as long as the claiming worker kept heartbeating: ack needs a decoded task,
+  and orphan recovery only reclaims rows of stale workers. The decode stage
+  now releases such rows through the normal retry budget (`Failed` with the
+  decode error in `last_result`, terminal `Killed` once attempts are
+  exhausted), guarded by the exact claim epoch (`lock_by`, `lock_at`,
+  `attempts`) so a delayed release never touches a row that was acked, swept,
+  or re-claimed in the meantime.
+- The checked-in Diesel schema (`src/schema.rs`) was missing the
+  `workers.lease_token` column added by migration 20260521000002; typed
+  queries against `apalis.workers` could not reference it. New specs pin
+  `schema.rs` against `information_schema` for both tables so the next
+  migration cannot leave the typed schema stale silently.
+- CI's postgres job ran only 3 of the 11 integration test binaries; the
+  newer spec suites (outbox SAVEPOINT semantics, concurrent reenqueue,
+  migration concurrency, the `spec_queries_*` SQL contracts) were
+  compile-checked but never executed as release gates. The job now runs
+  `--tests`, which also gates any future test binary automatically.
 - Concurrent `reenqueue_orphaned` sweeps could double-apply to the same stale
   row under READ COMMITTED (EvalPlanQual re-check): burning an extra attempt,
   prematurely killing a job, or flipping an already-acked row back to
@@ -59,6 +77,11 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Documentation
 
+- The handler/fan-out examples (`README.md`, `examples/worker.rs`,
+  `examples/worker-ntex.rs`) now run business transactions on a separate
+  backend pool injected via `Data<PgPool>` instead of `storage.pool()`,
+  matching the "Connection pool isolation" guidance they previously
+  contradicted.
 - `Error::IdempotencyConflict` recovery guidance now explains that
   `conflicting_keys` also covers intra-batch duplicates: deduplicate (keep
   one task per conflicting key) instead of dropping every task with the key.
