@@ -1141,6 +1141,163 @@ fn verify_schema_rejects_a_database_with_unrecorded_migrations()
 }
 
 // --------------------------------------------------------------------------
+// Typed schema agreement: `src/schema.rs` must declare exactly the columns
+// the migrations create. `workers.lease_token` (migration 20260521000002) was
+// missing from `schema.rs` until 2026-06-10, so typed Diesel queries could
+// not reference it. Both sides of the comparison are derived per run — the
+// typed side from the SQL Diesel generates for `select(all_columns)`, the
+// database side from `information_schema` — so neither can go stale the way
+// a hand-maintained column list would. The two drift directions (column only
+// in the database / column only in `schema.rs`) cannot be instantiated
+// against the shared test database without breaking sibling tests; they are
+// exactly the states the set-equality assertion detects, and were red-checked
+// manually by removing the `lease_token` line from `schema.rs`.
+// --------------------------------------------------------------------------
+
+#[derive(Debug, QueryableByName)]
+struct ColumnNameRow {
+    #[diesel(sql_type = Text)]
+    column_name: String,
+}
+
+#[derive(Debug)]
+struct SchemaAgreementRun {
+    typed_columns: Vec<String>,
+    database_columns: Vec<String>,
+}
+
+/// Column names a typed `select(all_columns)` references, parsed from the SQL
+/// Diesel generates. Column references render as
+/// `"apalis"."<table>"."<column>"`; the FROM clause's bare `"apalis"."<table>"`
+/// does not match the marker, so only select-list columns are captured.
+fn typed_column_set(table: &'static str) -> Result<Vec<String>, String> {
+    use apalis_diesel_postgres::schema::{jobs, workers};
+    use diesel::QueryDsl;
+    let sql = match table {
+        "jobs" => diesel::debug_query::<diesel::pg::Pg, _>(&jobs::table.select(jobs::all_columns))
+            .to_string(),
+        "workers" => {
+            diesel::debug_query::<diesel::pg::Pg, _>(&workers::table.select(workers::all_columns))
+                .to_string()
+        }
+        other => return Err(format!("unknown table under verification: {other}")),
+    };
+    let marker = format!("\"apalis\".\"{table}\".\"");
+    let mut columns: Vec<String> = sql
+        .split(&marker)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next().map(str::to_owned))
+        .collect();
+    columns.sort();
+    columns.dedup();
+    Ok(columns)
+}
+
+async fn run_schema_agreement(table: &'static str) -> Result<Outcome<SchemaAgreementRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let typed_columns = typed_column_set(table)?;
+    let database_columns = with_conn(pool, move |conn| {
+        let rows: Vec<ColumnNameRow> = sql_query(
+            "SELECT column_name
+             FROM information_schema.columns
+             WHERE table_schema = 'apalis' AND table_name = $1
+             ORDER BY column_name",
+        )
+        .bind::<Text, _>(table)
+        .load(conn)
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(|row| row.column_name).collect())
+    })
+    .await?;
+    Ok(Outcome::Completed(SchemaAgreementRun {
+        typed_columns,
+        database_columns,
+    }))
+}
+
+fn typed_and_database_columns_agree()
+-> impl Fn(&Result<Outcome<SchemaAgreementRun>, String>) -> AssertionResult {
+    observe::<SchemaAgreementRun, _>("schema agreement", |run| {
+        if run.typed_columns.is_empty() {
+            // An empty typed set means the debug-SQL parse broke; without this
+            // guard it could vacuously "agree" with an empty database set.
+            return Err("parsed no columns out of the typed query SQL".into());
+        }
+        if run.typed_columns == run.database_columns {
+            Ok(())
+        } else {
+            Err(format!(
+                "schema.rs and the migrated database disagree: typed={:?}, database={:?}",
+                run.typed_columns, run.database_columns
+            ))
+        }
+    })
+}
+
+#[derive(Debug)]
+struct LeaseTokenRoundtripRun {
+    stored_token: Option<String>,
+    typed_read: Option<String>,
+}
+
+async fn run_lease_token_roundtrip(
+    with_token: bool,
+) -> Result<Outcome<LeaseTokenRoundtripRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-schema-lease-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-schema-lease-worker-{queue}");
+    let stored_token = with_token.then(|| format!("lease-{}", Ulid::new()));
+
+    let q = queue.clone();
+    let wid = worker_id.clone();
+    let token = stored_token.clone();
+    let typed_read = with_conn(pool.clone(), move |conn| {
+        use apalis_diesel_postgres::schema::workers;
+        use diesel::{ExpressionMethods, QueryDsl};
+        sql_query(
+            "INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at, lease_token)
+             VALUES ($1, $2, 'PostgresStorage', '', now(), now(), $3)",
+        )
+        .bind::<Text, _>(&wid)
+        .bind::<Text, _>(&q)
+        .bind::<Nullable<Text>, _>(token)
+        .execute(conn)
+        .map_err(|e| e.to_string())?;
+        workers::table
+            .filter(workers::id.eq(&wid))
+            .filter(workers::worker_type.eq(&q))
+            .select(workers::lease_token)
+            .first::<Option<String>>(conn)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(LeaseTokenRoundtripRun {
+        stored_token,
+        typed_read,
+    }))
+}
+
+fn typed_read_returns_the_stored_lease_token()
+-> impl Fn(&Result<Outcome<LeaseTokenRoundtripRun>, String>) -> AssertionResult {
+    observe::<LeaseTokenRoundtripRun, _>("lease_token roundtrip", |run| {
+        if run.typed_read == run.stored_token {
+            Ok(())
+        } else {
+            Err(format!(
+                "typed read disagrees with the stored value: stored={:?}, read={:?}",
+                run.stored_token, run.typed_read
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // expectations
 // --------------------------------------------------------------------------
 
@@ -2290,6 +2447,43 @@ lets_expect! { #tokio_test
             }
             to rejects_a_database_with_an_unrecorded_migration {
                 verify_schema_rejects_a_database_with_unrecorded_migrations()
+            }
+        }
+    }
+
+    // Both sides of the column comparison are recomputed per run and the
+    // roundtrip inserts a fresh worker row per call, so re-running per `to`
+    // block is safe.
+    expect(run_schema_agreement(table).await) {
+        let table = "jobs";
+
+        when the_typed_jobs_table_is_compared_to_the_database {
+            to declares_exactly_the_migrated_columns {
+                typed_and_database_columns_agree()
+            }
+        }
+
+        when the_typed_workers_table_is_compared_to_the_database {
+            let table = "workers";
+            to declares_exactly_the_migrated_columns {
+                typed_and_database_columns_agree()
+            }
+        }
+    }
+
+    expect(run_lease_token_roundtrip(with_token).await) {
+        let with_token = true;
+
+        when the_worker_row_carries_a_lease_token {
+            to reads_the_token_back_through_the_typed_schema {
+                typed_read_returns_the_stored_lease_token()
+            }
+        }
+
+        when the_worker_row_has_a_null_lease_token {
+            let with_token = false;
+            to reads_a_none_back_through_the_typed_schema {
+                typed_read_returns_the_stored_lease_token()
             }
         }
     }

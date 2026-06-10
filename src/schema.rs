@@ -29,6 +29,7 @@ diesel::table! {
         layers -> Text,
         last_seen -> Timestamptz,
         started_at -> Nullable<Timestamptz>,
+        lease_token -> Nullable<Text>,
     }
 }
 
