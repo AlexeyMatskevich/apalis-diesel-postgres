@@ -29,7 +29,7 @@ compatible with Apalis SQL storage (`apalis.jobs`, `apalis.workers`).
 
 ```toml
 [dependencies]
-apalis-diesel-postgres = { version = "0.3", features = ["tokio"] }
+apalis-diesel-postgres = { version = "0.4", features = ["tokio"] }
 diesel = { version = "2.3", features = ["postgres", "r2d2", "chrono", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 ```

@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While
 the crate is pre-1.0, a minor version bump may carry breaking changes.
 
-## [Unreleased]
+## [0.4.0]
 
 ### Fixed
 
