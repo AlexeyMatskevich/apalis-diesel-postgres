@@ -29,15 +29,19 @@ struct LogActivity {
 
 async fn handle_email(
     job: SendEmail,
+    backend_pool: Data<PgPool>,
     log_storage: Data<PostgresStorage<LogActivity>>,
 ) -> Result<(), BoxDynError> {
     println!("sending email to {}", job.to);
 
+    let pool = (*backend_pool).clone();
     let storage = (*log_storage).clone();
     let to = job.to.clone();
 
+    // The transaction borrows a connection from the *backend* pool: business
+    // work on the apalis pool would compete with fetch/ack/heartbeat.
     let result = ntex_rt::spawn_blocking(move || -> Result<(), PgError> {
-        let mut conn = storage.pool().get().map_err(PgError::Pool)?;
+        let mut conn = pool.get().map_err(PgError::Pool)?;
         conn.transaction(|c| {
             storage.push_with_conn(
                 c,
@@ -67,18 +71,23 @@ async fn main() -> Result<(), BoxDynError> {
         "DATABASE_URL must be set, e.g. postgres://127.0.0.1:5432/apalis_diesel_postgres".into()
     })?;
 
-    let pool: PgPool = build_pool(&url)?;
-    setup(&pool).await?;
+    // Two pools against the same database: one dedicated to apalis worker
+    // plumbing, one for the application's own transactions.
+    let apalis_pool: PgPool = build_pool(&url)?;
+    let backend_pool: PgPool = build_pool(&url)?;
+    setup(&apalis_pool).await?;
 
     let emails: PostgresStorage<SendEmail> =
-        PostgresStorage::new_with_config(&pool, &Config::new("emails"));
+        PostgresStorage::new_with_config(&apalis_pool, &Config::new("emails"));
     let activity: PostgresStorage<LogActivity> =
-        PostgresStorage::new_with_config(&pool, &Config::new("activity"));
+        PostgresStorage::new_with_config(&apalis_pool, &Config::new("activity"));
 
+    // Seeded from the "business side", i.e. on the backend pool.
     {
         let emails = emails.clone();
+        let seed_pool = backend_pool.clone();
         ntex_rt::spawn_blocking(move || -> Result<(), PgError> {
-            let mut conn = emails.pool().get().map_err(PgError::Pool)?;
+            let mut conn = seed_pool.get().map_err(PgError::Pool)?;
             emails.push_with_conn(
                 &mut conn,
                 SendEmail {
@@ -93,6 +102,7 @@ async fn main() -> Result<(), BoxDynError> {
 
     let emails_worker = WorkerBuilder::new("emails")
         .backend(emails)
+        .data(backend_pool)
         .data(activity.clone())
         .build(handle_email);
 

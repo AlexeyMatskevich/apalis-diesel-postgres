@@ -121,13 +121,17 @@ WorkerBuilder::new("emails-worker")
 
 The outbox pattern isn't limited to HTTP handlers — the same transactional
 guarantees apply when one job needs to enqueue a follow-up job atomically
-with its own database writes. Inject the follow-up queue's storage via
-`Data<...>`, hop onto the blocking pool, and share a `&mut PgConnection`
-between the business write and `push_with_conn`:
+with its own database writes. Inject the follow-up queue's storage **and a
+separate business pool** via `Data<...>`, hop onto the blocking pool, and
+share a `&mut PgConnection` between the business write and `push_with_conn`.
+The transaction's connection comes from the business pool, not from
+`storage.pool()` — handler transactions on the apalis pool would compete
+with fetch/ack/heartbeat and can trigger the cascade described under
+[Connection pool isolation](#connection-pool-isolation):
 
 ```rust,no_run
 # use apalis::prelude::*;
-# use apalis_diesel_postgres::{Error as PgError, PostgresStorage};
+# use apalis_diesel_postgres::{Error as PgError, PgPool, PostgresStorage};
 # use diesel::Connection;
 # #[derive(Debug, serde::Deserialize, serde::Serialize)]
 # struct SendEmail { to: String }
@@ -135,13 +139,17 @@ between the business write and `push_with_conn`:
 # struct LogActivity { kind: String, target: String }
 async fn handle_email(
     job: SendEmail,
+    backend_pool: Data<PgPool>,
     activity: Data<PostgresStorage<LogActivity>>,
 ) -> Result<(), BoxDynError> {
+    let backend_pool = (*backend_pool).clone();
     let activity = (*activity).clone();
     let to = job.to.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), PgError> {
-        let mut conn = activity.pool().get().map_err(PgError::Pool)?;
+        // Business pool, NOT activity.pool(): the apalis pool stays
+        // dedicated to fetch/ack/heartbeat/listener work.
+        let mut conn = backend_pool.get().map_err(PgError::Pool)?;
         conn.transaction(|c| {
             // Your business write goes here — same connection, same txn.
             activity.push_with_conn(c, LogActivity {
@@ -156,23 +164,29 @@ async fn handle_email(
 }
 ```
 
-Wire the follow-up storage into the worker via `.data(...)`:
+Wire the follow-up storage and the business pool into the worker via
+`.data(...)`:
 
 ```rust,no_run
 # use apalis::prelude::*;
-# use apalis_diesel_postgres::PostgresStorage;
+# use apalis_diesel_postgres::{PgPool, PostgresStorage};
 # #[derive(Debug, serde::Deserialize, serde::Serialize)]
 # struct SendEmail { to: String }
 # #[derive(Debug, serde::Deserialize, serde::Serialize)]
 # struct LogActivity { kind: String, target: String }
-# async fn handle_email(_: SendEmail, _: Data<PostgresStorage<LogActivity>>)
-#     -> Result<(), BoxDynError> { Ok(()) }
+# async fn handle_email(
+#     _: SendEmail,
+#     _: Data<PgPool>,
+#     _: Data<PostgresStorage<LogActivity>>,
+# ) -> Result<(), BoxDynError> { Ok(()) }
 # fn wire(
+#     backend_pool: PgPool,
 #     emails: PostgresStorage<SendEmail>,
 #     activity: PostgresStorage<LogActivity>,
 # ) {
 let worker = WorkerBuilder::new("emails-worker")
     .backend(emails)
+    .data(backend_pool)
     .data(activity)
     .build(handle_email);
 # let _ = worker;
