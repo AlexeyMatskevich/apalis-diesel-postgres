@@ -67,10 +67,14 @@ jobs:
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: 1.88.0
+    # `--tests` runs the lib unittests plus every integration test binary in
+    # `tests/` (and gates any future ones automatically) instead of a
+    # hand-maintained `--test` list that silently went stale: postgres_specs,
+    # postgres_outbox, postgres_migration_concurrency,
+    # postgres_worker_integration and the four spec_queries_* binaries were
+    # compile-checked but never executed in CI.
     - name: PostgreSQL integration tests
       run: >-
         cargo test --locked --features tokio --verbose
-        --test postgres_lifecycle
-        --test postgres_notify_shared
-        --test postgres_queries
+        --tests
         -- --test-threads=1

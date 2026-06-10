@@ -33,10 +33,7 @@ env -u DATABASE_URL cargo test --locked --features tokio --lib
 env -u DATABASE_URL cargo test --locked --features ntex --lib
 env -u DATABASE_URL cargo test --locked --all-features --lib
 APALIS_DIESEL_POSTGRES_REQUIRE_DATABASE=1 cargo test --locked --all-features \
-  --test postgres_lifecycle \
-  --test postgres_notify_shared \
-  --test postgres_queries \
-  -- --test-threads=1
+  --tests -- --test-threads=1
 cargo test --locked --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 ```
