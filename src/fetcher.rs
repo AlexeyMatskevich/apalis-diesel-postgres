@@ -66,8 +66,17 @@ where
 /// Decode a compact task stream into an `Args`-typed task stream by mapping
 /// every yielded row through the configured codec. Shared between the polling
 /// and notify backends so the decode logic exists in exactly one place.
+///
+/// Decode runs *after* the dequeue SQL has already claimed the row as
+/// `Running`, so a decode failure must not just surface the error: it also
+/// fails the claimed row (best-effort) via `fail_undecodable_task`, otherwise
+/// the row would stay `Running` for as long as this worker keeps heartbeating
+/// — unackable (ack needs a decoded task) and invisible to orphan recovery
+/// (which only reclaims rows of stale workers).
 pub(crate) fn decode_task_stream<Args, Decode>(
     compact: TaskStream<PgTask<CompactType>, Error>,
+    pool: PgPool,
+    worker_id: String,
 ) -> TaskStream<PgTask<Args>, Error>
 where
     Args: Send + 'static,
@@ -75,14 +84,50 @@ where
     Decode::Error: std::error::Error + Send + Sync + 'static,
 {
     compact
-        .map(|row| match row {
-            Ok(Some(task)) => {
-                Ok(Some(task.try_map(|t| {
-                    Decode::decode(&t).map_err(|e| Error::Decode(e.into()))
-                })?))
+        .then(move |row| {
+            let pool = pool.clone();
+            let worker_id = worker_id.clone();
+            async move {
+                match row {
+                    Ok(Some(task)) => {
+                        // Claim-epoch identity for the release predicate: the
+                        // decode stage runs before the worker increments the
+                        // attempt counter, so `attempt.current()` still holds
+                        // the row's stored value from the claim.
+                        let task_id = task.parts.task_id;
+                        let lock_at = *task.parts.ctx.lock_at();
+                        let attempts = i32::try_from(task.parts.attempt.current());
+                        match task
+                            .try_map(|t| Decode::decode(&t).map_err(|e| Error::Decode(e.into())))
+                        {
+                            Ok(decoded) => Ok(Some(decoded)),
+                            Err(error) => {
+                                // Best-effort: the decode error is the primary
+                                // signal and must surface either way; a missing
+                                // claim identity or a failed UPDATE falls back
+                                // to the pre-release behaviour (stranded until
+                                // the worker stops heartbeating).
+                                if let (Some(task_id), Some(lock_at), Ok(attempts)) =
+                                    (task_id, lock_at, attempts)
+                                {
+                                    let _ = queries::fail_undecodable_task(
+                                        pool,
+                                        task_id,
+                                        worker_id,
+                                        lock_at,
+                                        attempts,
+                                        error.to_string(),
+                                    )
+                                    .await;
+                                }
+                                Err(error)
+                            }
+                        }
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                }
             }
-            Ok(None) => Ok(None),
-            Err(error) => Err(error),
         })
         .boxed()
 }

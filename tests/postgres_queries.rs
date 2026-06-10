@@ -1980,6 +1980,195 @@ fn poll_decode_error_mentions_payload()
     })
 }
 
+// ----------------------- decode-failure row release ------------------------
+//
+// The dequeue SQL claims a row as `Running` *before* the payload is decoded.
+// A decode failure must therefore not only surface on the stream: the claimed
+// row has to be failed (status `Failed`, attempts burnt, decode error in
+// `last_result`) or it would stay `Running` for as long as the claiming
+// worker keeps heartbeating — unackable and invisible to orphan recovery.
+//
+// The scenario reads the row state only after the stream is dropped: the
+// fetchers are pull-based, so no further claims are issued once polling
+// stops. Pruned combinations: notify×exhausted-budget and notify×second-poll
+// (both channels funnel into the same `fail_undecodable_task`, whose
+// status/attempts CASE does not depend on the channel), and "a Killed row is
+// not claimable again" (the claim predicate excludes `Killed` and is specced
+// in spec_queries_fetch).
+
+#[derive(Debug)]
+struct DecodeReleaseRun {
+    first_error: String,
+    status_after_first: String,
+    attempts_after_first: i32,
+    last_result_after_first: Option<Value>,
+    second_error: Option<String>,
+    status_after_second: Option<String>,
+    attempts_after_second: Option<i32>,
+}
+
+async fn insert_undecodable_task(
+    pool: PgPool,
+    queue: String,
+    max_attempts: i32,
+) -> Result<PgTaskId, String> {
+    let id = Ulid::new();
+    let task_id = TaskId::from_str(&id.to_string()).map_err(|error| error.to_string())?;
+    with_conn(pool, move |conn| {
+        sql_query(
+            "INSERT INTO apalis.jobs (
+                id, job_type, job, status, attempts, max_attempts, run_at
+            ) VALUES ($1, $2, $3, 'Pending', 0, $4, now() - INTERVAL '1 second')",
+        )
+        .bind::<Text, _>(id.to_string())
+        .bind::<Text, _>(queue)
+        .bind::<diesel::sql_types::Binary, _>(b"not-json".to_vec())
+        .bind::<Integer, _>(max_attempts)
+        .execute(conn)
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .await?;
+    Ok(task_id)
+}
+
+async fn decode_error_via_poll(
+    pool: &PgPool,
+    queue: &str,
+    worker_name: &str,
+    notify: bool,
+) -> Result<String, String> {
+    let worker = WorkerContext::new::<()>(worker_name);
+    if notify {
+        let storage = PostgresStorage::<String>::new_with_notify(pool, &Config::new(queue));
+        let mut stream = storage.poll(&worker);
+        next_stream_error(&mut stream).await
+    } else {
+        let storage = PostgresStorage::<String>::new_with_config(pool, &Config::new(queue));
+        let mut stream = storage.poll(&worker);
+        next_stream_error(&mut stream).await
+    }
+}
+
+async fn run_decode_release(
+    notify: bool,
+    max_attempts: i32,
+    second_poll: bool,
+) -> Result<Outcome<DecodeReleaseRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-query-decode-release-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let task_id = insert_undecodable_task(pool.clone(), queue.clone(), max_attempts).await?;
+
+    let first_error = decode_error_via_poll(
+        &pool,
+        &queue,
+        &format!("decode-release-first-{queue}"),
+        notify,
+    )
+    .await?;
+    let first_row = job_status(pool.clone(), task_id).await?;
+
+    let (second_error, second_row) = if second_poll {
+        let error = decode_error_via_poll(
+            &pool,
+            &queue,
+            &format!("decode-release-second-{queue}"),
+            false,
+        )
+        .await?;
+        let row = job_status(pool.clone(), task_id).await?;
+        (Some(error), Some(row))
+    } else {
+        (None, None)
+    };
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(DecodeReleaseRun {
+        first_error,
+        status_after_first: first_row.status,
+        attempts_after_first: first_row.attempts,
+        last_result_after_first: first_row.last_result,
+        second_error,
+        status_after_second: second_row.as_ref().map(|row| row.status.clone()),
+        attempts_after_second: second_row.as_ref().map(|row| row.attempts),
+    }))
+}
+
+fn decode_release_surfaces_the_error()
+-> impl Fn(&Result<Outcome<DecodeReleaseRun>, String>) -> AssertionResult {
+    observe::<DecodeReleaseRun, _>("decode release error", |run| {
+        if run.first_error.contains("failed to decode task payload") {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the decode error on the stream, got {:?}",
+                run.first_error
+            ))
+        }
+    })
+}
+
+fn decode_release_row(
+    status: &'static str,
+    attempts: i32,
+) -> impl Fn(&Result<Outcome<DecodeReleaseRun>, String>) -> AssertionResult {
+    observe::<DecodeReleaseRun, _>("decode release row state", move |run| {
+        if run.status_after_first == status && run.attempts_after_first == attempts {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the claimed row to become {status} with attempts={attempts}, got {}/{}",
+                run.status_after_first, run.attempts_after_first
+            ))
+        }
+    })
+}
+
+fn decode_release_persists_decode_error()
+-> impl Fn(&Result<Outcome<DecodeReleaseRun>, String>) -> AssertionResult {
+    observe::<DecodeReleaseRun, _>("decode release last_result", |run| {
+        let message = run
+            .last_result_after_first
+            .as_ref()
+            .and_then(|value| value.get("Err"))
+            .and_then(Value::as_str);
+        match message {
+            Some(text) if text.contains("failed to decode task payload") => Ok(()),
+            other => Err(format!(
+                "expected last_result to carry {{\"Err\": <decode error>}}, got {other:?} \
+                 (full: {:?})",
+                run.last_result_after_first
+            )),
+        }
+    })
+}
+
+fn decode_release_retry_claims_again()
+-> impl Fn(&Result<Outcome<DecodeReleaseRun>, String>) -> AssertionResult {
+    observe::<DecodeReleaseRun, _>("decode release second claim", |run| {
+        let Some(second_error) = run.second_error.as_deref() else {
+            return Err("expected the second poll to observe a decode error".into());
+        };
+        if !second_error.contains("failed to decode task payload") {
+            return Err(format!(
+                "expected the second decode error, got {second_error:?}"
+            ));
+        }
+        match (
+            run.status_after_second.as_deref(),
+            run.attempts_after_second,
+        ) {
+            (Some("Failed"), Some(2)) => Ok(()),
+            other => Err(format!(
+                "expected the second claim to burn another attempt (Failed/2), got {other:?}"
+            )),
+        }
+    })
+}
+
 // -------------------- Additional boundary scenarios -----------------------
 
 #[derive(Debug)]
@@ -3057,6 +3246,47 @@ lets_expect! { #tokio_test
         when notify_polling_storage_decodes_a_malformed_payload {
             to surfaces_a_decode_error_through_the_stream {
                 poll_decode_error_mentions_payload()
+            }
+        }
+    }
+
+    // Each `to` re-runs the scenario against a fresh ULID-named queue, so the
+    // runs are independent.
+    expect(run_decode_release(notify, max_attempts, second_poll).await) {
+        let notify = false;
+        let max_attempts = 25;
+        let second_poll = false;
+
+        when the_poll_path_claims_an_undecodable_payload_with_retry_budget_left {
+            to surfaces_the_decode_error {
+                decode_release_surfaces_the_error()
+            }
+            to fails_the_attempt_instead_of_stranding_the_row_in_running {
+                decode_release_row("Failed", 1)
+            }
+            to persists_the_decode_error_in_last_result {
+                decode_release_persists_decode_error()
+            }
+        }
+
+        when a_second_worker_polls_after_the_failed_decode {
+            let second_poll = true;
+            to reclaims_the_row_and_burns_another_attempt {
+                decode_release_retry_claims_again()
+            }
+        }
+
+        when the_undecodable_payload_has_an_exhausted_retry_budget {
+            let max_attempts = 1;
+            to kills_the_task_terminally {
+                decode_release_row("Killed", 1)
+            }
+        }
+
+        when the_notify_path_claims_an_undecodable_payload_with_retry_budget_left {
+            let notify = true;
+            to fails_the_attempt_instead_of_stranding_the_row_in_running {
+                decode_release_row("Failed", 1)
             }
         }
     }

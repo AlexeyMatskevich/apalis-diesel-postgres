@@ -19,7 +19,7 @@ pub(crate) use admin::{
     fetch_by_id, list_all_tasks, list_queues, list_tasks, list_workers, metrics_for_queue,
     metrics_global, register_worker,
 };
-pub(crate) use fetch::{fetch_next, lock_task};
+pub(crate) use fetch::{fail_undecodable_task, fetch_next, lock_task};
 pub(crate) use notify::{
     NOTIFY_CHANNEL_CAPACITY_MAX, NOTIFY_LISTENER_POLL_INTERVAL, notify_task_ids,
 };

@@ -344,13 +344,17 @@ where
     }
 
     fn poll(self, worker: &WorkerContext) -> Self::Stream {
+        // The decode stage keeps its own pool handle (and the claiming
+        // worker's id) so it can fail rows whose payload does not decode —
+        // see `queries::fail_undecodable_task`.
+        let pool = self.pool.clone();
         let compact = self.fetcher.into_compact_stream(
             self.pool,
             self.config,
             worker.clone(),
             self.lease_token,
         );
-        crate::fetcher::decode_task_stream::<Args, Decode>(compact)
+        crate::fetcher::decode_task_stream::<Args, Decode>(compact, pool, worker.name().to_owned())
     }
 }
 

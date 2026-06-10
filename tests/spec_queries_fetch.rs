@@ -30,6 +30,13 @@
 //!   8. H4 invariant: a successfully claimed row transitions to `Running` with
 //!      `lock_by = worker`, `lock_at` set, and `done_at = NULL` — straight from
 //!      the production CTE.
+//!   9. `fail_undecodable_task` claim-epoch predicate: the decode-failure
+//!      release applies only to the caller's own live claim; rows that were
+//!      acked, swept, or re-claimed (other worker / later epoch / advanced
+//!      attempts) in the meantime are untouched. The positive direction (a
+//!      decode failure routes the row through Failed→Killed) is covered
+//!      through the public API in `postgres_queries`'s decode_release specs;
+//!      these negatives cannot be reached deterministically from there.
 //!
 //! Tests gate on `DATABASE_URL`; without it every scenario resolves to
 //! `Outcome::Skipped` and the assertions pass.
@@ -44,7 +51,7 @@ use apalis_core::task::task_id::TaskId;
 use apalis_diesel_postgres::{PgPool, PgTaskId};
 use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
-    sql_types::{Array, Integer, Nullable, Text},
+    sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text},
 };
 use lets_expect::{AssertionError, AssertionResult, *};
 use ulid::Ulid;
@@ -1151,6 +1158,304 @@ lets_expect! { #tokio_test
             to claims_only_the_claimable_subset { fetched_row_count(2) }
             to returns_both_claimable_ids { all_seeded_ids_returned() }
             to skips_the_terminal_row { no_foreign_ids_returned() }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// SQL mirror of `src/queries/fetch.rs::fail_undecodable_task`.
+//
+// IMPORTANT: keep this byte-equal to the production SQL. If
+// `src/queries/fetch.rs::fail_undecodable_task` changes, update this helper in
+// lock-step. The release must pin the caller's exact claim epoch (`lock_by` +
+// `lock_at` + `attempts`), mirroring `ack_task`'s defense: a delayed release
+// must not fire on a row that was acked, orphan-swept, or re-claimed since.
+// --------------------------------------------------------------------------
+
+const RELEASE_ERROR_TEXT: &str = "failed to decode task payload: spec probe";
+
+/// The claim epoch the "caller" presents. Fixed in the recent past and whole
+/// seconds, matching the production claim's `date_trunc('second', now())`.
+fn claim_epoch_secs() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs();
+    now as i64 - 10
+}
+
+async fn fail_undecodable_sql(
+    pool: PgPool,
+    task_id: String,
+    worker_id: String,
+    lock_at_epoch: i64,
+    attempts: i32,
+    error_json: serde_json::Value,
+) -> Result<usize, String> {
+    with_conn(pool, move |conn| {
+        sql_query(
+            "UPDATE apalis.jobs
+             SET status = CASE
+                     WHEN attempts + 1 >= max_attempts THEN 'Killed'
+                     ELSE 'Failed'
+                 END,
+                 attempts = LEAST(attempts + 1, max_attempts),
+                 done_at = now(),
+                 last_result = $3
+             WHERE id = $1
+                 AND status = 'Running'
+                 AND lock_by = $2
+                 AND lock_at = to_timestamp($4::double precision)
+                 AND attempts = $5",
+        )
+        .bind::<Text, _>(&task_id)
+        .bind::<Text, _>(&worker_id)
+        .bind::<Jsonb, _>(error_json)
+        .bind::<BigInt, _>(lock_at_epoch)
+        .bind::<Integer, _>(attempts)
+        .execute(conn)
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Insert a row in an arbitrary lock state. `max_attempts` is fixed at 25:
+/// the retry-budget axis of the release is pruned here because it is covered
+/// through the public API (`postgres_queries` decode_release specs).
+async fn insert_lock_state_row(
+    pool: PgPool,
+    queue: String,
+    status: &'static str,
+    attempts: i32,
+    lock_by: Option<String>,
+    lock_at_epoch: Option<i64>,
+    last_result: Option<serde_json::Value>,
+) -> Result<PgTaskId, String> {
+    let id = Ulid::new();
+    let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
+    let job = serde_json::to_vec("undecodable-probe").map_err(|e| e.to_string())?;
+    with_conn(pool, move |conn| {
+        sql_query(
+            "INSERT INTO apalis.jobs (
+                id, job_type, job, status, attempts, max_attempts, run_at,
+                lock_by, lock_at, last_result
+            ) VALUES (
+                $1, $2, $3, $4, $5, 25, now() - INTERVAL '1 second',
+                $6, to_timestamp($7::double precision), $8
+            )",
+        )
+        .bind::<Text, _>(id.to_string())
+        .bind::<Text, _>(queue)
+        .bind::<diesel::sql_types::Binary, _>(job)
+        .bind::<Text, _>(status)
+        .bind::<Integer, _>(attempts)
+        .bind::<Nullable<Text>, _>(lock_by)
+        .bind::<Nullable<BigInt>, _>(lock_at_epoch)
+        .bind::<Nullable<Jsonb>, _>(last_result)
+        .execute(conn)
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await?;
+    Ok(task_id)
+}
+
+#[derive(Debug, QueryableByName)]
+struct ReleasedRow {
+    #[diesel(sql_type = Text)]
+    status: String,
+    #[diesel(sql_type = Integer)]
+    attempts: i32,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    done_at_present: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    last_result_present: bool,
+    #[diesel(sql_type = Nullable<Text>)]
+    last_result_err: Option<String>,
+}
+
+async fn read_released_row(pool: PgPool, task_id: String) -> Result<ReleasedRow, String> {
+    with_conn(pool, move |conn| {
+        sql_query(
+            "SELECT status,
+                    attempts,
+                    (done_at IS NOT NULL) AS done_at_present,
+                    (last_result IS NOT NULL) AS last_result_present,
+                    last_result->>'Err' AS last_result_err
+             FROM apalis.jobs
+             WHERE id = $1",
+        )
+        .bind::<Text, _>(&task_id)
+        .load::<ReleasedRow>(conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "released row not found".to_owned())
+    })
+    .await
+}
+
+#[derive(Debug)]
+struct FailUndecodableRun {
+    affected: usize,
+    status: String,
+    attempts: i32,
+    done_at_present: bool,
+    last_result_present: bool,
+    last_result_err: Option<String>,
+}
+
+/// The caller always presents the same claim identity (worker A, the fixed
+/// epoch, attempts = 0); each context varies the *stored* row instead — the
+/// realistic state the row reaches when an ack, an orphan sweep, or a
+/// re-claim raced the delayed release.
+async fn run_fail_undecodable(setup: &'static str) -> Result<Outcome<FailUndecodableRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-fail-undecodable-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_a = format!("fail-undecodable-a-{queue}");
+    let worker_b = format!("fail-undecodable-b-{queue}");
+    insert_worker(pool.clone(), queue.clone(), worker_a.clone()).await?;
+    insert_worker(pool.clone(), queue.clone(), worker_b.clone()).await?;
+    let epoch = claim_epoch_secs();
+
+    let (status, attempts, lock_by, lock_at, last_result) = match setup {
+        "live_claim" => ("Running", 0, Some(worker_a.clone()), Some(epoch), None),
+        "acked_done" => (
+            "Done",
+            1,
+            Some(worker_a.clone()),
+            Some(epoch),
+            Some(serde_json::json!({ "Ok": null })),
+        ),
+        "swept_pending" => ("Pending", 1, None, None, None),
+        "reclaimed_by_other" => ("Running", 0, Some(worker_b.clone()), Some(epoch), None),
+        "reclaimed_later_epoch" => ("Running", 0, Some(worker_a.clone()), Some(epoch + 5), None),
+        "attempts_advanced" => ("Running", 1, Some(worker_a.clone()), Some(epoch), None),
+        other => return Err(format!("unknown setup: {other}")),
+    };
+    let task_id = insert_lock_state_row(
+        pool.clone(),
+        queue.clone(),
+        status,
+        attempts,
+        lock_by,
+        lock_at,
+        last_result,
+    )
+    .await?;
+
+    let affected = fail_undecodable_sql(
+        pool.clone(),
+        task_id.to_string(),
+        worker_a,
+        epoch,
+        0,
+        serde_json::json!({ "Err": RELEASE_ERROR_TEXT }),
+    )
+    .await?;
+    let row = read_released_row(pool.clone(), task_id.to_string()).await?;
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(FailUndecodableRun {
+        affected,
+        status: row.status,
+        attempts: row.attempts,
+        done_at_present: row.done_at_present,
+        last_result_present: row.last_result_present,
+        last_result_err: row.last_result_err,
+    }))
+}
+
+fn release_fails_the_live_claim()
+-> impl Fn(&Result<Outcome<FailUndecodableRun>, String>) -> AssertionResult {
+    observe::<FailUndecodableRun, _>("live-claim release", |run| {
+        if run.affected != 1 {
+            return Err(format!("expected exactly one released row, got {run:?}"));
+        }
+        if run.status != "Failed" || run.attempts != 1 || !run.done_at_present {
+            return Err(format!(
+                "expected the claim to become Failed/attempts=1 with done_at set, got {run:?}"
+            ));
+        }
+        if run.last_result_err.as_deref() != Some(RELEASE_ERROR_TEXT) {
+            return Err(format!(
+                "expected last_result to carry the decode error, got {run:?}"
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn release_skips_the_row(
+    status: &'static str,
+    attempts: i32,
+    result_present: bool,
+) -> impl Fn(&Result<Outcome<FailUndecodableRun>, String>) -> AssertionResult {
+    observe::<FailUndecodableRun, _>("stale release", move |run| {
+        if run.affected != 0 {
+            return Err(format!(
+                "expected the release to match no rows, got {run:?}"
+            ));
+        }
+        if run.status != status
+            || run.attempts != attempts
+            || run.done_at_present
+            || run.last_result_present != result_present
+            || run.last_result_err.is_some()
+        {
+            return Err(format!(
+                "expected the {status}/attempts={attempts} row to stay untouched, got {run:?}"
+            ));
+        }
+        Ok(())
+    })
+}
+
+lets_expect! { #tokio_test
+    expect(run_fail_undecodable(setup).await) {
+        let setup = "live_claim";
+
+        when the_release_matches_the_callers_live_claim {
+            to fails_the_attempt_and_persists_the_decode_error {
+                release_fails_the_live_claim()
+            }
+        }
+
+        when the_row_was_acked_done_before_the_release_fired {
+            let setup = "acked_done";
+            to leaves_the_acked_row_and_its_stored_result_untouched {
+                release_skips_the_row("Done", 1, true)
+            }
+        }
+
+        when the_row_was_swept_back_to_pending_before_the_release_fired {
+            let setup = "swept_pending";
+            to leaves_the_swept_row_untouched {
+                release_skips_the_row("Pending", 1, false)
+            }
+        }
+
+        when the_row_was_reclaimed_by_another_worker {
+            let setup = "reclaimed_by_other";
+            to leaves_the_foreign_claim_untouched {
+                release_skips_the_row("Running", 0, false)
+            }
+        }
+
+        when the_row_was_reclaimed_at_a_later_epoch_by_the_same_worker_name {
+            let setup = "reclaimed_later_epoch";
+            to leaves_the_newer_claim_untouched {
+                release_skips_the_row("Running", 0, false)
+            }
+        }
+
+        when the_stored_attempts_advanced_since_the_claim {
+            let setup = "attempts_advanced";
+            to leaves_the_advanced_row_untouched {
+                release_skips_the_row("Running", 1, false)
+            }
         }
     }
 }

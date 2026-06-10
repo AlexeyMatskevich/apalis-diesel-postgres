@@ -1,12 +1,12 @@
 use apalis_core::worker::context::WorkerContext;
 use diesel::{
     RunQueryDsl, sql_query,
-    sql_types::{Array, Integer, Nullable, Text},
+    sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text},
 };
 use ulid::Ulid;
 
 use crate::{
-    CompactType, Config, Error, PgPool, PgTask,
+    CompactType, Config, Error, PgPool, PgTask, PgTaskId,
     queries::{clamp_i32, task_rows, with_conn},
 };
 
@@ -115,6 +115,59 @@ pub(crate) fn queue_by_id(
         .load(conn)
         .map_err(Error::database("claiming notified jobs"))?;
         task_rows(rows)
+    })
+}
+
+/// Release a row the dequeue SQL already claimed as `Running` but whose
+/// payload failed to decode. Without this, a poisoned payload (codec drift, a
+/// third-party insert) would strand the row in `Running` for as long as the
+/// claiming worker keeps heartbeating: ack requires a decoded task, and
+/// orphan recovery only reclaims rows of *stale* workers. Failing the attempt
+/// instead routes the row through the normal retry budget — it stays
+/// claimable (`Failed` with attempts left) until the budget is exhausted,
+/// then turns terminal `Killed`, the same convention as `reenqueue_orphaned`.
+///
+/// The predicate pins the caller's exact claim epoch, mirroring `ack_task`:
+/// `status`/`lock_by` alone would let a delayed release fire on a row that
+/// was orphan-swept and re-claimed in the meantime (same worker name, new
+/// claim), so `lock_at` and `attempts` from the claimed task must match too.
+/// An ack, a sweep, or a re-claim that raced this call all leave the row
+/// untouched.
+pub(crate) fn fail_undecodable_task(
+    pool: PgPool,
+    task_id: PgTaskId,
+    worker_id: String,
+    lock_at: i64,
+    attempts: i32,
+    error: String,
+) -> impl Future<Output = Result<(), Error>> + Send {
+    with_conn(pool, move |conn| {
+        // Same externally-tagged `Result<O, String>` JSON shape as ack's
+        // `last_result`, so readers observe one format for every failure path.
+        let result = serde_json::json!({ "Err": crate::ack::truncate_error_payload(error) });
+        sql_query(
+            "UPDATE apalis.jobs
+             SET status = CASE
+                     WHEN attempts + 1 >= max_attempts THEN 'Killed'
+                     ELSE 'Failed'
+                 END,
+                 attempts = LEAST(attempts + 1, max_attempts),
+                 done_at = now(),
+                 last_result = $3
+             WHERE id = $1
+                 AND status = 'Running'
+                 AND lock_by = $2
+                 AND lock_at = to_timestamp($4::double precision)
+                 AND attempts = $5",
+        )
+        .bind::<Text, _>(task_id.to_string())
+        .bind::<Text, _>(worker_id)
+        .bind::<Jsonb, _>(result)
+        .bind::<BigInt, _>(lock_at)
+        .bind::<Integer, _>(attempts)
+        .execute(conn)
+        .map_err(Error::database("failing undecodable task"))?;
+        Ok(())
     })
 }
 
