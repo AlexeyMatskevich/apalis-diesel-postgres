@@ -250,8 +250,10 @@ Key points:
 
 - `backend_pool` is **your** service's pool, separate from the pool you hand
   to `PostgresStorage`. See [Connection pool isolation](#connection-pool-isolation).
-- The whole block runs inside `tokio::task::spawn_blocking` —
-  `push_with_conn` is synchronous and would otherwise stall the runtime.
+- The whole block runs inside `tokio::task::spawn_blocking` (or
+  `ntex_rt::spawn_blocking` on the `ntex` runtime — see the Runtime features
+  section above) — `push_with_conn` is synchronous and would otherwise stall
+  the runtime.
 - `NOTIFY` fires when the outer transaction commits, so listeners only
   observe committed work.
 

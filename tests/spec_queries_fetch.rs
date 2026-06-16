@@ -1,10 +1,14 @@
 //! Exhaustive specification for `src/queries/fetch.rs::fetch_next`.
 //!
 //! `fetch_next` is `pub(crate)`, so this integration test crate cannot call it
-//! directly. Instead, the helper `fetch_next_sql` below issues the *same SQL
-//! statement* as the production function and pins the resulting row-level
-//! behaviour. Any production-side SQL drift will desync this contract from the
-//! source and the spec must be updated in lock-step.
+//! directly. Instead, the helper `fetch_next_sql` below *mirrors* the
+//! production function's claim/update CTE — the same `CLAIMABLE_PREDICATE`,
+//! `run_at <= now()` filter, `ORDER BY priority DESC, run_at ASC`, `LIMIT`, and
+//! `FOR UPDATE SKIP LOCKED` — and pins the resulting row-level behaviour. It is
+//! deliberately *not* byte-equal to production: `fetch_next` returns `RETURNING
+//! apalis.jobs.*` into a full `JobRow`, whereas this mirror projects only the
+//! derived columns under assertion. Any drift in the production claim/update SQL
+//! must be reflected here in lock-step.
 //!
 //! Behaviour already covered elsewhere is not re-tested here:
 //!   - basic push → poll ordering (oldest first, delayed deferred) →
@@ -22,7 +26,10 @@
 //!   2. `buffer_size > available` → returns all available, no padding.
 //!   3. LIMIT clamps when `buffer_size < available`.
 //!   4. Cross-queue isolation: a sibling queue's claimable rows are invisible.
-//!   5. `run_at = now()` boundary is inclusive (`run_at <= now()`).
+//!   5. A `run_at` at-or-just-before `now()` is claimable — the inclusive
+//!      (`run_at <= now()`) boundary direction. Exact `run_at = now()` equality
+//!      is not asserted: insert-time `now()` is already slightly in the past by
+//!      the time fetch runs (see `run_run_at_boundary`).
 //!   6. Tie-break on equal priority falls back to `run_at ASC`.
 //!   7. Per-status predicate matrix for *fetch* (distinct from `lock_task`):
 //!      Pending claimable; Failed retryable claimable; Failed exhausted, Queued,
@@ -192,9 +199,12 @@ struct FetchedRow {
 // --------------------------------------------------------------------------
 // SQL mirror of `src/queries/fetch.rs::fetch_next`.
 //
-// IMPORTANT: keep this byte-equal to the production SQL. If
-// `src/queries/fetch.rs::fetch_next` changes, update this helper in lock-step.
-// `CLAIMABLE_PREDICATE` is inlined here since it is `pub(crate)` in production.
+// IMPORTANT: keep the claim/update CTE — predicate, `run_at <= now()` filter,
+// ordering, `LIMIT`, and `FOR UPDATE SKIP LOCKED` — in lock-step with the
+// production SQL. The final SELECT intentionally projects only the derived
+// columns under assertion, so this helper is NOT byte-equal to production's
+// `RETURNING apalis.jobs.*`. `CLAIMABLE_PREDICATE` is inlined here since it is
+// `pub(crate)` in production.
 // --------------------------------------------------------------------------
 
 const CLAIMABLE_PREDICATE: &str =

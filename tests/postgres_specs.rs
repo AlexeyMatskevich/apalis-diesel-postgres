@@ -374,6 +374,12 @@ fn concurrent_admin_register_creates_single_row()
 struct TwoWorkerRaceRun {
     total: usize,
     duplicates: usize,
+    /// Sorted union of payloads delivered across both workers, with any
+    /// duplicates preserved so the assertion can check disjointness *and*
+    /// full-set coverage.
+    delivered: Vec<String>,
+    /// Sorted set of payloads the producer pushed — the expected union.
+    pushed: Vec<String>,
 }
 
 async fn run_two_worker_race() -> Result<Outcome<TwoWorkerRaceRun>, String> {
@@ -385,14 +391,17 @@ async fn run_two_worker_race() -> Result<Outcome<TwoWorkerRaceRun>, String> {
     let mut producer =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(8));
     let n = 8usize;
+    let mut pushed = Vec::with_capacity(n);
     for i in 0..n {
         // unique payloads
         let payload: &'static str = Box::leak(format!("race-{i}").into_boxed_str());
+        pushed.push(payload.to_owned());
         producer
             .push_task(task(payload, now_unix() - 1, 0, 25))
             .await
             .map_err(|e| e.to_string())?;
     }
+    pushed.sort();
 
     let storage_a =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(4));
@@ -435,18 +444,26 @@ async fn run_two_worker_race() -> Result<Outcome<TwoWorkerRaceRun>, String> {
     Ok(Outcome::Completed(TwoWorkerRaceRun {
         total: all.len(),
         duplicates,
+        delivered: sorted,
+        pushed,
     }))
 }
 
 fn two_workers_share_set_without_duplicates()
 -> impl Fn(&Result<Outcome<TwoWorkerRaceRun>, String>) -> AssertionResult {
     observe::<TwoWorkerRaceRun, _>("two-worker race", |run| {
-        if run.duplicates == 0 && run.total >= 1 {
+        // Disjoint *and* complete: every pushed row reaches exactly one worker.
+        // SKIP LOCKED claims each row once, and both pollers drain until the
+        // queue is empty, so the deduped union must equal the full pushed set.
+        let mut unique = run.delivered.clone();
+        unique.dedup();
+        if run.duplicates == 0 && unique == run.pushed {
             Ok(())
         } else {
             Err(format!(
-                "expected SKIP LOCKED to keep deliveries disjoint, got total={} duplicates={}",
-                run.total, run.duplicates
+                "expected SKIP LOCKED to deliver the full pushed set disjointly: \
+                 duplicates={} total={} pushed={:?} delivered={:?}",
+                run.duplicates, run.total, run.pushed, run.delivered
             ))
         }
     })

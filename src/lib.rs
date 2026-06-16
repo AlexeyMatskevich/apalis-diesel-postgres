@@ -250,9 +250,11 @@ where
     /// needed.
     ///
     /// This is the only synchronous public method in the crate. From an async
-    /// context, invoke it inside `tokio::task::spawn_blocking` together with
-    /// your business-data writes so the entire transaction lives on one
-    /// blocking task.
+    /// context, invoke it on the selected runtime's blocking pool —
+    /// `tokio::task::spawn_blocking` with the `tokio` feature, or
+    /// `ntex_rt::spawn_blocking` with the `ntex` feature — together with your
+    /// business-data writes so the entire transaction lives on one blocking
+    /// task.
     ///
     /// See [`Self::push_task_with_conn`] for the full-control variant that
     /// accepts a pre-built [`PgTask`] (custom `idempotency_key`, `priority`,
