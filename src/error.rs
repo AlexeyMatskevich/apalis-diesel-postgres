@@ -339,6 +339,17 @@ mod tests {
         }
     }
 
+    /// A `Database` error whose diesel source carries a non-empty
+    /// `database_hint` (the missing-`apalis.jobs`-relation signal), so the
+    /// Display assertion exercises the `{source}{hint}` concatenation with a
+    /// NON-empty hint — the path `database_error()` (empty hint) cannot reach.
+    fn database_error_with_setup_hint() -> Error {
+        Error::Database {
+            operation: Cow::Borrowed("locking task"),
+            source: database_error_with("relation \"apalis.jobs\" does not exist", None, None),
+        }
+    }
+
     fn displays_as(expected: &'static str) -> impl Fn(&Error) -> AssertionResult {
         move |error| {
             let actual = error.to_string();
@@ -417,6 +428,12 @@ mod tests {
             to exposes_the_database_error_as_the_source { has_source_containing("Record not found") }
         }
 
+        expect(database_error_with_setup_hint()) {
+            to displays_the_operation_context_with_the_setup_hint_appended {
+                displays_as("database error while locking task: relation \"apalis.jobs\" does not exist; run apalis_diesel_postgres::setup(&pool).await before using the storage")
+            }
+        }
+
         expect(Error::Blocking(boxed_error("join cancelled"))) {
             to displays_the_blocking_error { displays_as("blocking task failed: join cancelled") }
             to exposes_the_blocking_error_as_the_source { has_source_containing("join cancelled") }
@@ -462,6 +479,17 @@ mod tests {
             to has_no_error_source { has_no_source }
         }
 
+        // Empty conflicting_keys is the boundary of the Vec axis. In production
+        // this state is effectively unreachable (only keyed submissions can
+        // collide), so this leaf pins the pure Display rendering of the `[]`
+        // branch rather than a reachable conflict.
+        expect(Error::idempotency_conflict("emails", vec![], 0)) {
+            to displays_an_empty_conflict_batch {
+                displays_as("idempotency_key conflict in queue `emails`: keys [] collided with the unique constraint; 0 task(s) in the batch were all rolled back")
+            }
+            to has_no_error_source { has_no_source }
+        }
+
         expect(Error::task_not_found(
             "locking task",
             "task-1",
@@ -470,10 +498,25 @@ mod tests {
         )) {
             to returns_a_contextual_task_not_found_error { is_task_not_found }
             to displays_the_next_step { displays_as("task not found while locking task (task_id: task-1, queue: queue-1); the task may be delayed, already locked by another worker, completed, or in another queue") }
+            to has_no_error_source { has_no_source }
+        }
+
+        expect(Error::task_not_found(
+            "locking task",
+            "task-1",
+            None,
+            "the task may be delayed, already locked by another worker, completed, or in another queue",
+        )) {
+            when queue_is_not_constrained {
+                to renders_the_unconstrained_placeholder {
+                    displays_as("task not found while locking task (task_id: task-1, queue: <not constrained>); the task may be delayed, already locked by another worker, completed, or in another queue")
+                }
+            }
         }
 
         expect(Error::stale_acknowledgement("task-1", "queue-1", "worker-1")) {
             to displays_the_ack_conflict { displays_as("stale acknowledgement for task task-1 in queue queue-1 by worker worker-1; the task is no longer Running with the same lock owner, attempt, and lock timestamp") }
+            to has_no_error_source { has_no_source }
         }
 
         expect(Error::worker_not_registered(
@@ -483,10 +526,12 @@ mod tests {
             "recreate the worker stream so registration can run again",
         )) {
             to displays_the_worker_registration_problem { displays_as("worker not registered while updating worker heartbeat (worker_id: worker-1, queue: queue-1); recreate the worker stream so registration can run again") }
+            to has_no_error_source { has_no_source }
         }
 
         expect(Error::NotifyListener("LISTEN failed".to_owned())) {
             to displays_the_notify_degradation { displays_as("PostgreSQL notification listener failed: LISTEN failed; polling fallback can still fetch jobs, but LISTEN/NOTIFY wakeups are disabled until the stream is recreated") }
+            to has_no_error_source { has_no_source }
         }
 
         expect(Error::SinkBufferFull(1)) {

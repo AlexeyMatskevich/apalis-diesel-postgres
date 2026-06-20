@@ -2,6 +2,8 @@
 
 mod support;
 
+use support::{Outcome, observe, with_conn};
+
 use std::{
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -28,33 +30,9 @@ use diesel::{
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz},
 };
 use futures::StreamExt;
-use lets_expect::{AssertionError, AssertionResult, *};
+use lets_expect::{AssertionResult, *};
 use serde_json::Value;
 use ulid::Ulid;
-
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
-}
-
-fn observe<T, F>(
-    label: &'static str,
-    body: F,
-) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
-where
-    F: Fn(&T) -> Result<(), String>,
-{
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "{label}: scenario failed: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(run)) => {
-            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
-        }
-    }
-}
 
 #[derive(Debug, QueryableByName)]
 struct CountRow {
@@ -82,19 +60,6 @@ fn invalid_pool() -> PgPool {
         .max_size(1)
         .connection_timeout(Duration::from_millis(10))
         .build_unchecked(manager)
-}
-
-async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
-where
-    F: FnOnce(&mut diesel::PgConnection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|error| error.to_string())?;
-        work(&mut conn)
-    })
-    .await
-    .map_err(|error| error.to_string())?
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -617,10 +582,21 @@ fn other_queue_remains_empty_for_same_queue_duplicate()
 struct AckBoundaryRun {
     status: String,
     attempts: i32,
-    last_result_present: bool,
+    last_result_payload: Option<Value>,
 }
 
 async fn run_ack_boundary(terminal: bool) -> Result<Outcome<AckBoundaryRun>, String> {
+    run_ack_boundary_with_error(terminal, "failed".to_owned()).await
+}
+
+/// Drives `PgAck::ack` against a real DB with a configurable `Err` payload so
+/// the failure-path wiring (status/attempts/last_result) can be observed end to
+/// end. The error text is funnelled through `truncate_error_payload` inside
+/// `PgAck::ack`, so an oversized `error_text` exercises the truncation marker.
+async fn run_ack_boundary_with_error(
+    terminal: bool,
+    error_text: String,
+) -> Result<Outcome<AckBoundaryRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
@@ -658,7 +634,7 @@ async fn run_ack_boundary(terminal: bool) -> Result<Outcome<AckBoundaryRun>, Str
         .parts;
 
     let mut ack = PgAck::new(pool.clone());
-    let result: Result<String, BoxDynError> = Err(std::io::Error::other("failed").into());
+    let result: Result<String, BoxDynError> = Err(std::io::Error::other(error_text).into());
     ack.ack(&result, &parts).await.map_err(|e| e.to_string())?;
 
     let status = job_status(pool.clone(), id).await?;
@@ -667,8 +643,20 @@ async fn run_ack_boundary(terminal: bool) -> Result<Outcome<AckBoundaryRun>, Str
     Ok(Outcome::Completed(AckBoundaryRun {
         status: status.status,
         attempts: status.attempts,
-        last_result_present: status.last_result.is_some(),
+        last_result_payload: status.last_result,
     }))
+}
+
+/// Drives `PgAck::ack` with an oversized `Err` (longer than
+/// `MAX_ERROR_PAYLOAD_LEN`, ASCII) so the persisted `last_result` proves the
+/// ack mapping applied `truncate_error_payload` and emitted the externally
+/// tagged `{"Err": ...}` shape.
+async fn run_ack_oversized_error() -> Result<Outcome<AckBoundaryRun>, String> {
+    // 8 KiB cap + slack; ASCII so the byte length equals the char count and
+    // truncation is guaranteed to trip. The multibyte walk-back boundary is
+    // owned by the pure-unit tree in src/ack.rs and is intentionally not
+    // re-tested here.
+    run_ack_boundary_with_error(false, "x".repeat(9000)).await
 }
 
 fn ack_recorded_status(
@@ -703,11 +691,38 @@ fn ack_recorded_attempts(
 
 fn ack_persisted_last_result()
 -> impl Fn(&Result<Outcome<AckBoundaryRun>, String>) -> AssertionResult {
-    observe::<AckBoundaryRun, _>("ack last_result", |run| {
-        if run.last_result_present {
+    observe::<AckBoundaryRun, _>("ack last_result", |run| match &run.last_result_payload {
+        Some(value)
+            if value
+                .get("Err")
+                .and_then(Value::as_str)
+                .map(|s| s.contains("failed"))
+                .unwrap_or(false) =>
+        {
             Ok(())
-        } else {
-            Err("expected last_result to be persisted after ack".into())
+        }
+        other => Err(format!(
+            "expected last_result to carry the {{\"Err\": ...}} failure payload, got {other:?}"
+        )),
+    })
+}
+
+fn ack_truncates_oversized_error_payload()
+-> impl Fn(&Result<Outcome<AckBoundaryRun>, String>) -> AssertionResult {
+    // The ack mapping funnels the Err text through `truncate_error_payload`,
+    // which appends `…[truncated]` (TRUNCATION_MARKER in src/ack.rs) once the
+    // payload exceeds MAX_ERROR_PAYLOAD_LEN.
+    observe::<AckBoundaryRun, _>("ack oversized last_result", |run| {
+        match run
+            .last_result_payload
+            .as_ref()
+            .and_then(|value| value.get("Err"))
+            .and_then(Value::as_str)
+        {
+            Some(text) if text.ends_with("…[truncated]") => Ok(()),
+            other => Err(format!(
+                "expected the oversized Err payload to be truncated with the marker, got {other:?}"
+            )),
         }
     })
 }
@@ -1144,7 +1159,14 @@ async fn run_lock_status_scenario(
     let (status, attempts, max_attempts, run_offset, lock_by, lock_at) = match scenario {
         "pending_due" => ("Pending", 0, 25, -1, None, None),
         "pending_future" => ("Pending", 0, 25, 3600, None, None),
-        "queued_by_self" => ("Queued", 0, 25, -1, Some(primary_worker.clone()), Some(now)),
+        "queued_by_self" => (
+            "Queued",
+            0,
+            25,
+            -1,
+            Some(primary_worker.clone()),
+            Some(past),
+        ),
         "queued_by_other" => ("Queued", 0, 25, -1, Some(other_worker.clone()), Some(now)),
         "running_by_self" => (
             "Running",
@@ -1727,7 +1749,7 @@ fn wait_pending_does_not_complete_early()
 
 #[derive(Debug)]
 struct WaitMalformedRun {
-    first_item_was_error: bool,
+    first_item_was_decode_error: bool,
     stream_ended_after_one_item: bool,
 }
 
@@ -1761,7 +1783,10 @@ async fn run_wait_malformed_terminal() -> Result<Outcome<WaitMalformedRun>, Stri
         .is_none();
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(WaitMalformedRun {
-        first_item_was_error: first.is_err(),
+        first_item_was_decode_error: matches!(
+            first.as_ref().err(),
+            Some(apalis_diesel_postgres::Error::Json(_))
+        ),
         stream_ended_after_one_item: ended,
     }))
 }
@@ -1769,10 +1794,10 @@ async fn run_wait_malformed_terminal() -> Result<Outcome<WaitMalformedRun>, Stri
 fn malformed_wait_first_yields_decode_error()
 -> impl Fn(&Result<Outcome<WaitMalformedRun>, String>) -> AssertionResult {
     observe::<WaitMalformedRun, _>("malformed wait first item", |run| {
-        if run.first_item_was_error {
+        if run.first_item_was_decode_error {
             Ok(())
         } else {
-            Err("expected wait_for to surface a decode error for a malformed terminal".into())
+            Err("expected wait_for to surface a JSON decode error for a malformed terminal".into())
         }
     })
 }
@@ -2755,6 +2780,40 @@ async fn run_check_status_variants(
             .await?
         }
         "missing" => task_id(),
+        // A Failed row that still has retries left is non-terminal: it must be
+        // excluded by `completed_task_rows` exactly like a Pending row.
+        "failed_retryable" => {
+            insert_status_row(pool.clone(), queue.clone(), "Failed", 1, 3, -1, None, None).await?
+        }
+        // A Failed row whose attempts reached max_attempts crosses the `>=`
+        // boundary into terminal — the one arm whose terminality hinges on a
+        // numeric comparison. Terminal rows are read back through
+        // `task_result_from_row`, which requires a non-NULL `last_result`, so
+        // these are seeded with a decodable failure/result payload.
+        "failed_exhausted" => {
+            insert_completed_task(
+                pool.clone(),
+                queue.clone(),
+                "exhausted",
+                "Failed",
+                3,
+                3,
+                serde_json::json!({"Err": "exhausted"}),
+            )
+            .await?
+        }
+        "killed" => {
+            insert_completed_task(
+                pool.clone(),
+                queue.clone(),
+                "killed",
+                "Killed",
+                3,
+                3,
+                serde_json::json!({"Err": "killed"}),
+            )
+            .await?
+        }
         other => return Err(format!("unknown check_status scenario: {other}")),
     };
 
@@ -2780,6 +2839,20 @@ fn check_status_returns_no_rows()
                 "expected check_status to return no results for a missing id, got {} ({:?})",
                 run.results_len, run.first_status
             ))
+        }
+    })
+}
+
+fn check_status_returns_terminal(
+    expected: Status,
+) -> impl Fn(&Result<Outcome<CheckStatusVariantRun>, String>) -> AssertionResult {
+    observe::<CheckStatusVariantRun, _>("check_status terminal", move |run| {
+        match (run.results_len, run.first_status.clone()) {
+            (1, Some(status)) if status == expected => Ok(()),
+            (len, status) => Err(format!(
+                "expected check_status to return the row as terminal {expected:?}, \
+                 got {len} result(s) ({status:?})"
+            )),
         }
     })
 }
@@ -2919,9 +2992,17 @@ lets_expect! { #tokio_test
         }
     }
 
+    expect(run_ack_oversized_error().await) {
+        when a_failed_attempt_carries_an_error_larger_than_the_payload_cap {
+            to truncates_the_failure_payload_with_the_marker {
+                ack_truncates_oversized_error_payload()
+            }
+        }
+    }
+
     expect(run_ack_stale().await) {
         when ack_arrives_from_a_worker_that_no_longer_holds_the_lock {
-            to surfaces_a_database_error {
+            to surfaces_a_stale_acknowledgement_error {
                 stale_ack_returns_error()
             }
             to keeps_the_row_in_running_status {
@@ -2991,6 +3072,7 @@ lets_expect! { #tokio_test
             to re_locks_the_row_for_the_same_worker { lock_matrix_succeeds() }
             to leaves_the_row_in_running_state { lock_matrix_status_equals("Running") }
             to keeps_the_lock_holder_as_the_primary_worker { lock_matrix_owned_by("primary") }
+            to preserves_the_existing_lock_at_timestamp { lock_matrix_preserved_past_lock_at() }
         }
 
         when the_task_is_queued_by_a_different_worker {
@@ -3181,7 +3263,7 @@ lets_expect! { #tokio_test
             to records_the_retry_attempt {
                 orphan_attempts_equals(1)
             }
-            to writes_the_timeout_failure_to_last_result {
+            to populates_last_result_after_reenqueue {
                 orphan_recorded_last_result()
             }
         }
@@ -3195,7 +3277,7 @@ lets_expect! { #tokio_test
             to records_the_final_attempt {
                 orphan_attempts_equals(2)
             }
-            to writes_the_timeout_failure_to_last_result {
+            to populates_last_result_after_reenqueue {
                 orphan_recorded_last_result()
             }
         }
@@ -3214,7 +3296,7 @@ lets_expect! { #tokio_test
             to records_the_retry_attempt {
                 orphan_attempts_equals(1)
             }
-            to writes_the_timeout_failure_to_last_result {
+            to populates_last_result_after_reenqueue {
                 orphan_recorded_last_result()
             }
         }
@@ -3228,7 +3310,7 @@ lets_expect! { #tokio_test
             to records_the_final_attempt {
                 orphan_attempts_equals(2)
             }
-            to writes_the_timeout_failure_to_last_result {
+            to populates_last_result_after_reenqueue {
                 orphan_recorded_last_result()
             }
         }
@@ -3318,7 +3400,7 @@ lets_expect! { #tokio_test
 
     expect(run_ack_on_pending_row().await) {
         when ack_targets_a_row_that_was_never_locked {
-            to returns_a_database_error {
+            to returns_a_stale_acknowledgement_error {
                 ack_on_pending_row_is_rejected()
             }
             to does_not_change_the_row_status {
@@ -3346,7 +3428,7 @@ lets_expect! { #tokio_test
 
     expect(run_ack_on_terminal_row().await) {
         when ack_targets_a_row_that_is_already_marked_done {
-            to returns_a_database_error {
+            to returns_a_stale_acknowledgement_error {
                 terminal_ack_rejected()
             }
             to leaves_the_row_in_done_state {
@@ -3382,6 +3464,27 @@ lets_expect! { #tokio_test
             let scenario = "missing";
             to omits_the_id_from_the_result_set {
                 check_status_returns_no_rows()
+            }
+        }
+
+        when check_status_inspects_a_retryable_failed_row {
+            let scenario = "failed_retryable";
+            to treats_the_failed_row_with_retries_left_as_non_terminal {
+                check_status_returns_no_rows()
+            }
+        }
+
+        when check_status_inspects_an_exhausted_failed_row {
+            let scenario = "failed_exhausted";
+            to reports_the_exhausted_failed_row_as_terminal {
+                check_status_returns_terminal(Status::Failed)
+            }
+        }
+
+        when check_status_inspects_a_killed_row {
+            let scenario = "killed";
+            to reports_the_killed_row_as_terminal {
+                check_status_returns_terminal(Status::Killed)
             }
         }
     }

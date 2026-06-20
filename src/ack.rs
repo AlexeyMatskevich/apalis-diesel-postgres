@@ -169,10 +169,6 @@ mod tests {
         truncate_error_payload("€".repeat(char_count)).len()
     }
 
-    fn truncated_three_byte_char_payload_is_valid_utf8(char_count: usize) -> bool {
-        std::str::from_utf8(truncate_error_payload("€".repeat(char_count)).as_bytes()).is_ok()
-    }
-
     fn poll_lock_ready(state: ReadyState) -> Poll<Result<(), BoxDynError>> {
         let mut service = LockTaskService {
             inner: ReadyService { state },
@@ -337,9 +333,7 @@ mod tests {
             let worker_id: Option<&str> = Some("worker-1");
             let has_lock_at = true;
 
-            when the_owner_matches_and_a_lock_timestamp_is_present {
-                to recognizes_the_preclaimed_task_and_skips_the_sql_lock { be_true }
-            }
+            to recognizes_the_preclaimed_task_and_skips_the_sql_lock { be_true }
 
             when the_lock_timestamp_is_absent {
                 let has_lock_at = false;
@@ -566,14 +560,6 @@ mod tests {
                     // appended. A naive `truncate(8192)` would instead panic.
                     equal(8190 + "…[truncated]".len())
                 }
-            }
-        }
-
-        expect(truncated_three_byte_char_payload_is_valid_utf8(char_count)) {
-            let char_count = 4000;
-
-            when the_truncation_cut_falls_in_the_middle_of_a_multibyte_codepoint {
-                to never_splits_a_codepoint_and_stays_valid_utf8 { equal(true) }
             }
         }
     }

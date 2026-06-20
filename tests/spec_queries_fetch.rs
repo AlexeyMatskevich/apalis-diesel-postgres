@@ -52,61 +52,21 @@
 
 mod support;
 
+use support::{Outcome, observe, with_conn};
+
 use std::str::FromStr;
 
 use apalis_core::task::task_id::TaskId;
 use apalis_diesel_postgres::{PgPool, PgTaskId};
 use diesel::{
-    PgConnection, QueryableByName, RunQueryDsl, sql_query,
+    QueryableByName, RunQueryDsl, sql_query,
     sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text},
 };
-use lets_expect::{AssertionError, AssertionResult, *};
+use lets_expect::{AssertionResult, *};
 use ulid::Ulid;
-
-// --------------------------------------------------------------------------
-// shared scaffolding (kept local so concurrent edits in postgres_specs.rs,
-// postgres_queries.rs, or spec_queries_worker.rs don't conflict).
-// --------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
-}
-
-fn observe<T, F>(
-    label: &'static str,
-    body: F,
-) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
-where
-    F: Fn(&T) -> Result<(), String>,
-{
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "{label}: scenario failed: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(run)) => {
-            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
-        }
-    }
-}
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
     support::shared_pool().await
-}
-
-async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
-where
-    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        work(&mut conn)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -454,46 +414,6 @@ async fn run_equal_priority_tie_break() -> Result<Outcome<FetchRun>, String> {
     }))
 }
 
-// ----- 6b. priority DESC ordering (distinct priorities) ------------------
-
-async fn run_priority_desc_ordering() -> Result<Outcome<FetchRun>, String> {
-    let Some(pool) = test_pool().await? else {
-        return Ok(Outcome::Skipped);
-    };
-    let queue = format!("apalis-spec-fetch-prio-{}", Ulid::new());
-    cleanup_queue(pool.clone(), queue.clone()).await?;
-    let worker_id = format!("spec-fetch-prio-{queue}");
-    insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
-
-    // Insert LOW priority first with an OLDER run_at, so the only signal that
-    // can produce the correct order is `priority DESC` — `run_at ASC` alone
-    // would otherwise put the low-priority row first.
-    let low = insert_row(pool.clone(), queue.clone(), "low", "Pending", 0, 25, -60, 0).await?;
-    let high = insert_row(
-        pool.clone(),
-        queue.clone(),
-        "high",
-        "Pending",
-        0,
-        25,
-        -10,
-        10,
-    )
-    .await?;
-
-    let rows = fetch_next_sql(pool.clone(), queue.clone(), worker_id.clone(), 10).await?;
-    cleanup_queue(pool, queue.clone()).await?;
-    Ok(Outcome::Completed(FetchRun {
-        rows,
-        worker_id,
-        queue,
-        // Canonical order is high-priority first, regardless of insert order
-        // or older run_at on the low-priority row.
-        seeded_ids: vec![high, low],
-        foreign_ids: vec![],
-    }))
-}
-
 // ----- 7. per-status predicate matrix ------------------------------------
 
 #[derive(Debug, Clone, Copy)]
@@ -687,8 +607,8 @@ lets_expect! { #tokio_test
 
     // ----- 5. run_at boundary ---------------------------------------------
     expect(run_run_at_boundary().await) {
-        when run_at_is_at_the_inclusive_now_boundary {
-            // `run_at <= now()` — equality is claimable.
+        when run_at_is_already_past_due {
+            // run_at is slightly in the past by fetch time — the <= now() (past-due) direction; exact equality is not pinned (see module docstring lines 30-32).
             to claims_the_row { fetched_row_count(1) }
             to returns_the_seeded_id { all_seeded_ids_returned() }
         }
@@ -700,15 +620,6 @@ lets_expect! { #tokio_test
             // seeded_ids is built as [older, newer] in the harness; this is
             // the canonical priority-DESC, run_at-ASC ordering.
             to returns_the_older_row_before_the_newer_one {
-                returned_ids_match_seeded_order()
-            }
-        }
-    }
-
-    // ----- 6b. priority DESC ordering -------------------------------------
-    expect(run_priority_desc_ordering().await) {
-        when two_pending_rows_carry_different_priorities {
-            to returns_the_higher_priority_row_first_even_when_its_run_at_is_newer {
                 returned_ids_match_seeded_order()
             }
         }

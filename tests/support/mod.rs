@@ -1,6 +1,8 @@
 use std::sync::OnceLock;
 
 use apalis_diesel_postgres::{PgPool, build_pool_with, setup};
+use diesel::PgConnection;
+use lets_expect::{AssertionError, AssertionResult};
 
 pub fn database_url_or_skip() -> Result<Option<String>, String> {
     let database_url = std::env::var("DATABASE_URL")
@@ -66,4 +68,54 @@ pub async fn shared_pool() -> Result<Option<PgPool>, String> {
     };
     setup(&pool).await.map_err(|error| error.to_string())?;
     Ok(Some(pool))
+}
+
+/// Result of a DB-gated scenario: `Skipped` when `DATABASE_URL` is unset (so
+/// every assertion passes vacuously), `Completed(T)` with the captured
+/// observations otherwise. Shared by the `lets_expect` integration specs so the
+/// skip-gating shape lives in one place instead of being copy-pasted per file.
+#[derive(Debug)]
+#[allow(dead_code)] // not every test binary that includes `support` uses this
+pub enum Outcome<T> {
+    Skipped,
+    Completed(T),
+}
+
+/// Adapt a scenario's captured observations into a `lets_expect` assertion: a
+/// `Skipped` run passes, a failed run surfaces the error, and a completed run is
+/// handed to `body`. Centralised so the adapter is defined once across the specs.
+#[allow(dead_code)] // not every test binary that includes `support` uses this
+pub fn observe<T, F>(
+    label: &'static str,
+    body: F,
+) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
+where
+    F: Fn(&T) -> Result<(), String>,
+{
+    move |result| match result {
+        Err(error) => Err(AssertionError::new(vec![format!(
+            "{label}: scenario failed: {error}"
+        )])),
+        Ok(Outcome::Skipped) => Ok(()),
+        Ok(Outcome::Completed(run)) => {
+            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
+        }
+    }
+}
+
+/// Run a blocking diesel closure on a pooled connection from an async context.
+/// Shared by the integration specs so the `spawn_blocking` + pool-get + error
+/// mapping is defined once.
+#[allow(dead_code)] // not every test binary that includes `support` uses this
+pub async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
+where
+    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut conn = pool.get().map_err(|e| e.to_string())?;
+        work(&mut conn)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

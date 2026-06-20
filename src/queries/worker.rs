@@ -271,7 +271,7 @@ mod tests {
     lets_expect! {
         expect(minted_lease_token_parses_as_ulid()) {
             when a_lease_token_is_minted {
-                to is_a_well_formed_ulid_rather_than_a_constant { be_true }
+                to is_a_well_formed_ulid { be_true }
             }
         }
 
@@ -284,9 +284,7 @@ mod tests {
         expect(heartbeat(rows)) {
             let rows = 1;
 
-            when the_update_affected_a_worker_row {
-                to reports_a_successful_heartbeat { be_ok }
-            }
+            to reports_a_successful_heartbeat { be_ok }
 
             when the_update_affected_no_rows {
                 let rows = 0;

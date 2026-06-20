@@ -34,6 +34,20 @@ pub(crate) const NOTIFY_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis
 /// polling fetcher recovers any wakeups dropped past this cap.
 pub(crate) const NOTIFY_CHANNEL_CAPACITY_MAX: usize = 8192;
 
+/// Clamp a caller-supplied channel capacity into the valid range
+/// `[1, NOTIFY_CHANNEL_CAPACITY_MAX]`.
+///
+/// `buffer_size` from `Config` is caller-controlled, so both the single-queue
+/// listener ([`notify_task_ids`]) and the shared listener clamp it before
+/// allocating the mpsc channel: a floor of 1 keeps `mpsc::channel(0)` from
+/// rejecting every send, and the ceiling bounds the allocation if a
+/// misconfigured `usize::MAX` is passed. Sharing one helper keeps both call
+/// sites in lock-step (a drift between them would mean one listener silently
+/// used a different bound).
+pub(crate) fn clamp_notify_capacity(capacity: usize) -> usize {
+    capacity.clamp(1, NOTIFY_CHANNEL_CAPACITY_MAX)
+}
+
 /// Outcome of a single `try_send` from the LISTEN thread to a fetcher channel.
 /// Extracted (with `classify_delivery`) so the disconnected-vs-full distinction
 /// is unit-testable: the listener loop runs on a spawned thread, so an inline
@@ -62,7 +76,7 @@ pub(crate) fn notify_task_ids(
     queue: String,
     capacity: usize,
 ) -> impl Stream<Item = Result<PgTaskId, Error>> + Send {
-    let (mut sender, receiver) = mpsc::channel(capacity.clamp(1, NOTIFY_CHANNEL_CAPACITY_MAX));
+    let (mut sender, receiver) = mpsc::channel(clamp_notify_capacity(capacity));
     let cancel = Arc::new(AtomicBool::new(false));
     let thread_cancel = cancel.clone();
     let mut spawn_error_sender = sender.clone();
@@ -209,7 +223,36 @@ mod tests {
         classify_delivery(sender.try_send(1))
     }
 
+    fn clamp_capacity(capacity: usize) -> usize {
+        clamp_notify_capacity(capacity)
+    }
+
     lets_expect! {
+        expect(clamp_capacity(capacity)) {
+            let capacity = 8_usize;
+
+            // Default state: a caller value comfortably inside the valid range.
+            to preserves_the_caller_value { equal(8) }
+
+            when the_capacity_is_below_the_minimum {
+                // `mpsc::channel(0)` would reject every send, so the floor is 1.
+                let capacity = 0_usize;
+                to clamps_up_to_the_minimum_of_one { equal(1) }
+            }
+
+            when the_capacity_equals_the_maximum {
+                let capacity = NOTIFY_CHANNEL_CAPACITY_MAX;
+                to keeps_the_maximum_unchanged { equal(NOTIFY_CHANNEL_CAPACITY_MAX) }
+            }
+
+            when the_capacity_exceeds_the_maximum {
+                let capacity = NOTIFY_CHANNEL_CAPACITY_MAX + 1;
+                to clamps_down_to_the_channel_capacity_cap {
+                    equal(NOTIFY_CHANNEL_CAPACITY_MAX)
+                }
+            }
+        }
+
         expect(classify_a_delivered_send()) {
             when the_channel_accepts_the_id {
                 to reports_the_id_as_delivered { equal(DeliveryOutcome::Delivered) }

@@ -24,6 +24,8 @@
 
 mod support;
 
+use support::{Outcome, observe, with_conn};
+
 use std::{
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -36,54 +38,12 @@ use diesel::{
     Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text, Timestamptz},
 };
-use lets_expect::{AssertionError, AssertionResult, *};
+use lets_expect::{AssertionResult, *};
 use serde_json::Value;
 use ulid::Ulid;
 
-// --------------------------------------------------------------------------
-// shared scaffolding (kept local so concurrent edits in postgres_specs.rs
-// or postgres_queries.rs don't conflict).
-// --------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
-}
-
-fn observe<T, F>(
-    label: &'static str,
-    body: F,
-) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
-where
-    F: Fn(&T) -> Result<(), String>,
-{
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "{label}: scenario failed: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(run)) => {
-            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
-        }
-    }
-}
-
 async fn test_pool() -> Result<Option<PgPool>, String> {
     support::shared_pool().await
-}
-
-async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
-where
-    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        work(&mut conn)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -334,20 +294,20 @@ async fn reenqueue_orphaned_sql(
     .await
 }
 
-/// Mirror of `register_worker_blocking`. Returns affected row count (0 means
-/// production would raise `Error::AlreadyRegistered`).
-async fn register_worker_sql(
-    pool: PgPool,
-    worker_id: String,
-    queue: String,
-    storage_name: String,
-    layers: String,
-    lease_token: String,
+/// Mirror of `register_worker_blocking`, connection-bound so the advisory-lock
+/// contention scenario below can run the register on a second connection while
+/// a first connection holds the `(worker_id, worker_type)` xact-scoped lock.
+fn register_worker_sql_on(
+    conn: &mut PgConnection,
+    worker_id: &str,
+    queue: &str,
+    storage_name: &str,
+    layers: &str,
+    lease_token: &str,
     stale_after_secs: i32,
-) -> Result<usize, String> {
-    with_conn(pool, move |conn| {
-        sql_query(
-            "WITH registration_lock AS (
+) -> Result<usize, diesel::result::Error> {
+    sql_query(
+        "WITH registration_lock AS (
                  SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired
              )
              INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at, lease_token)
@@ -362,14 +322,37 @@ async fn register_worker_sql(
              WHERE apalis.workers.lease_token IS NULL
                 OR apalis.workers.lease_token = EXCLUDED.lease_token
                 OR now() - apalis.workers.last_seen >= ($6 * INTERVAL '1 second')",
+    )
+    .bind::<Text, _>(worker_id)
+    .bind::<Text, _>(queue)
+    .bind::<Text, _>(storage_name)
+    .bind::<Text, _>(layers)
+    .bind::<Text, _>(lease_token)
+    .bind::<Integer, _>(stale_after_secs)
+    .execute(conn)
+}
+
+/// Mirror of `register_worker_blocking`. Returns affected row count (0 means
+/// production would raise `Error::AlreadyRegistered`).
+async fn register_worker_sql(
+    pool: PgPool,
+    worker_id: String,
+    queue: String,
+    storage_name: String,
+    layers: String,
+    lease_token: String,
+    stale_after_secs: i32,
+) -> Result<usize, String> {
+    with_conn(pool, move |conn| {
+        register_worker_sql_on(
+            conn,
+            &worker_id,
+            &queue,
+            &storage_name,
+            &layers,
+            &lease_token,
+            stale_after_secs,
         )
-        .bind::<Text, _>(&worker_id)
-        .bind::<Text, _>(&queue)
-        .bind::<Text, _>(&storage_name)
-        .bind::<Text, _>(&layers)
-        .bind::<Text, _>(&lease_token)
-        .bind::<Integer, _>(stale_after_secs)
-        .execute(conn)
         .map_err(|e| e.to_string())
     })
     .await
@@ -903,6 +886,117 @@ fn register_stored_token_equals(
 }
 
 // --------------------------------------------------------------------------
+// register_worker_blocking: advisory-lock contention drives affected=0
+//
+// The production statement wraps the INSERT in a CTE that calls
+// `pg_try_advisory_xact_lock(hashtext($1), hashtext($2))` and gates the
+// INSERT-SELECT on `WHERE acquired`. When a *peer* transaction already holds
+// that xact-scoped lock for the same `(worker_id, worker_type)` pair, the
+// try-lock returns FALSE, the INSERT-SELECT produces no row, and affected=0 —
+// which production maps to `Error::AlreadyRegistered`. This is a distinct path
+// to affected=0 from the incumbent-token-mismatch case in the matrix above:
+// here there is *no* incumbent row at all, so the block is attributable solely
+// to the advisory lock.
+// --------------------------------------------------------------------------
+
+/// `pg_try_advisory_lock` keys are derived from `hashtext` per the production
+/// statement; this row is the boolean outcome of the holding transaction's
+/// lock acquisition.
+#[derive(Debug, QueryableByName)]
+struct AdvisoryLockRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    acquired: bool,
+}
+
+/// Holds the `(worker_id, queue)` advisory lock on a dedicated connection's
+/// open transaction while a *second* connection runs the production register
+/// path, then releases the lock. Because the lock is xact-scoped, the holding
+/// transaction must stay open (BEGIN, never committed) across the register
+/// call; we `ROLLBACK` at the end to release it deterministically rather than
+/// relying on connection drop. Returns the register call's affected-row count.
+async fn run_register_under_advisory_contention() -> Result<Outcome<RegisterRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-worker-reg-lock-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-reg-lock-worker-{queue}");
+
+    let work_pool = pool.clone();
+    let work_queue = queue.clone();
+    let work_worker_id = worker_id.clone();
+    let affected = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        // Connection A holds the lock; connection B runs the register. Two
+        // distinct pooled connections so A's open transaction does not block
+        // B's statement at the connection level.
+        let mut holder = work_pool.get().map_err(|e| e.to_string())?;
+        let mut registrar = work_pool.get().map_err(|e| e.to_string())?;
+
+        // A: BEGIN, grab the xact-scoped advisory lock for this (id, queue).
+        sql_query("BEGIN")
+            .execute(&mut holder)
+            .map_err(|e| e.to_string())?;
+        let lock =
+            sql_query("SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired")
+                .bind::<Text, _>(&work_worker_id)
+                .bind::<Text, _>(&work_queue)
+                .get_result::<AdvisoryLockRow>(&mut holder)
+                .map_err(|e| e.to_string())?;
+        if !lock.acquired {
+            // Defensive: a clean DB should always grant the lock here. If it
+            // does not, the contention precondition is not established and the
+            // assertion below would be meaningless.
+            let _ = sql_query("ROLLBACK").execute(&mut holder);
+            return Err(
+                "holder failed to acquire the advisory lock; cannot establish contention".into(),
+            );
+        }
+
+        // B: run the production register path with a fresh lease token while A
+        // still holds the lock. The try-lock inside the statement must return
+        // FALSE, gating out the INSERT-SELECT → affected=0.
+        let affected = register_worker_sql_on(
+            &mut registrar,
+            &work_worker_id,
+            &work_queue,
+            "PostgresStorage",
+            "",
+            "contended-token",
+            30,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // A: release the xact-scoped lock (auto-releases at xact end, but be
+        // explicit so the pooled connection returns clean).
+        sql_query("ROLLBACK")
+            .execute(&mut holder)
+            .map_err(|e| e.to_string())?;
+
+        Ok(affected)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let stored = worker_row(pool.clone(), queue.clone(), worker_id.clone()).await?;
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(RegisterRun {
+        affected,
+        stored_lease_token: stored.and_then(|w| w.lease_token),
+    }))
+}
+
+fn register_left_no_row() -> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
+    observe::<RegisterRun, _>("register stored no row", |run| {
+        match &run.stored_lease_token {
+            None => Ok(()),
+            Some(t) => Err(format!(
+                "expected no workers row to be inserted under lock contention, found lease_token={t:?}"
+            )),
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // keep_alive: characteristic matrix
 // --------------------------------------------------------------------------
 
@@ -1207,6 +1301,19 @@ lets_expect! { #tokio_test
             };
             to allows_the_takeover { register_inserted_one_row() }
             to rotates_the_lease_token { register_stored_token_equals("new-token") }
+        }
+    }
+
+    // ----- register_worker_blocking: advisory-lock contention -------------
+    // The `WHERE acquired` CTE gate is a second, distinct path to affected=0
+    // (→ AlreadyRegistered): a peer transaction holding the xact-scoped
+    // `(worker_id, worker_type)` advisory lock makes the in-statement
+    // `pg_try_advisory_xact_lock` return FALSE, so the INSERT-SELECT yields no
+    // row even though no incumbent workers row exists.
+    expect(run_register_under_advisory_contention().await) {
+        when a_peer_holds_the_registration_advisory_lock {
+            to refuses_to_register_while_the_lock_is_held { register_was_blocked() }
+            to inserts_no_workers_row { register_left_no_row() }
         }
     }
 

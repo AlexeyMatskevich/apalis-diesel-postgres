@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While
 the crate is pre-1.0, a minor version bump may carry breaking changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `list_queues()` (the `ListQueues` admin trait) silently returned an empty
+  `stats` list for any queue with no completed jobs: in that state the
+  per-queue `AVG_JOB_DURATION_MINS` aggregate is SQL `NULL`, which serialized
+  to a JSON `null` that cannot decode into `apalis_core::Statistic` (whose
+  `value` is a non-optional `String`); the whole `Vec<Statistic>` decode then
+  failed and was defaulted to empty, dropping *every* stat for the queue. The
+  `queue_stats` CTE now `COALESCE`s null stat values to `"0"` (matching the
+  single-stat metrics path), so a queue with jobs always reports its full
+  stat set. A new `spec_queries_admin` scenario pins the `PENDING_JOBS` /
+  `TOTAL_JOBS` titles so the regression cannot recur unobserved.
+
 ## [0.4.0]
 
 ### Fixed

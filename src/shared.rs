@@ -316,11 +316,8 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
         &mut self,
         config: Self::Config,
     ) -> Result<Self::Backend, Self::MakeError> {
-        let (sender, receiver) = mpsc::channel(
-            config
-                .buffer_size()
-                .clamp(1, crate::queries::NOTIFY_CHANNEL_CAPACITY_MAX),
-        );
+        let (sender, receiver) =
+            mpsc::channel(crate::queries::clamp_notify_capacity(config.buffer_size()));
         let mut registry = self
             .registry
             .lock()
@@ -617,6 +614,45 @@ mod tests {
         drop_leaves_remaining("shared-target", &["shared-other-a", "shared-other-b"])
     }
 
+    /// Identity-strengthened sibling-drop check: a bare count cannot tell a
+    /// correct drop (the target's entry removed, both siblings kept) from a
+    /// broken one that removed the wrong key but landed on the same total.
+    /// Build the same target + two siblings, drop the `shared-target`
+    /// registration, and return `(remaining_len,
+    /// only_the_target_was_removed)` where the bool asserts the *target* key is
+    /// gone while *both* named siblings remain. Mirrors
+    /// `broadcast_notify_error_observation`'s identity assertion.
+    fn drop_siblings_keeps_their_identities() -> (usize, bool) {
+        let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let target_id = Ulid::new();
+        {
+            let mut reg = registry
+                .lock()
+                .expect("fresh shared registry is not poisoned");
+            let (sender, _r) = mpsc::channel(1);
+            reg.insert("shared-target".to_owned(), vec![(target_id, sender)]);
+            for sibling in ["shared-other-a", "shared-other-b"] {
+                let (sender, _r) = mpsc::channel(1);
+                reg.insert(sibling.to_owned(), vec![(Ulid::new(), sender)]);
+            }
+        }
+
+        drop(SharedRegistration {
+            id: target_id,
+            queue: "shared-target".to_owned(),
+            registry: registry.clone(),
+            pool: unchecked_pool(),
+        });
+
+        let reg = registry
+            .lock()
+            .expect("fresh shared registry is not poisoned");
+        let only_target_removed = !reg.contains_key("shared-target")
+            && reg.contains_key("shared-other-a")
+            && reg.contains_key("shared-other-b");
+        (reg.len(), only_target_removed)
+    }
+
     /// Drop of one registration on a queue with two consumers must leave the
     /// other sender intact. Regression test for the bug where
     /// `registry.remove(&queue)` wiped the whole entry, severing the second
@@ -769,6 +805,69 @@ mod tests {
             .get("shared-deliver-full")
             .map(Vec::len)
             .unwrap_or(0)
+    }
+
+    /// `deliver_to_queue`'s central contract per its doc comment — broadcasting
+    /// one id to *every* sender bound to the queue — fanned out to MORE than one
+    /// live consumer. Both receivers are held open so neither is pruned; the
+    /// single id is broadcast and each receiver is drained, asserting it carries
+    /// exactly that id. Returns `(first_got_the_id, second_got_the_id)` — `(true,
+    /// true)` when both senders received the wake-up. A delivery that targeted
+    /// only one (e.g. the last) sender would surface here as a `false`.
+    fn deliver_broadcasts_id_to_every_live_sender() -> (bool, bool) {
+        let mut registry: RegistryMap = HashMap::new();
+        let (first_sender, mut first_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (second_sender, mut second_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        registry.insert(
+            "shared-deliver-fanout".to_owned(),
+            vec![(Ulid::new(), first_sender), (Ulid::new(), second_sender)],
+        );
+        let id = new_task_id();
+        deliver_to_queue(&mut registry, "shared-deliver-fanout", &[id]);
+
+        let got_id = |receiver: &mut Receiver<Result<PgTaskId, Error>>| matches!(receiver.try_recv(), Ok(Ok(got)) if got == id);
+        (got_id(&mut first_receiver), got_id(&mut second_receiver))
+    }
+
+    /// `deliver_to_queue` aimed at a queue that has NO registered consumers (a
+    /// real runtime state: a NOTIFY arrives for a job_type no one is polling) is
+    /// a no-op — the `get_mut(queue)` None arm. It must not panic, must not
+    /// create an entry for the absent queue, and must leave the one unrelated
+    /// queue's live sender untouched. Returns `(unrelated_queue_sender_count,
+    /// absent_queue_was_created)`.
+    fn deliver_to_absent_queue_leaves_others_intact() -> (usize, bool) {
+        let mut registry: RegistryMap = HashMap::new();
+        let (sender, _receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        registry.insert("shared-other".to_owned(), vec![(Ulid::new(), sender)]);
+        deliver_to_queue(&mut registry, "shared-absent", &[new_task_id()]);
+        let unrelated_len = registry.get("shared-other").map(Vec::len).unwrap_or(0);
+        let absent_created = registry.contains_key("shared-absent");
+        (unrelated_len, absent_created)
+    }
+
+    /// `broadcast_notify_error_locked` must KEEP a sender whose channel is full
+    /// but still connected — only a disconnected sender is pruned. The receiver
+    /// is held open and the single-slot buffer is pre-saturated so the broadcast's
+    /// one `try_send` reports `Full`, not `Disconnected`. Returns the number of
+    /// senders still registered on the queue — 1 when the back-pressured sender
+    /// is retained. Mirrors `deliver_keeps_full_sender`, the symmetric branch on
+    /// `deliver_to_queue`.
+    fn broadcast_notify_error_keeps_full_sender() -> usize {
+        let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (mut full_sender, _full_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        // Saturate the single-slot channel so the broadcast's `try_send` hits
+        // the `Full` (kept) path rather than the empty `Ok` path.
+        while full_sender.try_send(Ok(new_task_id())).is_ok() {}
+        registry
+            .lock()
+            .expect("fresh registry is not poisoned")
+            .insert(
+                "shared-error-full".to_owned(),
+                vec![(Ulid::new(), full_sender)],
+            );
+        broadcast_notify_error(&registry, "synthetic listener failure".to_owned());
+        let reg = registry.lock().expect("registry is not poisoned");
+        reg.get("shared-error-full").map(Vec::len).unwrap_or(0)
     }
 
     fn empty_registry() -> RegistryMap {
@@ -953,6 +1052,14 @@ mod tests {
             }
         }
 
+        expect(drop_siblings_keeps_their_identities()) {
+            when dropping_one_of_several_registrations_with_siblings_present {
+                to removes_only_the_dropped_queue_and_keeps_both_named_siblings {
+                    equal((2_usize, true))
+                }
+            }
+        }
+
         expect(drop_one_of_two_keeps_sibling_sender()) {
             when dropping_one_of_two_consumers_on_the_same_queue {
                 to leaves_the_other_senders_sender_in_place { equal(1) }
@@ -982,6 +1089,12 @@ mod tests {
             }
         }
 
+        expect(broadcast_notify_error_keeps_full_sender()) {
+            when a_senders_channel_is_full_but_still_connected {
+                to keeps_the_back_pressured_sender_registered { equal(1) }
+            }
+        }
+
         expect(deliver_prunes_disconnected_sender()) {
             when a_queues_only_sender_has_a_dropped_receiver {
                 to prunes_the_disconnected_sender_and_removes_the_empty_queue { equal(0) }
@@ -991,6 +1104,20 @@ mod tests {
         expect(deliver_keeps_full_sender()) {
             when a_queues_sender_channel_is_full_but_still_connected {
                 to keeps_the_back_pressured_sender_registered { equal(1) }
+            }
+        }
+
+        expect(deliver_broadcasts_id_to_every_live_sender()) {
+            when a_queue_has_multiple_live_consumers {
+                to broadcasts_the_wakeup_id_to_every_sender { equal((true, true)) }
+            }
+        }
+
+        expect(deliver_to_absent_queue_leaves_others_intact()) {
+            when a_notification_targets_a_queue_with_no_registered_consumers {
+                to leaves_other_queues_untouched_and_creates_no_entry {
+                    equal((1_usize, false))
+                }
             }
         }
 

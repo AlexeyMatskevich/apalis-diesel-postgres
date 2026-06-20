@@ -23,12 +23,16 @@
 //!     across terminal rows, secondary run_at DESC tie-break.
 //!   - `list_tasks` pagination — page=1/page=2 carve disjoint slices, page=0
 //!     surfaces `InvalidArgument`.
-//!   - `list_all_tasks` — same filter+pagination, but cross-queue: rows from
-//!     different `job_type`s coexist in the response.
+//!   - `list_all_tasks` — the global listing's own axes: `page=0` surfaces
+//!     `InvalidArgument` via `filter_offset_i32`, and a non-zero OFFSET shifts
+//!     the result past the first global row (the cross-queue "rows from many
+//!     job_types coexist" property is owned by `run_listing_metrics`, not here).
 //!   - `list_queues` — a queue with only `apalis.workers` rows (no jobs) still
-//!     appears via the `all_job_types` UNION.
-//!   - `metrics_for_queue` — basic counts on a queue with one row of each
-//!     terminal status (Done/Failed/Killed) + Pending.
+//!     appears via the `all_job_types` UNION, AND a jobs-backed queue surfaces
+//!     its `queue_stats` CTE counts (PENDING_JOBS / TOTAL_JOBS) in `stats`.
+//!   - `metrics_for_queue` — counts on a queue mixing active (Pending / Running
+//!     / Queued) and terminal (Done / Failed / Killed) rows, including the
+//!     RUNNING_JOBS and ACTIVE_JOBS active-state filters.
 //!   - `metrics_global` — non-scoped variant still emits the static metrics
 //!     (DB_PAGE_SIZE, DB_PAGE_COUNT, DB_SIZE).
 //!
@@ -38,6 +42,8 @@
 #![cfg(feature = "tokio")]
 
 mod support;
+
+use support::{Outcome, observe, with_conn};
 
 use std::{
     str::FromStr,
@@ -50,56 +56,14 @@ use apalis_core::{
 };
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 use diesel::{
-    PgConnection, RunQueryDsl, sql_query,
+    RunQueryDsl, sql_query,
     sql_types::{Integer, Text},
 };
-use lets_expect::{AssertionError, AssertionResult, *};
+use lets_expect::{AssertionResult, *};
 use ulid::Ulid;
-
-// --------------------------------------------------------------------------
-// shared scaffolding (kept local — concurrent edits in postgres_specs.rs or
-// spec_queries_worker.rs shouldn't conflict with this file).
-// --------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
-}
-
-fn observe<T, F>(
-    label: &'static str,
-    body: F,
-) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
-where
-    F: Fn(&T) -> Result<(), String>,
-{
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "{label}: scenario failed: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(run)) => {
-            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
-        }
-    }
-}
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
     support::shared_pool().await
-}
-
-async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
-where
-    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        work(&mut conn)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -663,66 +627,60 @@ fn pagination_rejected_as_invalid_argument() -> impl Fn(&PaginationRun) -> Asser
 }
 
 // --------------------------------------------------------------------------
-// list_all_tasks: rows from multiple queues coexist
+// list_all_tasks: this file owns the validation + pagination axes of the
+// global listing. The cross-queue "rows from many job_types coexist" property
+// is already owned by `run_listing_metrics` (postgres_queries.rs:
+// list_all_tasks_covers_all_queues), so we do NOT re-test it here. Instead we
+// pin (a) `page=0` surfacing `InvalidArgument` via `filter_offset_i32` — the
+// same routing as `list_tasks`, but never exercised through `list_all_tasks`
+// across the suite — and (b) a non-zero OFFSET carving the correct slice.
 // --------------------------------------------------------------------------
 
-#[derive(Debug)]
-struct ListAllRun {
-    queue_a_id: String,
-    queue_b_id: String,
-    returned_ids: Vec<String>,
-}
-
-async fn run_list_all_cross_queue() -> Result<Outcome<ListAllRun>, String> {
+async fn run_list_all_page_zero() -> Result<Outcome<PaginationOutcome>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue_a = format!("apalis-spec-admin-all-a-{}", Ulid::new());
-    let queue_b = format!("apalis-spec-admin-all-b-{}", Ulid::new());
-    cleanup_queue(pool.clone(), queue_a.clone()).await?;
-    cleanup_queue(pool.clone(), queue_b.clone()).await?;
+    let queue = format!("apalis-spec-admin-all-page0-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    // One row is enough; the page=0 validation rejects before any scan.
+    let _ = insert_job(pool.clone(), queue.clone(), "Pending", 5, None, 0, 3).await?;
 
-    let a_id = insert_job(pool.clone(), queue_a.clone(), "Pending", 5, None, 0, 3).await?;
-    let b_id = insert_job(pool.clone(), queue_b.clone(), "Pending", 5, None, 0, 3).await?;
-
-    // `list_all_tasks` doesn't filter by job_type, so any storage instance
-    // can read it. The configured queue is irrelevant here.
-    let config = Config::new(&queue_a);
+    let config = Config::new(&queue);
     let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let result = storage
+        .list_all_tasks(&filter(Status::Pending, 0, Some(2)))
+        .await;
 
-    // Use a large page size to make sure both rows are in the slice even if
-    // the global table has many other Pending rows from concurrent tests.
-    let listed = storage
-        .list_all_tasks(&filter(Status::Pending, 1, Some(1000)))
-        .await
-        .map_err(|e| e.to_string())?;
-    let returned_ids: Vec<String> = listed
-        .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
-        .collect();
+    let outcome = match result {
+        Ok(tasks) => PaginationOutcome::Ok {
+            ids: tasks
+                .into_iter()
+                .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                .collect(),
+        },
+        Err(err) => {
+            let s = err.to_string();
+            if s.to_ascii_lowercase().contains("filter.page")
+                || s.to_ascii_lowercase().contains("invalid")
+            {
+                PaginationOutcome::InvalidArgument
+            } else {
+                PaginationOutcome::OtherError(s)
+            }
+        }
+    };
 
-    cleanup_queue(pool.clone(), queue_a).await?;
-    cleanup_queue(pool, queue_b).await?;
-    Ok(Outcome::Completed(ListAllRun {
-        queue_a_id: a_id,
-        queue_b_id: b_id,
-        returned_ids,
-    }))
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(outcome))
 }
 
-fn list_all_returns_rows_from_both_queues()
--> impl Fn(&Result<Outcome<ListAllRun>, String>) -> AssertionResult {
-    observe::<ListAllRun, _>("list_all cross-queue", |run| {
-        let has_a = run.returned_ids.contains(&run.queue_a_id);
-        let has_b = run.returned_ids.contains(&run.queue_b_id);
-        if has_a && has_b {
-            Ok(())
-        } else {
-            Err(format!(
-                "expected both queue_a={} and queue_b={} ids in result, got has_a={has_a} has_b={has_b}",
-                run.queue_a_id, run.queue_b_id
-            ))
-        }
+fn list_all_page_zero_rejected_as_invalid_argument()
+-> impl Fn(&Result<Outcome<PaginationOutcome>, String>) -> AssertionResult {
+    observe::<PaginationOutcome, _>("list_all page=0", |run| match run {
+        PaginationOutcome::InvalidArgument => Ok(()),
+        other => Err(format!(
+            "expected InvalidArgument error for list_all_tasks page=0, got {other:?}"
+        )),
     })
 }
 
@@ -778,6 +736,82 @@ fn workers_only_queue_appears_in_list()
 }
 
 // --------------------------------------------------------------------------
+// list_queues: a jobs-backed queue surfaces its `queue_stats` CTE in
+// `QueueInfo.stats`. Pins the `queue_stats` aggregation + the
+// `COALESCE(qs.stats, '[]') AS stats` join so a drift that empties or
+// miswires the stats JSON goes RED (the workers-only scenario above only
+// exercises the empty-stats `[]` branch).
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct QueueStatsRun {
+    /// Stat titles present on the seeded queue's `QueueInfo.stats`.
+    stat_titles: Vec<String>,
+    /// Value reported for the `PENDING_JOBS` stat, if present.
+    pending_jobs_value: Option<String>,
+}
+
+async fn run_queue_stats_for_jobs_backed_queue() -> Result<Outcome<QueueStatsRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-queue-stats-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    // One Pending job, so PENDING_JOBS = 1 and TOTAL_JOBS = 1.
+    let _ = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
+
+    let config = Config::new(&queue);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let queues = storage.list_queues().await.map_err(|e| e.to_string())?;
+
+    let info = queues
+        .into_iter()
+        .find(|q| q.name == queue)
+        .ok_or_else(|| format!("seeded queue {queue} missing from list_queues"))?;
+    let stat_titles: Vec<String> = info.stats.iter().map(|s| s.title.clone()).collect();
+    let pending_jobs_value = info
+        .stats
+        .iter()
+        .find(|s| s.title == "PENDING_JOBS")
+        .map(|s| s.value.clone());
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(QueueStatsRun {
+        stat_titles,
+        pending_jobs_value,
+    }))
+}
+
+fn queue_stats_carry_pending_and_total_titles()
+-> impl Fn(&Result<Outcome<QueueStatsRun>, String>) -> AssertionResult {
+    observe::<QueueStatsRun, _>("queue_stats CTE titles", |run| {
+        for title in ["PENDING_JOBS", "TOTAL_JOBS"] {
+            if !run.stat_titles.iter().any(|t| t == title) {
+                return Err(format!(
+                    "expected queue stats to include {title}, got {:?}",
+                    run.stat_titles
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+fn queue_stats_report_one_pending_job()
+-> impl Fn(&Result<Outcome<QueueStatsRun>, String>) -> AssertionResult {
+    observe::<QueueStatsRun, _>("queue_stats PENDING_JOBS value", |run| {
+        let Some(value) = run.pending_jobs_value.as_ref() else {
+            return Err("expected PENDING_JOBS stat to be present".into());
+        };
+        if value == "1" {
+            Ok(())
+        } else {
+            Err(format!("expected PENDING_JOBS value \"1\", got {value:?}"))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // metrics_for_queue: terminal-status counts surface correctly
 // --------------------------------------------------------------------------
 
@@ -787,6 +821,8 @@ struct MetricsRun {
     failed_jobs: Option<String>,
     killed_jobs: Option<String>,
     pending_jobs: Option<String>,
+    running_jobs: Option<String>,
+    active_jobs: Option<String>,
     total_jobs: Option<String>,
 }
 
@@ -797,11 +833,14 @@ async fn run_metrics_terminal_mix() -> Result<Outcome<MetricsRun>, String> {
     let queue = format!("apalis-spec-admin-metrics-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    // Seed: 2 Pending, 1 Done, 1 Failed (terminal), 1 Killed. The `_now`
-    // offsets put run_at within the past few seconds so window-scoped
-    // metrics also catch them.
+    // Seed: 2 Pending, 1 Running, 1 Queued (both active, non-terminal),
+    // 1 Done, 1 Failed (terminal), 1 Killed. The small run_at offsets put
+    // run_at within the past few seconds so window-scoped metrics also catch
+    // them. ACTIVE_JOBS = Pending + Queued + Running = 4; TOTAL_JOBS = 7.
     let _ = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
     let _ = insert_job(pool.clone(), queue.clone(), "Pending", 2, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Running", 5, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Queued", 5, None, 0, 3).await?;
     let _ = insert_job(pool.clone(), queue.clone(), "Done", 5, Some(1), 1, 3).await?;
     let _ = insert_job(pool.clone(), queue.clone(), "Failed", 5, Some(1), 3, 3).await?;
     let _ = insert_job(pool.clone(), queue.clone(), "Killed", 5, Some(1), 1, 3).await?;
@@ -822,6 +861,8 @@ async fn run_metrics_terminal_mix() -> Result<Outcome<MetricsRun>, String> {
         failed_jobs: by_title("FAILED_JOBS"),
         killed_jobs: by_title("KILLED_JOBS"),
         pending_jobs: by_title("PENDING_JOBS"),
+        running_jobs: by_title("RUNNING_JOBS"),
+        active_jobs: by_title("ACTIVE_JOBS"),
         total_jobs: by_title("TOTAL_JOBS"),
     };
 
@@ -843,6 +884,8 @@ fn metric_count_approx_equals(
             "FAILED_JOBS" => &run.failed_jobs,
             "KILLED_JOBS" => &run.killed_jobs,
             "PENDING_JOBS" => &run.pending_jobs,
+            "RUNNING_JOBS" => &run.running_jobs,
+            "ACTIVE_JOBS" => &run.active_jobs,
             "TOTAL_JOBS" => &run.total_jobs,
             other => return Err(format!("unsupported metric title in matcher: {other}")),
         };
@@ -1041,11 +1084,11 @@ lets_expect! { #tokio_test
         }
     }
 
-    // ----- list_all_tasks crosses job_type boundaries ---------------------
-    expect(run_list_all_cross_queue().await) {
-        when two_pending_rows_live_in_two_different_queues {
-            to returns_rows_from_both_queues_because_list_all_drops_the_job_type_filter {
-                list_all_returns_rows_from_both_queues()
+    // ----- list_all_tasks page=0 validation -------------------------------
+    expect(run_list_all_page_zero().await) {
+        when the_global_listing_is_requested_with_page_zero {
+            to surfaces_invalid_argument_via_filter_offset_i32 {
+                list_all_page_zero_rejected_as_invalid_argument()
             }
         }
     }
@@ -1059,14 +1102,28 @@ lets_expect! { #tokio_test
         }
     }
 
+    // ----- list_queues stats CTE surfaces per-queue counts ----------------
+    expect(run_queue_stats_for_jobs_backed_queue().await) {
+        when a_queue_has_one_pending_job {
+            to surfaces_pending_and_total_titles_from_the_queue_stats_cte {
+                queue_stats_carry_pending_and_total_titles()
+            }
+            to reports_one_pending_job_in_its_stats { queue_stats_report_one_pending_job() }
+        }
+    }
+
     // ----- metrics_for_queue counts ---------------------------------------
     expect(run_metrics_terminal_mix().await) {
-        when a_queue_has_one_row_of_each_terminal_status_and_two_pending_rows {
+        when a_queue_mixes_active_pending_running_queued_and_terminal_rows {
             to reports_two_pending_jobs { metric_value_is("PENDING_JOBS", 2.0) }
+            to reports_one_running_job { metric_value_is("RUNNING_JOBS", 1.0) }
+            to reports_active_jobs_as_pending_plus_running_plus_queued {
+                metric_value_is("ACTIVE_JOBS", 4.0)
+            }
             to reports_one_done_job { metric_value_is("DONE_JOBS", 1.0) }
             to reports_one_failed_job { metric_value_is("FAILED_JOBS", 1.0) }
             to reports_one_killed_job { metric_value_is("KILLED_JOBS", 1.0) }
-            to reports_total_of_five_jobs { metric_value_is("TOTAL_JOBS", 5.0) }
+            to reports_total_of_seven_jobs { metric_value_is("TOTAL_JOBS", 7.0) }
         }
     }
 
