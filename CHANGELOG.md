@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While
 the crate is pre-1.0, a minor version bump may carry breaking changes.
 
-## [Unreleased]
+## [0.4.1]
 
 ### Fixed
 
@@ -175,7 +175,7 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 See the git history for changes before this changelog was introduced.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.0...HEAD
+[0.4.1]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.1.1...v0.2.0
