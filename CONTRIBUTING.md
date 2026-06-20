@@ -23,12 +23,10 @@ Before opening a pull request, run:
 
 ```sh
 cargo fmt --all -- --check
-cargo check --locked --no-default-features
 cargo check --locked --features tokio
 cargo check --locked --features ntex
 cargo check --locked --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
-env -u DATABASE_URL cargo test --locked --no-default-features --lib
 env -u DATABASE_URL cargo test --locked --features tokio --lib
 env -u DATABASE_URL cargo test --locked --features ntex --lib
 env -u DATABASE_URL cargo test --locked --all-features --lib
@@ -37,6 +35,10 @@ APALIS_DIESEL_POSTGRES_REQUIRE_DATABASE=1 cargo test --locked --all-features \
 cargo test --locked --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 ```
+
+There is deliberately no `--no-default-features` command: building without a
+runtime feature (`tokio` or `ntex`) is a `compile_error!` by design (see
+`src/runtime.rs`), so such a build is expected to fail rather than be a check.
 
 If you only need to run the non-database unit tests, unset `DATABASE_URL`:
 

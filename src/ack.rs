@@ -861,6 +861,17 @@ pub(crate) fn calculate_status<Res>(
 /// [`lock_task_in_queue`] which scopes the lock to a specific queue and
 /// prevents a caller that learned a `Ulid` from logs or dashboards from
 /// claiming it under an unrelated queue.
+///
+/// # Errors
+/// - [`Error::TaskNotFound`] if the task is absent or not currently lockable
+///   (delayed, completed, or already locked by another worker). This entry
+///   point does not filter by queue, so a task in another queue is still
+///   locked rather than reported missing.
+/// - [`Error::Database`] for SQL/driver failures, including the foreign-key
+///   violation raised when `worker_id` is not registered for the queue.
+/// - [`Error::Pool`] if a pooled connection cannot be acquired.
+/// - [`Error::Blocking`] if the blocking task carrying the query fails to
+///   complete (a panic in the worker thread, or runtime shutdown).
 pub async fn lock_task(pool: &PgPool, task_id: &Ulid, worker_id: &str) -> Result<(), Error> {
     queries::lock_task(pool.clone(), *task_id, worker_id.to_owned(), None).await
 }
@@ -871,6 +882,14 @@ pub async fn lock_task(pool: &PgPool, task_id: &Ulid, worker_id: &str) -> Result
 /// knows the task's `Ulid` cannot accidentally (or maliciously) lock a task
 /// belonging to another queue. Use this in any code path that does not derive
 /// the queue from a trusted `WorkerContext`.
+///
+/// # Errors
+/// Same as [`lock_task`], except [`Error::TaskNotFound`] is also returned when
+/// the task exists but belongs to a different queue: [`Error::TaskNotFound`]
+/// when the task is absent or not lockable within `queue`, [`Error::Database`]
+/// for SQL/driver failures (including an unregistered worker), [`Error::Pool`]
+/// if a pooled connection cannot be acquired, and [`Error::Blocking`] if the
+/// blocking task fails to complete.
 pub async fn lock_task_in_queue(
     pool: &PgPool,
     task_id: &Ulid,

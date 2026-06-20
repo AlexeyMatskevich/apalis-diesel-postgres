@@ -5,6 +5,13 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
 use crate::{Error, PgPool, queries::with_conn};
 
+/// Embedded Apalis-compatible migrations bundled into the crate binary.
+///
+/// [`setup`](crate::setup) applies these for you; this constant is exposed for
+/// callers that run migrations out-of-band through their own
+/// [`diesel_migrations`] harness (a dedicated CI/ops step, a shared migration
+/// runner) instead of from the application process. After such a run,
+/// [`verify_schema`](crate::verify_schema) confirms the database is up to date.
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 /// Acquire/release a **session-level** advisory lock that serializes concurrent

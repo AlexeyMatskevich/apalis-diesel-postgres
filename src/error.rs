@@ -505,11 +505,15 @@ mod tests {
             "locking task",
             "task-1",
             None,
-            "the task may be delayed, already locked by another worker, completed, or in another queue",
+            "the task may be delayed, already locked by another worker, or completed",
         )) {
             when queue_is_not_constrained {
+                // Mirrors the unscoped `lock_task` path (queries/fetch.rs):
+                // a `None` queue both renders the `<not constrained>` placeholder
+                // and drops the "or in another queue" reason, which cannot apply
+                // when the lock is not filtered by queue.
                 to renders_the_unconstrained_placeholder {
-                    displays_as("task not found while locking task (task_id: task-1, queue: <not constrained>); the task may be delayed, already locked by another worker, completed, or in another queue")
+                    displays_as("task not found while locking task (task_id: task-1, queue: <not constrained>); the task may be delayed, already locked by another worker, or completed")
                 }
             }
         }

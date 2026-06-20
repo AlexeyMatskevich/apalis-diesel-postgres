@@ -206,12 +206,15 @@ pub(crate) fn lock_task(
         .load(conn)
         .map_err(Error::database("locking task"))?;
         if rows.is_empty() {
-            Err(Error::task_not_found(
-                "locking task",
-                task_id,
-                queue,
-                "the task may be delayed, already locked by another worker, completed, or in another queue",
-            ))
+            // Only the queue-scoped call (`$3 = job_type`) can fail because the
+            // task lives in a different queue; the unscoped call (`$3 IS NULL`)
+            // locks across queues, so its hint must not list that reason.
+            let hint = if queue.is_some() {
+                "the task may be delayed, already locked by another worker, completed, or in another queue"
+            } else {
+                "the task may be delayed, already locked by another worker, or completed"
+            };
+            Err(Error::task_not_found("locking task", task_id, queue, hint))
         } else {
             Ok(())
         }

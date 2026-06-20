@@ -25,6 +25,8 @@ Targets the Apalis 1.0 release candidate: `apalis-core 1.0.0-rc.9`,
 `apalis-sql 1.0.0-rc.9`, `apalis-codec 0.1.0-rc.9`, `diesel 2.3`. Schema
 compatible with Apalis SQL storage (`apalis.jobs`, `apalis.workers`).
 
+MSRV: Rust 1.88.
+
 ## Installation
 
 ```toml
@@ -78,7 +80,7 @@ let storage = PostgresStorage::<SendEmail>::new_with_config(
 To enqueue tasks from a request handler atomically with business data, see
 the [outbox section](#transactional-enqueue-outbox-pattern). To run the
 example end-to-end against a real database, see
-[`examples/outbox.rs`](examples/outbox.rs):
+[`examples/outbox.rs`](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/master/examples/outbox.rs):
 
 ```sh
 DATABASE_URL=postgres://127.0.0.1:5432/apalis_diesel_postgres \
@@ -193,7 +195,7 @@ let worker = WorkerBuilder::new("emails-worker")
 # }
 ```
 
-End-to-end runnable example: [`examples/worker.rs`](examples/worker.rs).
+End-to-end runnable example: [`examples/worker.rs`](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/master/examples/worker.rs).
 
 ```sh
 DATABASE_URL=postgres://127.0.0.1:5432/apalis_diesel_postgres \
@@ -279,7 +281,7 @@ let mut task = PgTask::<Reminder>::new(Reminder { order_id });
 task.parts.idempotency_key = Some(format!("reminder:{order_id}"));
 task.parts.run_at = SystemTime::now()
     .duration_since(UNIX_EPOCH)
-    .unwrap()
+    .unwrap_or_default() // now() predates UNIX_EPOCH only on a broken clock
     .as_secs()
     + 24 * 3600; // tomorrow
 
@@ -380,7 +382,7 @@ the listener is alive — size the apalis pool accordingly.
 
 ## Examples
 
-[`examples/outbox.rs`](examples/outbox.rs) — runnable, demonstrates commit /
+[`examples/outbox.rs`](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/master/examples/outbox.rs) — runnable, demonstrates commit /
 rollback / idempotency-conflict behaviour against a real database:
 
 ```sh
@@ -452,7 +454,8 @@ and stores data in `./.pgdata`. Editor config for Zed is generated automatically
 opt in to MCP config with `APALIS_DIESEL_POSTGRES_WRITE_MCP=1 nix develop`.
 
 For the full pre-PR check list (`cargo fmt`, multiple `cargo check`/`cargo
-test` matrices, doc warnings), see [CONTRIBUTING.md](CONTRIBUTING.md). The
+test` matrices, doc warnings), see
+[CONTRIBUTING.md](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/master/CONTRIBUTING.md). The
 quick smoke path is:
 
 ```sh

@@ -12,6 +12,11 @@ use crate::{Error, PgPool};
 /// pooled connection for the lifetime of the listener; size the pool with that
 /// in mind. Use [`build_pool_with`] to override `max_size`, timeouts, or other
 /// r2d2 options.
+///
+/// # Errors
+/// Returns [`Error::Pool`] if r2d2 cannot establish the pool's initial
+/// connection — for example when `database_url` is malformed or the server is
+/// unreachable.
 pub fn build_pool(database_url: impl AsRef<str>) -> Result<PgPool, Error> {
     build_pool_with(database_url, |builder| builder)
 }
@@ -20,6 +25,11 @@ pub fn build_pool(database_url: impl AsRef<str>) -> Result<PgPool, Error> {
 ///
 /// The `configure` callback receives a [`diesel::r2d2::Builder`] and can chain calls
 /// such as `.max_size(32)`, `.connection_timeout(...)`, or `.min_idle(...)`.
+///
+/// # Errors
+/// Returns [`Error::Pool`] if r2d2 cannot establish the pool's initial
+/// connection under the configured builder — for example when `database_url`
+/// is malformed or the server is unreachable.
 pub fn build_pool_with<F>(database_url: impl AsRef<str>, configure: F) -> Result<PgPool, Error>
 where
     F: FnOnce(Builder<ConnectionManager<PgConnection>>) -> Builder<ConnectionManager<PgConnection>>,
