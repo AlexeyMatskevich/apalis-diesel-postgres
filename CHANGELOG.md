@@ -20,6 +20,32 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   stat set. A new `spec_queries_admin` scenario pins the `PENDING_JOBS` /
   `TOTAL_JOBS` titles so the regression cannot recur unobserved.
 
+### Changed
+
+- The unscoped `lock_task` no longer lists "or in another queue" in its
+  `TaskNotFound` hint: that entry point does not filter by `job_type`, so a task
+  in another queue is locked rather than reported missing. `lock_task_in_queue`
+  keeps the queue-aware hint.
+
+### Documentation
+
+- Every public `Result`-returning function now carries an `# Errors` section
+  (`build_pool`, `build_pool_with`, `setup`, `verify_schema`,
+  `refresh_queue_stats_snapshot`, `lock_task`, `lock_task_in_queue`), matching
+  the convention already used by the outbox `push_*_with_conn` methods.
+- `MIGRATIONS` and the `schema` module are now documented, and the crate enables
+  `#![warn(missing_docs)]` and `#![warn(rustdoc::broken_intra_doc_links)]` so doc
+  coverage and intra-doc links cannot silently regress.
+- README links to `examples/*` and `CONTRIBUTING.md` are now absolute GitHub
+  URLs: as relative links they 404 when the README is rendered as the crate's
+  docs.rs landing page. Added an MSRV note (Rust 1.88) and removed an `unwrap()`
+  from the `push_task_with_conn` example.
+- `Cargo.toml` gained `[package.metadata.docs.rs]` (`all-features = true`,
+  `--cfg docsrs`) so docs.rs documents the `ntex` path alongside `tokio`.
+- `CONTRIBUTING.md` no longer lists `--no-default-features` check/test commands:
+  building without a runtime feature is an intentional `compile_error!`, so
+  those commands could never pass.
+
 ## [0.4.0]
 
 ### Fixed
@@ -148,3 +174,8 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 ## [0.2.0] and earlier
 
 See the git history for changes before this changelog was introduced.
+
+[Unreleased]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.1.1...v0.2.0
