@@ -684,9 +684,7 @@ mod tests {
         expect(next_backoff(backoff, Duration::from_secs(2))) {
             let backoff = Duration::from_millis(100);
 
-            when the_backoff_is_below_the_cap {
-                to doubles_the_backoff { equal(Duration::from_millis(200)) }
-            }
+            to doubles_the_backoff { equal(Duration::from_millis(200)) }
 
             when doubling_would_exceed_the_cap {
                 let backoff = Duration::from_millis(1_500);
@@ -702,9 +700,7 @@ mod tests {
         expect(db_errors_exhausted(error_streak, 3)) {
             let error_streak = 0u32;
 
-            when only_the_first_failure_has_occurred {
-                to keeps_retrying_with_backoff { be_false }
-            }
+            to keeps_retrying_with_backoff { be_false }
 
             when one_more_failure_would_reach_the_threshold {
                 let error_streak = 1u32;

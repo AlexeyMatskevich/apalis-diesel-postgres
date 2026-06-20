@@ -15,6 +15,8 @@
 
 mod support;
 
+use support::{Outcome, observe, with_conn};
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use apalis_diesel_postgres::{Config, Error as PgError, PgPool, PgTask, PgTaskId, PostgresStorage};
@@ -23,52 +25,15 @@ use diesel::{
     Connection, OptionalExtension, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{Integer, Jsonb, Text, Timestamptz},
 };
-use lets_expect::{AssertionError, AssertionResult, *};
+use lets_expect::{AssertionResult, *};
 use ulid::Ulid;
 
 // --------------------------------------------------------------------------
 // scaffolding
 // --------------------------------------------------------------------------
 
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
-}
-
-fn observe<T, F>(
-    label: &'static str,
-    body: F,
-) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
-where
-    F: Fn(&T) -> Result<(), String>,
-{
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "{label}: scenario failed: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(run)) => {
-            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
-        }
-    }
-}
-
 async fn test_pool() -> Result<Option<PgPool>, String> {
     support::shared_pool().await
-}
-
-async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
-where
-    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        work(&mut conn)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 async fn ensure_business_table(pool: PgPool) -> Result<(), String> {

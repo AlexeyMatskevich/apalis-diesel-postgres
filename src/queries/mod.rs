@@ -256,17 +256,31 @@ mod tests {
         }
     }
 
-    fn ulid_string() -> String {
-        Ulid::new().to_string()
+    fn task_result_killed_with_message(
+        result: &apalis_core::backend::TaskResult<String, Ulid>,
+    ) -> AssertionResult {
+        if result.status != Status::Killed {
+            return Err(AssertionError::new(vec![format!(
+                "expected Status::Killed, got {:?}",
+                result.status
+            )]));
+        }
+        match &result.result {
+            Err(message) if message == "boom" => Ok(()),
+            Err(other) => Err(AssertionError::new(vec![format!(
+                "expected Err message \"boom\", got {other:?}"
+            )])),
+            Ok(value) => Err(AssertionError::new(vec![format!(
+                "expected Err payload, got Ok({value:?})"
+            )])),
+        }
     }
 
     lets_expect! {
         expect(clamp_usize(value)) {
             let value = 5_usize;
 
-            when value_is_inside_i32_range {
-                to returns_the_value_as_i32 { equal(5_i32) }
-            }
+            to returns_the_value_as_i32 { equal(5_i32) }
 
             when value_is_zero {
                 let value = 0_usize;
@@ -287,8 +301,11 @@ mod tests {
         expect(clamp_u64(value)) {
             let value = 5_u64;
 
-            when value_is_inside_i32_range {
-                to returns_the_value_as_i32 { equal(5_i32) }
+            to returns_the_value_as_i32 { equal(5_i32) }
+
+            when value_is_zero {
+                let value = 0_u64;
+                to returns_zero { equal(0_i32) }
             }
 
             when value_equals_i32_max {
@@ -305,9 +322,7 @@ mod tests {
         expect(convert_u32(value)) {
             let value = 5_u32;
 
-            when value_fits_in_i32 {
-                to returns_ok_with_the_value { be_ok_and equal(5_i32) }
-            }
+            to returns_ok_with_the_value { be_ok_and equal(5_i32) }
 
             when value_equals_i32_max {
                 let value = i32::MAX as u32;
@@ -326,9 +341,7 @@ mod tests {
             let page = 1_u32;
             let page_size: Option<u32> = Some(20);
 
-            when page_is_one_with_explicit_size {
-                to returns_zero_offset { be_ok_and equal(0_i32) }
-            }
+            to returns_zero_offset_for_page_one { be_ok_and equal(0_i32) }
 
             when page_is_one_with_no_size {
                 let page_size = None;
@@ -377,15 +390,21 @@ mod tests {
             let status: Option<&'static str> = Some("Done");
             let result: Option<serde_json::Value> = Some(json!({"Ok": "processed"}));
 
-            when row_has_id_status_and_ok_payload {
-                to returns_the_decoded_task_result { be_ok_and task_result_done_with_payload }
-            }
+            to returns_the_decoded_task_result { be_ok_and task_result_done_with_payload }
 
             when row_has_id_status_and_err_payload {
                 let result: Option<serde_json::Value> = Some(json!({"Err": "boom"}));
                 let status: Option<&'static str> = Some("Failed");
                 to returns_the_decoded_failure_result {
                     be_ok_and task_result_failed_with_message
+                }
+            }
+
+            when row_has_killed_status_and_err_payload {
+                let result: Option<serde_json::Value> = Some(json!({"Err": "boom"}));
+                let status: Option<&'static str> = Some("Killed");
+                to returns_the_decoded_killed_result {
+                    be_ok_and task_result_killed_with_message
                 }
             }
 
@@ -418,10 +437,6 @@ mod tests {
                 let result: Option<serde_json::Value> = Some(json!({"unexpected": true}));
                 to rejects_with_a_json_error { be_err_and json_error }
             }
-        }
-
-        expect(ulid_string().len()) {
-            to has_canonical_ulid_length { equal(26) }
         }
     }
 }

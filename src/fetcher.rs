@@ -518,6 +518,12 @@ mod tests {
         poll_observation(&mut fetcher)
     }
 
+    fn fetch_pending_observation() -> PollObservation {
+        let mut fetcher = buffered_fetcher();
+        fetcher.state = StreamState::Fetch(future::pending().boxed());
+        poll_observation(&mut fetcher)
+    }
+
     fn cloned_state(fetcher: &PgPollFetcher<CompactType>) -> &'static str {
         match &fetcher.clone().state {
             StreamState::WaitForPoll(_) => "wait_for_poll",
@@ -554,6 +560,18 @@ mod tests {
             ("task", "wait_for_poll", 1) => Ok(()),
             other => Err(AssertionError::new(vec![format!(
                 "expected successful fetch to yield one task and remember the count, got {other:?}"
+            )])),
+        }
+    }
+
+    fn observed_pending_fetch(result: &PollObservation) -> AssertionResult {
+        // The in-flight fetch future is still Pending (fetcher.rs:349): the
+        // poll returns Pending without mutating the state slot or the
+        // previously remembered batch count (12 from `buffered_fetcher`).
+        match (result.poll, result.state, result.previous_task_count) {
+            ("pending", "fetch", 12) => Ok(()),
+            other => Err(AssertionError::new(vec![format!(
+                "expected an in-flight fetch to wait without touching the batch count, got {other:?}"
             )])),
         }
     }
@@ -607,15 +625,14 @@ mod tests {
     /// the same Buffered state slot (we only stole the inner VecDeque). The
     /// follow-up observation confirms the buffer is now empty and the next
     /// `poll_next` would transition to WaitForPoll.
-    fn take_pending_drains_then_reports_empty() -> (usize, &'static str) {
+    fn take_pending_drains_then_reports_empty() -> (usize, usize, &'static str) {
         let mut fetcher = buffered_with(vec![synthetic_task(b"alpha"), synthetic_task(b"beta")]);
         let drained = fetcher.take_pending().len();
         let remaining = match &fetcher.state {
             StreamState::Buffered(tasks) => tasks.len(),
             _ => panic!("take_pending changed the state slot"),
         };
-        let _ = remaining;
-        (drained, state_name(&fetcher))
+        (drained, remaining, state_name(&fetcher))
     }
 
     fn buffered_pop_front_observation() -> PollObservation {
@@ -695,6 +712,12 @@ mod tests {
             }
         }
 
+        expect(fetch_pending_observation()) {
+            when fetch_query_is_still_in_flight {
+                to waits_without_touching_the_batch_count { observed_pending_fetch }
+            }
+        }
+
         expect(take_pending_count(state_kind)) {
             let state_kind = "buffered_two";
 
@@ -726,7 +749,7 @@ mod tests {
         expect(take_pending_drains_then_reports_empty()) {
             when buffered_state_is_drained_via_take_pending {
                 to leaves_the_fetcher_in_the_buffered_state_with_zero_tasks {
-                    equal((2, "buffered"))
+                    equal((2, 0, "buffered"))
                 }
             }
         }

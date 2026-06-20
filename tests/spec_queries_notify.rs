@@ -29,43 +29,17 @@
 
 mod support;
 
+use support::{Outcome, observe, with_conn};
+
 use std::time::Duration;
 
 use apalis_core::{backend::Backend, worker::context::WorkerContext};
 use apalis_diesel_postgres::{Config, PgPool, PgTask, PostgresStorage};
 use diesel::{PgConnection, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
-use lets_expect::{AssertionError, AssertionResult, *};
+use lets_expect::{AssertionResult, *};
 use serde_json::Value;
 use ulid::Ulid;
-
-// --------------------------------------------------------------------------
-// shared scaffolding
-// --------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
-}
-
-fn observe<T, F>(
-    label: &'static str,
-    body: F,
-) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
-where
-    F: Fn(&T) -> Result<(), String>,
-{
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "{label}: scenario failed: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(run)) => {
-            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
-        }
-    }
-}
 
 /// Build a pool with at least two connections so the LISTEN observer and the
 /// INSERT/`pg_notify` writer can run on independent connections.
@@ -74,19 +48,6 @@ async fn test_pool_multi() -> Result<Option<PgPool>, String> {
     // observer thread, one for the writer); the shared per-binary pool is sized
     // well above that.
     support::shared_pool().await
-}
-
-async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
-where
-    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        work(&mut conn)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -199,6 +160,10 @@ struct TriggerRun {
     /// All payloads observed during the deadline window, filtered to those
     /// whose `job_type` field equals the test queue.
     payloads: Vec<Value>,
+    /// For the single-row scenario, the exact row id minted and inserted by
+    /// the writer, so the captured payload's lone `ids` element can be pinned
+    /// to it. `None` for scenarios that do not assert on a specific id.
+    expected_id: Option<String>,
 }
 
 fn parse_payloads(observed: Vec<ObservedNotify>, queue: &str) -> TriggerRun {
@@ -213,7 +178,10 @@ fn parse_payloads(observed: Vec<ObservedNotify>, queue: &str) -> TriggerRun {
             payloads.push(v);
         }
     }
-    TriggerRun { payloads }
+    TriggerRun {
+        payloads,
+        expected_id: None,
+    }
 }
 
 async fn run_single_row_insert() -> Result<Outcome<TriggerRun>, String> {
@@ -223,7 +191,11 @@ async fn run_single_row_insert() -> Result<Outcome<TriggerRun>, String> {
     let queue = format!("apalis-spec-notify-single-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
+    // Mint the row id up front so the captured payload's lone `ids` element
+    // can be pinned to exactly the row the writer inserted.
+    let row_id = Ulid::new().to_string();
     let queue_for_writer = queue.clone();
+    let row_id_for_writer = row_id.clone();
     let observed = capture_trigger_notifies(
         pool.clone(),
         move |conn| {
@@ -231,7 +203,7 @@ async fn run_single_row_insert() -> Result<Outcome<TriggerRun>, String> {
                 "INSERT INTO apalis.jobs (id, job_type, job, status, attempts, max_attempts, run_at)
                  VALUES ($1, $2, $3, 'Pending', 0, 3, now() - INTERVAL '1 second')",
             )
-            .bind::<Text, _>(Ulid::new().to_string())
+            .bind::<Text, _>(&row_id_for_writer)
             .bind::<Text, _>(&queue_for_writer)
             .bind::<diesel::sql_types::Binary, _>(serde_json::to_vec("x").unwrap())
             .execute(conn)
@@ -243,7 +215,8 @@ async fn run_single_row_insert() -> Result<Outcome<TriggerRun>, String> {
     )
     .await?;
 
-    let run = parse_payloads(observed, &queue);
+    let mut run = parse_payloads(observed, &queue);
+    run.expected_id = Some(row_id);
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(run))
 }
@@ -536,7 +509,7 @@ fn payload_uses_ids_array_shape() -> impl Fn(&Result<Outcome<TriggerRun>, String
 
 fn payload_carries_a_single_id() -> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult
 {
-    observe::<TriggerRun, _>("payload ids length", |run| {
+    observe::<TriggerRun, _>("payload single id", |run| {
         let Some(payload) = run.payloads.first() else {
             return Err("no payloads captured".into());
         };
@@ -544,41 +517,55 @@ fn payload_carries_a_single_id() -> impl Fn(&Result<Outcome<TriggerRun>, String>
             .get("ids")
             .and_then(Value::as_array)
             .ok_or_else(|| format!("payload missing `ids` array: {payload:?}"))?;
-        if ids.len() == 1 {
+        if ids.len() != 1 {
+            return Err(format!("expected `ids` length=1, got {}", ids.len()));
+        }
+        let expected = run
+            .expected_id
+            .as_deref()
+            .ok_or("scenario did not record an expected row id")?;
+        let actual = ids[0]
+            .as_str()
+            .ok_or_else(|| format!("`ids[0]` is not a string: {payload:?}"))?;
+        if actual == expected {
             Ok(())
         } else {
-            Err(format!("expected `ids` length=1, got {}", ids.len()))
+            Err(format!(
+                "expected `ids[0]` to be the inserted row id {expected}, got {actual}"
+            ))
         }
     })
 }
 
 fn payloads_are_chunked_at_one_hundred(
-    expected_total: usize,
+    expected_chunks: &'static [usize],
 ) -> impl Fn(&Result<Outcome<TriggerRun>, String>) -> AssertionResult {
     observe::<TriggerRun, _>("payload chunking", move |run| {
         if run.payloads.is_empty() {
             return Err("no payloads captured".into());
         }
-        let mut total = 0usize;
+        // Collect the per-payload id counts and compare the sorted multiset to
+        // the expected chunk boundaries. Sorting keeps the assertion
+        // independent of NOTIFY delivery order while still pinning the exact
+        // 100-id chunk split (e.g. 150 rows → {100, 50}).
+        let mut sizes: Vec<usize> = Vec::with_capacity(run.payloads.len());
         for (idx, payload) in run.payloads.iter().enumerate() {
             let ids = payload
                 .get("ids")
                 .and_then(Value::as_array)
                 .ok_or_else(|| format!("payload[{idx}] missing `ids` array: {payload:?}"))?;
-            if ids.len() > 100 {
-                return Err(format!(
-                    "payload[{idx}] carries {} ids, exceeds 100-id chunk cap",
-                    ids.len()
-                ));
-            }
-            total += ids.len();
+            sizes.push(ids.len());
         }
-        if total != expected_total {
-            return Err(format!(
-                "expected total of {expected_total} ids across payloads, got {total}"
-            ));
+        sizes.sort_unstable();
+        let mut want = expected_chunks.to_vec();
+        want.sort_unstable();
+        if sizes == want {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected payload chunk sizes {want:?}, got {sizes:?}"
+            ))
         }
-        Ok(())
     })
 }
 
@@ -634,7 +621,7 @@ lets_expect! { #tokio_test
         when a_single_statement_inserts_more_rows_than_the_chunk_cap {
             // 150 rows → chunk size 100 → two NOTIFY payloads (100 + 50).
             to chunks_the_payloads_at_one_hundred_ids_each {
-                payloads_are_chunked_at_one_hundred(150)
+                payloads_are_chunked_at_one_hundred(&[100, 50])
             }
             to emits_more_than_one_payload_for_the_batch {
                 produced_at_least_two_payloads()

@@ -338,9 +338,7 @@ mod tests {
             let metadata = expected_metadata();
             let idempotency_key = expected_idempotency_key();
 
-            when attempts_is_positive {
-                to preserves_the_positive_attempt_count { have(attempts) equal(1) }
-            }
+            to preserves_the_positive_attempt_count { have(attempts) equal(1) }
 
             when attempts_is_zero {
                 let attempts = 0;
@@ -352,9 +350,7 @@ mod tests {
                 to clamps_attempts_to_zero { have(attempts) equal(0) }
             }
 
-            when max_attempts_is_positive {
-                to preserves_the_positive_attempt_limit { have(max_attempts) equal(Some(3)) }
-            }
+            to preserves_the_positive_attempt_limit { have(max_attempts) equal(Some(3)) }
 
             when max_attempts_is_zero {
                 let max_attempts = 0;
@@ -371,9 +367,7 @@ mod tests {
                 to leaves_priority_absent { have(priority) equal(None) }
             }
 
-            when priority_is_positive {
-                to preserves_the_positive_priority { have(priority) equal(Some(9)) }
-            }
+            to preserves_the_positive_priority { have(priority) equal(Some(9)) }
 
             when priority_is_zero {
                 let priority = Some(0);
@@ -385,11 +379,9 @@ mod tests {
                 to clamps_priority_to_zero { have(priority) equal(Some(0)) }
             }
 
-            when metadata_and_idempotency_are_present {
-                to preserves_metadata_and_idempotency {
-                    have(metadata) equal(expected_metadata()),
-                    have(idempotency_key) equal(idempotency_key.clone())
-                }
+            to preserves_metadata_and_idempotency {
+                have(metadata) equal(expected_metadata()),
+                have(idempotency_key) equal(idempotency_key.clone())
             }
 
             when metadata_and_idempotency_are_absent {
@@ -403,13 +395,11 @@ mod tests {
         }
 
         expect(RunningWorker::from(worker_row(last_seen, started_at, layers))) {
-            let last_seen = DateTime::now();
-            let started_at = Some(DateTime::now());
+            let last_seen = <DateTime as DateTimeExt>::from_unix_timestamp(123);
+            let started_at = Some(<DateTime as DateTimeExt>::from_unix_timestamp(456));
             let layers = Some("layer-a,layer-b".to_string());
 
-            when last_seen_is_present {
-                to converts_last_seen_to_a_unix_timestamp { have(last_heartbeat) be_greater_than(0) }
-            }
+            to converts_last_seen_to_a_unix_timestamp { have(last_heartbeat) equal(123) }
 
             when last_seen_is_a_negative_unix_timestamp {
                 // Mirror of started_at below: `u64::try_from(negative).unwrap_or(0)`
@@ -421,9 +411,7 @@ mod tests {
                 to silently_clamps_pre_epoch_heartbeat_to_zero { have(last_heartbeat) equal(0) }
             }
 
-            when started_at_is_present {
-                to converts_started_at_to_a_unix_timestamp { have(started_at) be_greater_than(0) }
-            }
+            to converts_started_at_to_a_unix_timestamp { have(started_at) equal(456) }
 
             when started_at_is_absent {
                 let started_at = None;
@@ -442,9 +430,7 @@ mod tests {
                 to silently_clamps_pre_epoch_to_zero { have(started_at) equal(0) }
             }
 
-            when layers_are_present {
-                to preserves_layers { have(layers) equal("layer-a,layer-b".to_string()) }
-            }
+            to preserves_layers { have(layers) equal("layer-a,layer-b".to_string()) }
 
             when layers_are_absent {
                 let layers = None;
@@ -458,18 +444,14 @@ mod tests {
             let value = Some(7.5);
             let priority = Some(4);
 
-            when title_is_present {
-                to preserves_the_title { have(title) equal("processed".to_string()) }
-            }
+            to preserves_the_title { have(title) equal("processed".to_string()) }
 
             when title_is_absent {
                 let statistic = None;
                 to defaults_the_title_to_an_empty_string { have(title) equal(String::new()) }
             }
 
-            when type_is_decimal {
-                to maps_the_type_to_decimal { has_stat_type(StatType::Decimal) }
-            }
+            to maps_the_type_to_decimal { has_stat_type(StatType::Decimal) }
 
             when type_is_percentage {
                 let stat_type = Some("Percentage".to_string());
@@ -491,9 +473,7 @@ mod tests {
                 to defaults_the_type_to_number { has_stat_type(StatType::Number) }
             }
 
-            when value_is_present {
-                to stringifies_the_value { have(value) equal("7.5".to_string()) }
-            }
+            to stringifies_the_value { have(value) equal("7.5".to_string()) }
 
             when value_is_absent {
                 let value = None;
@@ -505,9 +485,7 @@ mod tests {
                 to defaults_priority_to_zero { have(priority) equal(Some(0)) }
             }
 
-            when priority_is_positive {
-                to preserves_the_positive_priority { have(priority) equal(Some(4)) }
-            }
+            to preserves_the_positive_priority { have(priority) equal(Some(4)) }
 
             when priority_is_zero {
                 let priority = Some(0);
@@ -526,18 +504,14 @@ mod tests {
             let workers = Some(workers());
             let activity = Some(activity());
 
-            when name_is_present {
-                to preserves_the_name { have(name) equal("email".to_string()) }
-            }
+            to preserves_the_name { have(name) equal("email".to_string()) }
 
             when name_is_absent {
                 let name = None;
                 to defaults_the_name_to_an_empty_string { have(name) equal(String::new()) }
             }
 
-            when stats_are_valid {
-                to decodes_the_stats { contains_decimal_statistic }
-            }
+            to decodes_the_stats { contains_decimal_statistic }
 
             when stats_are_invalid {
                 let stats = Some(json!({"not": "a statistic list"}));
@@ -549,9 +523,7 @@ mod tests {
                 to defaults_stats_to_an_empty_list { have(stats.len()) equal(0) }
             }
 
-            when workers_are_valid {
-                to decodes_the_workers { have(workers) equal(vec!["worker-1".to_string(), "worker-2".to_string()]) }
-            }
+            to decodes_the_workers { have(workers) equal(vec!["worker-1".to_string(), "worker-2".to_string()]) }
 
             when workers_are_invalid {
                 let workers = Some(json!({"not": "a worker list"}));
@@ -563,9 +535,7 @@ mod tests {
                 to defaults_workers_to_an_empty_list { have(workers) equal(Vec::<String>::new()) }
             }
 
-            when activity_is_valid {
-                to decodes_the_activity { have(activity) equal(vec![1, 2, 3, 4]) }
-            }
+            to decodes_the_activity { have(activity) equal(vec![1, 2, 3, 4]) }
 
             when activity_is_invalid {
                 let activity = Some(json!({"not": "an activity list"}));

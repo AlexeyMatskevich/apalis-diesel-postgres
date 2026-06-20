@@ -2,6 +2,8 @@
 
 mod support;
 
+use support::Outcome;
+
 use std::time::Duration;
 
 use apalis_core::{
@@ -36,12 +38,6 @@ struct IsolationRun {
 struct SharedDuplicateRun {
     second_registration_accepted: bool,
     delivered_payload: String,
-}
-
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
@@ -273,6 +269,99 @@ async fn run_shared_isolation() -> Result<Outcome<IsolationRun>, String> {
     }))
 }
 
+#[derive(Debug)]
+struct MalformedPayloadRun {
+    /// Whether a task surfaced on the consumer during the grace window that
+    /// followed the malformed `pg_notify` (before any real job was pushed).
+    /// Must be `false`: a malformed payload is swallowed and delivers nothing.
+    malformed_delivered_a_task: bool,
+    /// The payload the consumer received from the *subsequent* real push. The
+    /// listener must have survived the malformed payload for this to arrive.
+    payload_after_malformed: String,
+}
+
+async fn raw_notify(pool: PgPool, channel: String, payload: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let mut conn = pool.get().map_err(|error| error.to_string())?;
+        sql_query("SELECT pg_notify($1, $2)")
+            .bind::<Text, _>(&channel)
+            .bind::<Text, _>(&payload)
+            .execute(&mut conn)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+// A malformed NOTIFY payload on the shared listener's channel must be swallowed
+// (the `serde_json::from_str::<InsertEvent>` else-`continue` branch) WITHOUT
+// surfacing an error to the consumer or killing the listener thread. We send a
+// non-JSON payload while a live shared consumer is registered, confirm nothing
+// is delivered, then push a real job to the same queue and confirm it still
+// arrives — proving the listener survived the malformed payload.
+async fn run_shared_malformed_payload_survival() -> Result<Outcome<MalformedPayloadRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-shared-malformed-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    let config = notify_only_config(&queue);
+    let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
+        SharedPostgresStorage::new(pool.clone());
+    let mut storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
+        &mut shared,
+        config.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let poll_handle = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
+        &mut shared,
+        config,
+    )
+    .map_err(|error| error.to_string())?;
+    let worker = WorkerContext::new::<()>(&format!("shared-worker-{queue}"));
+    let mut stream = poll_handle.poll(&worker);
+
+    // Warm-up barrier: deliver a real job and await it BEFORE sending the
+    // malformed payload. This config has no polling fallback (its poll strategy
+    // is `stream::pending`), so a delivery can only arrive via LISTEN/NOTIFY —
+    // receiving the warm-up therefore proves the listener has already issued
+    // LISTEN. Postgres drops NOTIFYs for sessions that have not yet LISTENed, so
+    // without this barrier a too-early malformed NOTIFY could be dropped before
+    // the listener subscribes, silently skipping the swallow-malformed branch
+    // under test (the previous fixed sleep only made that race unlikely).
+    storage
+        .push("warmup".to_owned())
+        .await
+        .map_err(|error| error.to_string())?;
+    let _warmup = next_task(&mut stream).await?;
+
+    // A payload the listener cannot parse as an `InsertEvent`. Its else-branch
+    // must `continue` silently — no Error pushed to the consumer.
+    raw_notify(
+        pool.clone(),
+        "apalis::job::insert".to_owned(),
+        "{not-json".to_owned(),
+    )
+    .await?;
+    let malformed_delivered_a_task =
+        !no_task_within(&mut stream, Duration::from_millis(250)).await?;
+
+    // The listener must still be alive: a genuine push has to be delivered.
+    storage
+        .push("after-malformed".to_owned())
+        .await
+        .map_err(|error| error.to_string())?;
+    let task = next_task(&mut stream).await?;
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(MalformedPayloadRun {
+        malformed_delivered_a_task,
+        payload_after_malformed: task.args,
+    }))
+}
+
 fn check<T, F>(
     name: &'static str,
     check: F,
@@ -470,6 +559,32 @@ fn recycled_connection_has_no_subscriptions()
     })
 }
 
+fn malformed_payload_delivered_no_task()
+-> impl Fn(&Result<Outcome<MalformedPayloadRun>, String>) -> AssertionResult {
+    check::<MalformedPayloadRun, _>("malformed payload delivery", |run| {
+        if run.malformed_delivered_a_task {
+            Err("a malformed NOTIFY payload was delivered as a task to the consumer".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn valid_payload_delivered_after_malformed(
+    expected: &'static str,
+) -> impl Fn(&Result<Outcome<MalformedPayloadRun>, String>) -> AssertionResult {
+    check::<MalformedPayloadRun, _>("post-malformed delivery", move |run| {
+        if run.payload_after_malformed == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the listener to survive and deliver {expected:?}, got {:?}",
+                run.payload_after_malformed
+            ))
+        }
+    })
+}
+
 lets_expect! { #tokio_test
     expect(run_listener_recycles_a_clean_connection().await) {
         when the_last_registration_drops_and_the_listener_exits {
@@ -516,6 +631,17 @@ lets_expect! { #tokio_test
             }
             to keeps_the_other_queue_quiet {
                 other_queue_was_isolated()
+            }
+        }
+    }
+
+    expect(run_shared_malformed_payload_survival().await) {
+        when malformed_notify_payload_is_received_while_a_consumer_is_live {
+            to delivers_no_task_for_the_malformed_payload {
+                malformed_payload_delivered_no_task()
+            }
+            to keeps_the_listener_alive_to_deliver_the_next_valid_payload {
+                valid_payload_delivered_after_malformed("after-malformed")
             }
         }
     }

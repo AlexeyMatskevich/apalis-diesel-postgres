@@ -309,9 +309,12 @@ mod tests {
 
     /// `poll_flush_creates_future` exercises the `flush_future.is_none() &&
     /// !buffer.is_empty()` branch: the function builds a new flush future from
-    /// the buffer and immediately polls it. Against an unreachable pool the
-    /// inner `push_tasks` future resolves to Err on first poll, so this returns
-    /// a `Ready(Err(...))` observation with the buffer drained.
+    /// the buffer and immediately polls it. The buffer is drained into the
+    /// future regardless of the poll outcome. Because `push_tasks` runs the
+    /// blocking diesel work via `spawn_blocking`, the first poll typically
+    /// returns `Poll::Pending` (the connection attempt is still in flight); it
+    /// only later resolves to `Ready(Err(...))` once the unreachable pool's
+    /// connect times out. Either observation confirms the drain happened.
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     fn poll_flush_creates_future() -> FlushObservation {
         poll_flush_sink_with_state(2, 1, None)
@@ -428,11 +431,11 @@ mod tests {
         format!("{sink:?}")
     }
 
-    fn sink_buffer_full(result: &Result<usize, Error>) -> AssertionResult {
-        match result {
-            Err(Error::SinkBufferFull(1)) => Ok(()),
+    fn sink_buffer_full_at(expected: usize) -> impl Fn(&Result<usize, Error>) -> AssertionResult {
+        move |result| match result {
+            Err(Error::SinkBufferFull(c)) if *c == expected => Ok(()),
             other => Err(AssertionError::new(vec![format!(
-                "expected sink buffer full at capacity 1, got {other:?}"
+                "expected sink buffer full at capacity {expected}, got {other:?}"
             )])),
         }
     }
@@ -531,6 +534,11 @@ mod tests {
     }
 
     fn debug_mentions_public_fields(result: &String) -> AssertionResult {
+        if result.contains("pool") {
+            return Err(AssertionError::new(vec![format!(
+                "debug output unexpectedly exposes the pool, got {result}"
+            )]));
+        }
         if result.contains("PgSink") && result.contains("config") && result.contains("buffer_len") {
             Ok(())
         } else {
@@ -561,13 +569,19 @@ mod tests {
             when buffer_is_at_capacity_already {
                 let buffer_size = 1;
                 let existing_items = 1;
-                to rejects_the_send { sink_buffer_full }
+                to rejects_the_send_carrying_the_effective_capacity { sink_buffer_full_at(1) }
+            }
+
+            when buffer_is_at_a_non_minimum_capacity_already {
+                let buffer_size = 2;
+                let existing_items = 2;
+                to rejects_the_send_carrying_the_effective_capacity { sink_buffer_full_at(2) }
             }
 
             when configured_capacity_is_zero_and_minimum_one_is_full {
                 let buffer_size = 0;
                 let existing_items = 1;
-                to rejects_the_send_via_the_minimum_capacity { sink_buffer_full }
+                to rejects_the_send_via_the_minimum_capacity { sink_buffer_full_at(1) }
             }
         }
 
@@ -576,6 +590,16 @@ mod tests {
             let existing_items = 0;
 
             when buffer_is_below_capacity_and_no_flush_is_in_flight {
+                to returns_ready_without_flushing { poll_ready_ok }
+            }
+
+            when buffer_has_exactly_one_slot_left {
+                // len == capacity - 1 with no in-flight flush: one free slot
+                // remains, so there is no backpressure and poll_ready must
+                // return Ready(Ok) without driving a flush (pins the `>= cap`
+                // guard against a `>= cap - 1` off-by-one).
+                let buffer_size = 2;
+                let existing_items = 1;
                 to returns_ready_without_flushing { poll_ready_ok }
             }
         }
@@ -710,7 +734,7 @@ mod tests {
                 let buffered = 1;
 
                 when poll_flush_runs_on_a_real_runtime_with_buffered_work {
-                    to resolves_to_an_error_against_an_unreachable_pool { poll_started_flush }
+                    to starts_flushing_against_the_unreachable_pool { poll_started_flush }
                 }
             }
         }

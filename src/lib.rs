@@ -383,8 +383,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use apalis_core::{
         backend::{Backend, BackendExt},
         task::status::Status,
@@ -506,17 +504,16 @@ mod tests {
     }
 
     fn debug_mentions_public_type(result: &String) -> AssertionResult {
-        if result.contains("PostgresStorage") && result.contains("config") {
+        if result.contains("PostgresStorage")
+            && result.contains("config")
+            && !result.contains("pool")
+        {
             Ok(())
         } else {
             Err(AssertionError::new(vec![format!(
-                "debug output did not describe storage: {result}"
+                "debug output did not describe storage without exposing the pool: {result}"
             )]))
         }
-    }
-
-    fn task_id_alias_accepts_ulid(id: PgTaskId) -> bool {
-        Ulid::from_str(&id.to_string()).is_ok()
     }
 
     fn storage_for_type_name() -> PostgresStorage<String> {
@@ -542,8 +539,29 @@ mod tests {
     fn cloned_storage_for_config(
         queue: &'static str,
         buffer_size: usize,
-    ) -> PostgresStorage<String> {
-        storage_for_config(queue, buffer_size).clone()
+    ) -> (PostgresStorage<String>, PostgresStorage<String>) {
+        let original = storage_for_config(queue, buffer_size);
+        let clone = original.clone();
+        (original, clone)
+    }
+
+    fn shares_lease_token(
+        pair: &(PostgresStorage<String>, PostgresStorage<String>),
+    ) -> AssertionResult {
+        let (original, clone) = pair;
+        if std::sync::Arc::ptr_eq(&original.lease_token, &clone.lease_token) {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![
+                "clone did not share the per-process lease token".to_owned(),
+            ]))
+        }
+    }
+
+    fn cloned_storage(
+        pair: &(PostgresStorage<String>, PostgresStorage<String>),
+    ) -> AssertionResult {
+        storage_uses_queue_and_buffer("clone-api", 4)(&pair.1)
     }
 
     fn debug_storage() -> String {
@@ -556,31 +574,25 @@ mod tests {
             .with_codec::<JsonCodec<CompactType>>()
     }
 
-    fn type_name_after_with_codec() -> &'static str {
+    // Pins the codec type parameter to `()` at compile time. The `Codec = ()`
+    // slot is enforced by the parameter type; `Fetcher` stays inferred so the
+    // assertion does not depend on the (preserved) fetcher type's spelling.
+    fn pin_unit_codec<Fetcher>(_storage: &PostgresStorage<String, (), Fetcher>) {}
+
+    fn with_codec_swaps_to_unit_codec() -> String {
         let pool = unchecked_pool();
         let storage = PostgresStorage::<String>::new(&pool).with_codec::<()>();
-        std::any::type_name_of_val(&storage)
+        // Compile-time check: this fails to compile if `with_codec::<()>` no
+        // longer yields a `()` codec slot, independent of `type_name` formatting.
+        pin_unit_codec(&storage);
+        storage.config.queue().to_string()
     }
 
-    fn type_name_contains_unit_codec(result: &&'static str) -> AssertionResult {
-        if result.contains("PostgresStorage")
-            && result.contains("alloc::string::String")
-            && (result.contains(", (),") || result.contains(",()"))
-        {
-            Ok(())
-        } else {
-            Err(AssertionError::new(vec![format!(
-                "expected with_codec::<()> to switch the codec slot, got {result}"
-            )]))
-        }
-    }
-
-    fn storage_accessors() -> (String, usize, u32) {
+    fn storage_accessors() -> (String, usize) {
         let storage = storage_for_config("accessor-api", 8);
         (
             storage.config().queue().to_string(),
             storage.config().buffer_size(),
-            storage.pool().state().connections,
         )
     }
 
@@ -613,7 +625,7 @@ mod tests {
         }
     }
 
-    fn exposes_accessors(result: &(String, usize, u32)) -> AssertionResult {
+    fn exposes_accessors(result: &(String, usize)) -> AssertionResult {
         if result.0 == "accessor-api" && result.1 == 8 {
             Ok(())
         } else {
@@ -693,7 +705,8 @@ mod tests {
 
             when storage_is_cloned {
                 let storage = cloned_storage_for_config("clone-api", 4);
-                to keeps_the_queue_configuration { storage_uses_queue_and_buffer("clone-api", 4) }
+                to keeps_the_queue_configuration { cloned_storage }
+                to shares_the_per_process_lease_token { shares_lease_token }
             }
         }
 
@@ -702,17 +715,21 @@ mod tests {
         }
 
         expect(storage_with_changed_codec()) {
-            to keeps_the_existing_pool_config_and_fetcher { storage_uses_queue_and_buffer("codec-api", 6) }
+            to preserves_the_supplied_config { storage_uses_queue_and_buffer("codec-api", 6) }
         }
 
-        expect(type_name_after_with_codec()) {
-            when with_codec_replaces_the_codec_type_parameter {
-                to swaps_the_codec_slot_in_the_generic_signature { type_name_contains_unit_codec }
+        // The codec swap to `()` is enforced at compile time by the
+        // `PostgresStorage<String, ()>` annotation in the helper; this leaf
+        // additionally confirms the swapped storage still constructs with the
+        // task-type-derived queue.
+        expect(with_codec_swaps_to_unit_codec()) {
+            to builds_a_unit_codec_storage_with_the_default_queue {
+                equal(std::any::type_name::<String>().to_owned())
             }
         }
 
         expect(storage_accessors()) {
-            to exposes_the_pool_and_config { exposes_accessors }
+            to exposes_the_queue_and_buffer_config { exposes_accessors }
         }
 
         expect(basic_get_queue()) {
@@ -734,12 +751,6 @@ mod tests {
                 let notify = true;
                 to builds_heartbeat_middleware_and_compact_stream { constructs_backend_traits }
             }
-        }
-
-        expect(task_id_alias_accepts_ulid(task_id)) {
-            let task_id = PgTaskId::from_str(&Ulid::new().to_string()).expect("generated ULID parses");
-
-            to accepts_the_public_task_id_alias { be_true }
         }
     }
 }

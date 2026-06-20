@@ -32,6 +32,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
     use std::time::Duration;
 
     use lets_expect::{AssertionError, AssertionResult, *};
@@ -98,11 +99,40 @@ mod tests {
         }
     }
 
+    /// Assert the `Error::Pool` Display contract: the actionable prefix and the
+    /// `DATABASE_URL` guidance must both be present. The inner r2d2 timeout text
+    /// is environment/timing dependent, so match by prefix + substring rather
+    /// than full equality.
+    fn displays_pool_acquisition_failure(error: &Error) -> AssertionResult {
+        let actual = error.to_string();
+        if actual.starts_with("failed to acquire PostgreSQL connection from r2d2 pool: ")
+            && actual.contains("check that DATABASE_URL points to a reachable PostgreSQL server")
+        {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "expected pool acquisition failure display, got {actual:?}"
+            )]))
+        }
+    }
+
+    /// `Error::Pool` uses `#[from]`, so thiserror generates `source()` for the
+    /// single wrapped `r2d2::Error`: the source chain must be present.
+    fn exposes_pool_error_as_source(error: &Error) -> AssertionResult {
+        match StdError::source(error) {
+            Some(_) => Ok(()),
+            None => Err(AssertionError::new(vec![
+                "expected the r2d2 pool error to be exposed as the source, got no source"
+                    .to_owned(),
+            ])),
+        }
+    }
+
     lets_expect! {
         expect(default_pool(url)) {
             let url = "postgres://127.0.0.1:1/unused";
 
-            when build_pool_uses_the_r2d2_defaults {
+            when build_pool_with_uses_the_r2d2_defaults {
                 to returns_a_pool_with_the_r2d2_default_capacity {
                     be_ok_and equals_max_size(10)
                 }
@@ -146,6 +176,14 @@ mod tests {
             when the_server_is_unreachable_and_initialization_is_eager {
                 to returns_a_pool_error {
                     be_err_and match_pattern!(Error::Pool(_))
+                }
+
+                to displays_the_pool_acquisition_failure {
+                    be_err_and displays_pool_acquisition_failure
+                }
+
+                to exposes_the_pool_error_as_the_source {
+                    be_err_and exposes_pool_error_as_source
                 }
             }
         }

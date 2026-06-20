@@ -10,6 +10,8 @@
 
 mod support;
 
+use support::{Outcome, observe, with_conn};
+
 use std::{
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -32,55 +34,13 @@ use diesel::{
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz},
 };
 use futures::StreamExt;
-use lets_expect::{AssertionError, AssertionResult, *};
+use lets_expect::{AssertionResult, *};
 use serde_json::Value;
 use std::sync::Arc;
 use ulid::Ulid;
 
-// --------------------------------------------------------------------------
-// shared scaffolding (small dup of postgres_queries.rs helpers; keeping the
-// two files independent so concurrent edits in either don't conflict).
-// --------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum Outcome<T> {
-    Skipped,
-    Completed(T),
-}
-
-fn observe<T, F>(
-    label: &'static str,
-    body: F,
-) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
-where
-    F: Fn(&T) -> Result<(), String>,
-{
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "{label}: scenario failed: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(run)) => {
-            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
-        }
-    }
-}
-
 async fn test_pool() -> Result<Option<PgPool>, String> {
     support::shared_pool().await
-}
-
-async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
-where
-    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut conn = pool.get().map_err(|e| e.to_string())?;
-        work(&mut conn)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -2324,54 +2284,36 @@ fn ack_persists_result() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -
     })
 }
 
-fn ack_rejected_as_stale() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult
-{
-    observe::<AckPredicateRun, _>("ack rejected", |run| match run.ack_error.as_deref() {
-        Some(msg) if msg.contains("stale acknowledgement") => Ok(()),
-        Some(other) => Err(format!(
-            "expected stale acknowledgement error, got {other:?}"
-        )),
-        None => Err("expected ack to be rejected as stale, but it succeeded".into()),
-    })
-}
-
-fn ack_row_stays_running() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult
-{
-    observe::<AckPredicateRun, _>("row stays Running", |run| {
-        if run.row_status == "Running" {
-            Ok(())
-        } else {
-            Err(format!(
+/// The single stale-ack rejection contract shared by every failed predicate
+/// arm: the call is rejected as a stale acknowledgement, and the row is left
+/// fully untouched — still `Running`, `last_result` still NULL, and `attempts`
+/// unchanged at the stored `0` (a successful ack would set attempts 0->1).
+fn be_a_stale_ack_rejection()
+-> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
+    observe::<AckPredicateRun, _>("stale ack rejection", |run| {
+        match run.ack_error.as_deref() {
+            Some(msg) if msg.contains("stale acknowledgement") => Ok(()),
+            Some(other) => Err(format!(
+                "expected stale acknowledgement error, got {other:?}"
+            )),
+            None => Err("expected ack to be rejected as stale, but it succeeded".into()),
+        }?;
+        if run.row_status != "Running" {
+            return Err(format!(
                 "expected row to remain Running on rejection, got {}",
                 run.row_status
-            ))
+            ));
         }
-    })
-}
-
-fn ack_row_keeps_null_last_result()
--> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
-    observe::<AckPredicateRun, _>("row keeps NULL last_result", |run| {
-        if run.row_last_result.is_none() {
-            Ok(())
-        } else {
-            Err("expected last_result to remain NULL after rejected ack".into())
+        if run.row_last_result.is_some() {
+            return Err("expected last_result to remain NULL after rejected ack".into());
         }
-    })
-}
-
-fn ack_row_attempts(
-    expected: i32,
-) -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
-    observe::<AckPredicateRun, _>("row attempts", move |run| {
-        if run.row_attempts == expected {
-            Ok(())
-        } else {
-            Err(format!(
-                "expected attempts={expected} after the call, got {}",
+        if run.row_attempts != 0 {
+            return Err(format!(
+                "expected attempts to remain 0 after rejected ack, got {}",
                 run.row_attempts
-            ))
+            ));
         }
+        Ok(())
     })
 }
 
@@ -2545,7 +2487,7 @@ lets_expect! { #tokio_test
             to accepts_the_push_and_persists_the_row { metadata_cap_succeeds() }
         }
 
-        when the_metadata_serialization_length_sits_just_below_the_eight_kib_cap {
+        when the_metadata_serialization_length_is_a_large_value_under_the_eight_kib_cap {
             let meta_payload_len = 8000usize;
             to accepts_the_push_and_persists_the_row { metadata_cap_succeeds() }
         }
@@ -2576,6 +2518,14 @@ lets_expect! { #tokio_test
     expect(run_run_at_cap(run_at).await) {
         let run_at = u64::MAX;
 
+        when the_run_at_timestamp_is_one_second_over_i64_max {
+            // 9223372036854775808 — the first value `i64::try_from` rejects, so
+            // it pins the exact rejecting boundary of the strict guard.
+            let run_at = (i64::MAX as u64) + 1;
+            to rejects_the_push_with_invalid_argument { run_at_cap_rejects() }
+            to does_not_persist_the_apalis_jobs_row { run_at_cap_persists_nothing() }
+        }
+
         when the_run_at_timestamp_exceeds_i64_max_seconds {
             to rejects_the_push_with_invalid_argument { run_at_cap_rejects() }
             to does_not_persist_the_apalis_jobs_row { run_at_cap_persists_nothing() }
@@ -2592,6 +2542,13 @@ lets_expect! { #tokio_test
         when the_idempotency_key_sits_at_the_one_kib_cap_boundary {
             let key_len = 1024usize;
             to accepts_the_push_and_persists_the_row { idempotency_cap_succeeds() }
+        }
+
+        when the_idempotency_key_is_one_byte_over_the_one_kib_cap {
+            // First value the strict `key.len() > 1024` guard must reject.
+            let key_len = 1025usize;
+            to rejects_the_push_with_invalid_argument { idempotency_cap_rejects() }
+            to does_not_persist_the_apalis_jobs_row { idempotency_cap_persists_nothing() }
         }
 
         when the_idempotency_key_exceeds_the_one_kib_cap {
@@ -2611,6 +2568,13 @@ lets_expect! { #tokio_test
         when the_queue_name_sits_at_the_two_hundred_fifty_five_byte_cap {
             let name_len = 255usize;
             to accepts_the_push_and_persists_the_row { queue_name_cap_succeeds() }
+        }
+
+        when the_queue_name_is_one_byte_over_the_two_hundred_fifty_five_byte_cap {
+            // First value the strict `job_type.len() > 255` guard must reject.
+            let name_len = 256usize;
+            to rejects_the_push_with_invalid_argument { queue_name_cap_rejects() }
+            to does_not_persist_the_apalis_jobs_row { queue_name_cap_persists_nothing() }
         }
 
         when the_queue_name_exceeds_the_two_hundred_fifty_five_byte_cap {
@@ -2649,10 +2613,7 @@ lets_expect! { #tokio_test
                 workers_token: Some("other-token"),
                 ..ACK_OK
             };
-            to is_rejected_as_a_stale_acknowledgement { ack_rejected_as_stale() }
-            to leaves_the_row_in_running_state { ack_row_stays_running() }
-            to does_not_write_last_result { ack_row_keeps_null_last_result() }
-            to does_not_increment_attempts { ack_row_attempts(0) }
+            to behaves_like_a_stale_ack_rejection { be_a_stale_ack_rejection() }
         }
 
         when called_with_a_lease_token_but_the_workers_row_has_null_lease_token {
@@ -2664,9 +2625,7 @@ lets_expect! { #tokio_test
                 workers_token: None,
                 ..ACK_OK
             };
-            to is_rejected_as_a_stale_acknowledgement { ack_rejected_as_stale() }
-            to leaves_the_row_in_running_state { ack_row_stays_running() }
-            to does_not_write_last_result { ack_row_keeps_null_last_result() }
+            to behaves_like_a_stale_ack_rejection { be_a_stale_ack_rejection() }
         }
 
         when the_callers_lock_at_disagrees_with_the_stored_row {
@@ -2674,9 +2633,7 @@ lets_expect! { #tokio_test
                 lock_at_delta_secs: 1,
                 ..ACK_OK
             };
-            to is_rejected_as_a_stale_acknowledgement { ack_rejected_as_stale() }
-            to leaves_the_row_in_running_state { ack_row_stays_running() }
-            to does_not_write_last_result { ack_row_keeps_null_last_result() }
+            to behaves_like_a_stale_ack_rejection { be_a_stale_ack_rejection() }
         }
 
         when the_callers_started_attempts_disagrees_with_the_stored_row {
@@ -2684,9 +2641,7 @@ lets_expect! { #tokio_test
                 attempt_delta: 5,
                 ..ACK_OK
             };
-            to is_rejected_as_a_stale_acknowledgement { ack_rejected_as_stale() }
-            to leaves_the_row_in_running_state { ack_row_stays_running() }
-            to does_not_write_last_result { ack_row_keeps_null_last_result() }
+            to behaves_like_a_stale_ack_rejection { be_a_stale_ack_rejection() }
         }
 
         when the_callers_task_id_does_not_exist_in_the_jobs_table {
@@ -2694,9 +2649,7 @@ lets_expect! { #tokio_test
                 fabricate_unknown_task_id: true,
                 ..ACK_OK
             };
-            to is_rejected_as_a_stale_acknowledgement { ack_rejected_as_stale() }
-            to leaves_the_original_row_in_running_state { ack_row_stays_running() }
-            to does_not_write_last_result { ack_row_keeps_null_last_result() }
+            to behaves_like_a_stale_ack_rejection { be_a_stale_ack_rejection() }
         }
 
         when the_callers_queue_disagrees_with_the_stored_row {
@@ -2704,9 +2657,7 @@ lets_expect! { #tokio_test
                 override_queue: Some("apalis-spec-ack-pred-wrong-queue"),
                 ..ACK_OK
             };
-            to is_rejected_as_a_stale_acknowledgement { ack_rejected_as_stale() }
-            to leaves_the_row_in_running_state { ack_row_stays_running() }
-            to does_not_write_last_result { ack_row_keeps_null_last_result() }
+            to behaves_like_a_stale_ack_rejection { be_a_stale_ack_rejection() }
         }
     }
 }
