@@ -396,7 +396,13 @@ const LIST_QUEUES_SQL: &str =
                jsonb_agg(jsonb_build_object(
                    'title', statistic,
                    'stat_type', stat_type,
-                   'value', value,
+                   -- COALESCE so a NULL aggregate (e.g. AVG_JOB_DURATION_MINS on a
+                   -- queue with no completed jobs) renders as text 0 instead of a
+                   -- JSON null. apalis_core::Statistic.value is a non-optional
+                   -- String, so a single null here fails the whole Vec<Statistic>
+                   -- decode in models.rs and silently drops EVERY stat for the
+                   -- queue. This mirrors the single-stat metrics value default.
+                   'value', COALESCE(value, '0'),
                    'priority', priority
                ) ORDER BY priority, statistic) AS stats
         FROM job_rollup
