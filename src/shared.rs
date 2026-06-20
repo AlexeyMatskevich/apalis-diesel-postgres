@@ -316,11 +316,8 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
         &mut self,
         config: Self::Config,
     ) -> Result<Self::Backend, Self::MakeError> {
-        let (sender, receiver) = mpsc::channel(
-            config
-                .buffer_size()
-                .clamp(1, crate::queries::NOTIFY_CHANNEL_CAPACITY_MAX),
-        );
+        let (sender, receiver) =
+            mpsc::channel(crate::queries::clamp_notify_capacity(config.buffer_size()));
         let mut registry = self
             .registry
             .lock()

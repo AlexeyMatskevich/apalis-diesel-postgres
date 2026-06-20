@@ -20,9 +20,7 @@ pub(crate) use admin::{
     metrics_global, register_worker,
 };
 pub(crate) use fetch::{fail_undecodable_task, fetch_next, lock_task};
-pub(crate) use notify::{
-    NOTIFY_CHANNEL_CAPACITY_MAX, NOTIFY_LISTENER_POLL_INTERVAL, notify_task_ids,
-};
+pub(crate) use notify::{NOTIFY_LISTENER_POLL_INTERVAL, clamp_notify_capacity, notify_task_ids};
 pub(crate) use push::{push_tasks, push_tasks_on_conn};
 pub(crate) use worker::{initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream};
 
