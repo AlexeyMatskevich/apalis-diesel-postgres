@@ -62,7 +62,7 @@ use apalis_core::{
 };
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 use diesel::{
-    RunQueryDsl, sql_query,
+    QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Text},
 };
 use lets_expect::{AssertionResult, *};
@@ -87,19 +87,30 @@ async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
     .await
 }
 
-/// Delete any `Done` row with `done_at IS NULL` from the whole shared table.
-/// PostgreSQL's default `ORDER BY done_at DESC` sorts NULLs first, so such a
-/// row (schema-permitted, though nothing in this crate's own test helpers
-/// creates one) would sort ahead of any timestamp — including deliberately
-/// far-future ones used to isolate a global-listing scenario from the rest of
-/// the table. Scoped to `status = 'Done'` so it cannot touch any other test's
-/// in-flight rows.
-async fn delete_done_rows_with_null_done_at(pool: PgPool) -> Result<(), String> {
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+/// Whether any `Done` row with `done_at IS NULL` exists anywhere in the
+/// shared table. PostgreSQL's default `ORDER BY done_at DESC` sorts NULLs
+/// first, so such a row (schema-permitted, though nothing in this crate's
+/// own test helpers creates one) would sort ahead of any timestamp —
+/// including deliberately far-future ones used to isolate a global-listing
+/// scenario from the rest of the table. Read-only on purpose: this crate's
+/// own tests otherwise only ever mutate rows scoped to a generated queue
+/// name, and a global `DELETE` here could destroy a legitimate row left by
+/// something else entirely on a persistent/shared `DATABASE_URL`.
+async fn has_done_row_with_null_done_at(pool: PgPool) -> Result<bool, String> {
     with_conn(pool, move |conn| {
-        sql_query("DELETE FROM apalis.jobs WHERE status = 'Done' AND done_at IS NULL")
-            .execute(conn)
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        sql_query(
+            "SELECT count(*)::bigint AS n FROM apalis.jobs
+             WHERE status = 'Done' AND done_at IS NULL",
+        )
+        .load::<CountRow>(conn)
+        .map_err(|e| e.to_string())
+        .map(|rows| rows.first().is_some_and(|row| row.n > 0))
     })
     .await
 }
@@ -856,10 +867,16 @@ async fn run_list_all_offset_slice() -> Result<Outcome<ListAllOffsetRun>, String
     // not forbid a `Done` row with `done_at IS NULL`, so a stray one left by
     // some unrelated manual/direct-SQL test would otherwise sort ahead of this
     // scenario's rows and break the offset assertions despite `list_all_tasks`
-    // being correct. Nothing in this crate's own helpers creates such a row,
-    // but clear any pre-existing one defensively so this scenario's isolation
-    // does not depend on that staying true.
-    delete_done_rows_with_null_done_at(pool.clone()).await?;
+    // being correct. Nothing in this crate's own helpers creates such a row.
+    // Rather than a global DELETE (which could destroy a legitimate row on a
+    // persistent/shared DATABASE_URL just to make this probe pass), skip this
+    // scenario outright when one is present: this file's other scenarios only
+    // ever mutate rows scoped to a generated queue name, and this is the one
+    // place a global, unscoped listing is genuinely under test.
+    if has_done_row_with_null_done_at(pool.clone()).await? {
+        cleanup_queue(pool, queue).await?;
+        return Ok(Outcome::Skipped);
+    }
 
     // Three Done rows with done_at ~10 years in the future (offsets are
     // negative, and insert_job computes `now() - offset`), so they sort ahead
