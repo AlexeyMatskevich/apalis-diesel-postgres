@@ -24,9 +24,7 @@ where
     // fall back to ntex's blocking pool.
     #[cfg(feature = "ntex")]
     if tokio::runtime::Handle::try_current().is_err() {
-        return ntex_rt::spawn_blocking(work)
-            .await
-            .map_err(|error| Error::Blocking(Box::new(error)))?;
+        return run_blocking_ntex(work).await;
     }
     tokio::task::spawn_blocking(work)
         .await
@@ -39,9 +37,44 @@ where
     F: FnOnce() -> Result<T, Error> + Send + 'static,
     T: Send + 'static,
 {
-    ntex_rt::spawn_blocking(work)
-        .await
-        .map_err(|error| Error::Blocking(Box::new(error)))?
+    run_blocking_ntex(work).await
+}
+
+// ntex-rt's blocking pool cancels a still-queued closure when the awaiting
+// future is dropped before a worker picks it up: `execute` wraps every closure
+// in `if !tx.is_closed()` (`ntex-rt/src/pool.rs`), so a dropped receiver skips
+// the work entirely — directly contradicting ntex-rt's own documented contract
+// ("The task will not be cancelled even if the future is dropped"). tokio's
+// `spawn_blocking` honours that contract, and the crate relies on it: a dropped
+// ack future must still finalize the row (otherwise it strands `Running` under
+// a healthy heartbeat), and a dropped sink flush must still insert the batch it
+// already drained from its buffer (otherwise the tasks are lost). Restore the
+// guarantee on the ntex path by detaching the blocking submission onto its own
+// background task whose lifetime is independent of the caller: that task owns
+// the `BlockingResult` receiver, so the pool never sees it "closed" and always
+// runs the closure, and the result is forwarded back over a fresh channel.
+// Dropping the caller's future drops only that forwarding receiver — the
+// detached task (and the DB write it carries) still runs to completion.
+#[cfg(feature = "ntex")]
+async fn run_blocking_ntex<F, T>(work: F) -> Result<T, Error>
+where
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = futures::channel::oneshot::channel();
+    // `ntex_rt::spawn` returns a `JoinHandle` whose `Drop` *detaches* the task
+    // (async_task semantics), so dropping it here keeps the task running in the
+    // background instead of cancelling it.
+    ntex_rt::spawn(async move {
+        let _ = tx.send(ntex_rt::spawn_blocking(work).await);
+    });
+    match rx.await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_error)) => Err(Error::Blocking(Box::new(join_error))),
+        // The forwarding task was torn down before it could report back — only
+        // reachable when the arbiter itself is shutting down.
+        Err(canceled) => Err(Error::Blocking(Box::new(canceled))),
+    }
 }
 
 // Assertion helpers shared by every `run_blocking` spec, regardless of which
@@ -185,6 +218,87 @@ mod both_features_no_tokio_runtime_tests {
 
         let error = result.expect_err("panic surfaces as Err");
         is_blocking_join_error(&error).expect("panic mapped to Error::Blocking");
+    }
+}
+
+// Deterministic regression test for the ntex `spawn_blocking` cancel-on-drop
+// hazard. ntex-rt's blocking pool wraps every submitted closure in
+// `if !tx.is_closed()` (`ntex-rt/src/pool.rs`), so a closure still queued when
+// the awaiting future is dropped is silently skipped — even though ntex-rt's
+// own docs promise "the task will not be cancelled even if the future is
+// dropped". `run_blocking` relied on that (false) promise, matching tokio's
+// real guarantee, so a dropped ack/flush future could strand a `Running` row or
+// lose accepted tasks under the `ntex` feature. A saturated one-thread pool
+// makes the queueing deterministic: the occupier holds the only worker, the
+// probe's closure is queued, and cancelling the probe's future before the
+// worker frees exercises the exact skip window. Runs under the
+// `--no-default-features --features ntex --lib` CI job and `--all-features`
+// (where the ntex fallback branch is taken because no tokio runtime is entered).
+#[cfg(all(test, feature = "ntex"))]
+mod ntex_drop_safety_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    use ntex::time::{Millis, sleep, timeout};
+
+    use super::*;
+
+    #[test]
+    fn dropped_run_blocking_future_still_runs_the_work() {
+        let runner = ntex::rt::System::build()
+            .thread_pool_limit(1)
+            .build(ntex::rt::DefaultRuntime);
+
+        let ran = Arc::new(AtomicBool::new(false));
+
+        runner.block_on({
+            let ran = ran.clone();
+            async move {
+                let (busy_tx, busy_rx) = mpsc::channel::<()>();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+
+                // Occupy the single blocking-pool worker until released, so the
+                // next submission is queued rather than picked up immediately.
+                let occupy = ntex_rt::spawn_blocking(move || {
+                    busy_tx.send(()).expect("signal the worker is busy");
+                    release_rx.recv().expect("await release");
+                });
+                busy_rx.recv().expect("the worker is running the occupier");
+
+                // Submit run_blocking while the pool is saturated, then cancel
+                // its future before the worker frees — the cancel-on-drop
+                // window. The timeout drops the future once it expires.
+                {
+                    let ran = ran.clone();
+                    let _ = timeout(
+                        Millis(50),
+                        run_blocking(move || {
+                            ran.store(true, Ordering::SeqCst);
+                            Ok::<(), Error>(())
+                        }),
+                    )
+                    .await;
+                }
+
+                // Let any detached forwarding task submit its closure before we
+                // free the worker.
+                sleep(Millis(50)).await;
+
+                // Free the worker; it now dequeues the (possibly skipped)
+                // closure.
+                release_tx.send(()).expect("release the worker");
+                let _ = occupy.await;
+                sleep(Millis(200)).await;
+
+                assert!(
+                    ran.load(Ordering::SeqCst),
+                    "run_blocking silently dropped the work when its future was cancelled before the ntex blocking pool picked the closure up"
+                );
+            }
+        });
     }
 }
 
