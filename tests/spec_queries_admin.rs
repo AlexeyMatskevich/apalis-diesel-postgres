@@ -63,7 +63,7 @@ use apalis_core::{
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 use diesel::{
     RunQueryDsl, sql_query,
-    sql_types::{Integer, Text},
+    sql_types::{BigInt, Integer, Text},
 };
 use lets_expect::{AssertionResult, *};
 use ulid::Ulid;
@@ -80,6 +80,23 @@ async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         sql_query("DELETE FROM apalis.workers WHERE worker_type = $1")
             .bind::<Text, _>(&queue)
+            .execute(conn)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+}
+
+/// Delete any `Done` row with `done_at IS NULL` from the whole shared table.
+/// PostgreSQL's default `ORDER BY done_at DESC` sorts NULLs first, so such a
+/// row (schema-permitted, though nothing in this crate's own test helpers
+/// creates one) would sort ahead of any timestamp — including deliberately
+/// far-future ones used to isolate a global-listing scenario from the rest of
+/// the table. Scoped to `status = 'Done'` so it cannot touch any other test's
+/// in-flight rows.
+async fn delete_done_rows_with_null_done_at(pool: PgPool) -> Result<(), String> {
+    with_conn(pool, move |conn| {
+        sql_query("DELETE FROM apalis.jobs WHERE status = 'Done' AND done_at IS NULL")
             .execute(conn)
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -159,6 +176,46 @@ async fn insert_job(
                 .map_err(|e| e.to_string())?;
             }
         }
+        Ok(())
+    })
+    .await?;
+    Ok(task_id)
+}
+
+/// Insert a job at an absolute `run_at` (Unix seconds), rather than an offset
+/// evaluated against SQL `now()` at INSERT time. Each `insert_job` call above
+/// computes `now() - offset` fresh on the server, so a caller-supplied
+/// timestamp computed *once* in Rust and reused across several inserts
+/// (see `run_queue_activity_daily_buckets`) is byte-for-byte identical for
+/// all of them — no two inserts can land on different calendar dates just
+/// because a few milliseconds and a date boundary happened to fall between
+/// their separate `now()` evaluations.
+async fn insert_job_at(
+    pool: PgPool,
+    queue: String,
+    status: &'static str,
+    run_at_unix_secs: i64,
+    attempts: i32,
+    max_attempts: i32,
+) -> Result<String, String> {
+    let id = Ulid::new().to_string();
+    let task_id = id.clone();
+    with_conn(pool, move |conn| {
+        let job = serde_json::to_vec("admin-spec-payload").map_err(|e| e.to_string())?;
+        sql_query(
+            "INSERT INTO apalis.jobs (
+                id, job_type, job, status, attempts, max_attempts, run_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))",
+        )
+        .bind::<Text, _>(&id)
+        .bind::<Text, _>(&queue)
+        .bind::<diesel::sql_types::Binary, _>(job)
+        .bind::<Text, _>(status)
+        .bind::<Integer, _>(attempts)
+        .bind::<Integer, _>(max_attempts)
+        .bind::<BigInt, _>(run_at_unix_secs)
+        .execute(conn)
+        .map_err(|e| e.to_string())?;
         Ok(())
     })
     .await?;
@@ -794,6 +851,16 @@ async fn run_list_all_offset_slice() -> Result<Outcome<ListAllOffsetRun>, String
     let queue = format!("apalis-spec-admin-all-offset-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
+    // PostgreSQL's default `ORDER BY done_at DESC` puts NULLs *first* (ahead of
+    // every timestamp, including our far-future ones below). The schema does
+    // not forbid a `Done` row with `done_at IS NULL`, so a stray one left by
+    // some unrelated manual/direct-SQL test would otherwise sort ahead of this
+    // scenario's rows and break the offset assertions despite `list_all_tasks`
+    // being correct. Nothing in this crate's own helpers creates such a row,
+    // but clear any pre-existing one defensively so this scenario's isolation
+    // does not depend on that staying true.
+    delete_done_rows_with_null_done_at(pool.clone()).await?;
+
     // Three Done rows with done_at ~10 years in the future (offsets are
     // negative, and insert_job computes `now() - offset`), so they sort ahead
     // of every real-world Done row in this shared table regardless of what
@@ -1096,47 +1163,29 @@ async fn run_queue_activity_daily_buckets() -> Result<Outcome<QueueActivityRun>,
     let queue = format!("apalis-spec-admin-activity-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    // Two rows on the "2 days ago" calendar date and three on "1 day ago",
-    // each pinned to mid-day so the group can't straddle midnight. run_date
-    // ascending is [day-2, day-1], so ORDER BY run_date yields counts [2, 3].
-    let two_days_ago = 2 * SECS_PER_DAY + HALF_DAY;
-    let one_day_ago = SECS_PER_DAY + HALF_DAY;
+    // Two rows on the "2 days ago" calendar date and three on "1 day ago".
+    // `now_unix()` is read exactly once and every offset below is computed
+    // from that single value in Rust, then bound directly via `insert_job_at`
+    // (`to_timestamp($n)`, no server-side `now()` re-evaluation per insert):
+    // every row in a group gets a byte-identical `run_at`, so the group can
+    // never straddle a calendar-date boundary no matter what time of day (or
+    // how close to local midnight/noon) the scenario happens to run — unlike
+    // computing each insert's timestamp against SQL's own `now()` separately,
+    // which risks exactly that when the wall clock crosses a date boundary
+    // between two of this group's inserts. run_date ascending is
+    // [day-2, day-1], so ORDER BY run_date yields counts [2, 3].
+    let now = now_unix() as i64;
+    let two_days_ago = now - 2 * SECS_PER_DAY - HALF_DAY;
+    let one_day_ago = now - SECS_PER_DAY - HALF_DAY;
     for _ in 0..2 {
-        insert_job(
-            pool.clone(),
-            queue.clone(),
-            "Pending",
-            two_days_ago,
-            None,
-            0,
-            3,
-        )
-        .await?;
+        insert_job_at(pool.clone(), queue.clone(), "Pending", two_days_ago, 0, 3).await?;
     }
     for _ in 0..3 {
-        insert_job(
-            pool.clone(),
-            queue.clone(),
-            "Pending",
-            one_day_ago,
-            None,
-            0,
-            3,
-        )
-        .await?;
+        insert_job_at(pool.clone(), queue.clone(), "Pending", one_day_ago, 0, 3).await?;
     }
     // Outside the 7-day window: must be excluded from `activity` entirely.
-    let eight_days_ago = 8 * SECS_PER_DAY + HALF_DAY;
-    insert_job(
-        pool.clone(),
-        queue.clone(),
-        "Pending",
-        eight_days_ago,
-        None,
-        0,
-        3,
-    )
-    .await?;
+    let eight_days_ago = now - 8 * SECS_PER_DAY - HALF_DAY;
+    insert_job_at(pool.clone(), queue.clone(), "Pending", eight_days_ago, 0, 3).await?;
 
     let config = Config::new(&queue);
     let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
