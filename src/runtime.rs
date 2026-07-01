@@ -370,6 +370,61 @@ mod ntex_no_system_tests {
     }
 }
 
+// Guards the assumption behind the `System::try_current()` gate in
+// `run_blocking_ntex`. It is tempting to think that after an ntex
+// `SystemRunner::block_on` returns the thread keeps a *current* `System` while
+// its runtime is no longer entered — which would make the gate insufficient,
+// since `ntex_rt::spawn` needs a running `Runtime`, not merely a `System`. In
+// practice the runner clears the current `System` as it winds down (the
+// arbiter's shutdown calls `unregister_arbiter`/`remove_current`), so once
+// `block_on` returns `System::try_current()` is `None`. A caller that then
+// drives these futures off the runtime (e.g. `futures::executor::block_on`)
+// therefore takes the no-`System` inline/pool fallback, never the detached
+// `ntex_rt::spawn` path that would panic without a running runtime. The only way
+// to observe a current `System` with no running runtime is to call the
+// `#[doc(hidden)]` `System::set_current` by hand, which is not supported usage.
+// Were a future ntex release stop clearing the `System` here, this spec fails
+// loudly — signalling that the gate must then probe the runtime itself.
+#[cfg(all(test, feature = "ntex"))]
+mod ntex_runner_returned_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    #[test]
+    fn current_system_is_cleared_after_a_runner_returns_so_run_blocking_falls_back() {
+        let runner = ntex::rt::System::build()
+            .thread_pool_limit(1)
+            .build(ntex::rt::DefaultRuntime);
+        runner.block_on(async {});
+
+        assert!(
+            ntex_rt::System::try_current().is_none(),
+            "an ntex runner must clear the current System when it returns; the \
+             run_blocking gate relies on this to route off-runtime callers to \
+             the inline/pool fallback instead of the detached spawn path"
+        );
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let result = futures::executor::block_on(run_blocking({
+            let ran = ran.clone();
+            move || {
+                ran.store(true, Ordering::SeqCst);
+                Ok::<usize, Error>(9)
+            }
+        }));
+
+        assert_eq!(result.expect("work forwarded its value"), 9);
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the blocking closure must have run after the runner returned"
+        );
+    }
+}
+
 // The ntex-only `run_blocking` implementation (no tokio feature) has its own
 // spec. lets_expect is tokio-feature-bound (it emits `#[tokio::test]`), so this
 // module uses a plain `#[ntex::test]` harness, which runs under the existing
