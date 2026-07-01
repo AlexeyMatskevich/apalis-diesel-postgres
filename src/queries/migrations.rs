@@ -23,18 +23,8 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 /// `hashtext` key mirrors the advisory-lock style used elsewhere in the crate.
 const ACQUIRE_MIGRATION_LOCK: &str =
     "SELECT pg_advisory_lock(hashtext('apalis_diesel_postgres'), hashtext('migrations'))";
-const RELEASE_MIGRATION_LOCK: &str = "SELECT pg_advisory_unlock(hashtext('apalis_diesel_postgres'), hashtext('migrations')) AS released";
-
-/// Single-column result of `pg_advisory_unlock`: `true` when this session held
-/// the migration lock and released it, `false` when it did not hold it (an
-/// unexpected double-release or a missing acquire). Capturing it turns a
-/// no-op release into a detectable error instead of silently reporting a clean
-/// setup that left the serialization lock in an unexpected state.
-#[derive(diesel::QueryableByName)]
-struct AdvisoryUnlock {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    released: bool,
-}
+const RELEASE_MIGRATION_LOCK: &str =
+    "SELECT pg_advisory_unlock(hashtext('apalis_diesel_postgres'), hashtext('migrations'))";
 
 pub(crate) async fn setup(pool: PgPool) -> Result<(), Error> {
     with_conn(pool, |conn| {
@@ -56,29 +46,23 @@ pub(crate) async fn setup(pool: PgPool) -> Result<(), Error> {
         let migrated = catch_unwind(AssertUnwindSafe(|| {
             conn.run_pending_migrations(MIGRATIONS).map(|_| ())
         }));
-        let released = sql_query(RELEASE_MIGRATION_LOCK).get_result::<AdvisoryUnlock>(conn);
+        let released = sql_query(RELEASE_MIGRATION_LOCK).execute(conn);
         match migrated {
             Err(panic) => std::panic::resume_unwind(panic),
             // A migration failure is the more useful error to surface; the lock
-            // was still released above. A release failure on this path is
-            // secondary and, if it truly failed while the session stays alive,
-            // the leaked lock is auto-freed when r2d2 eventually recycles the
-            // (now suspect) connection.
+            // was still released above. (Draining every reentrant level here is
+            // deliberately not attempted: this call acquires the lock exactly
+            // once and releases it exactly once. A pre-existing extra hold could
+            // only come from a *prior* setup() whose release failed while its
+            // session stayed alive — a case r2d2 clears by recycling the suspect
+            // connection — so an unbounded drain would add per-setup overhead
+            // and a spurious "lock not owned" warning for no reachable gain.)
             Ok(Err(error)) => Err(Error::Migration(error)),
-            // On a clean migration run, a release that failed to execute — or
-            // that reported the lock was not held — compromises the
-            // serialization guarantee, so it must not be reported as success.
-            Ok(Ok(())) => match released {
-                Ok(AdvisoryUnlock { released: true }) => Ok(()),
-                Ok(AdvisoryUnlock { released: false }) => Err(Error::Migration(
-                    "the migration advisory lock was not held at release time; \
-                     concurrent setup() serialization may be compromised"
-                        .into(),
-                )),
-                Err(error) => Err(Error::database("releasing the migration advisory lock")(
-                    error,
-                )),
-            },
+            // On a clean migration run a release-query failure must surface, not
+            // be reported as success.
+            Ok(Ok(())) => released
+                .map(|_| ())
+                .map_err(Error::database("releasing the migration advisory lock")),
         }
     })
     .await

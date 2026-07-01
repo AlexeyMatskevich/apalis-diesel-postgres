@@ -286,13 +286,23 @@ async fn run_setup_releases_lock() -> Result<Option<i64>, String> {
                 n: i64,
             }
             let mut conn = maintenance_conn(&advisory_url)?;
-            sql_query("SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype = 'advisory'")
-                .load::<Count>(&mut conn)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .next()
-                .map(|row| row.n)
-                .ok_or_else(|| "pg_locks count returned no row".to_owned())
+            // Scope to THIS throwaway database: advisory locks are per-database,
+            // so filtering on the temp DB's oid excludes any advisory lock held
+            // elsewhere (the shared test DB's worker-registration locks, or a
+            // concurrent runner's own throwaway DB). Only `setup()` ever touched
+            // this database, so any advisory lock left here is its migration
+            // lock.
+            sql_query(
+                "SELECT count(*)::bigint AS n FROM pg_locks
+                 WHERE locktype = 'advisory'
+                   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .load::<Count>(&mut conn)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .map(|row| row.n)
+            .ok_or_else(|| "pg_locks count returned no row".to_owned())
         })
         .await
         .map_err(|error| error.to_string())??;
