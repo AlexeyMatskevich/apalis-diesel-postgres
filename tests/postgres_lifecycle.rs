@@ -110,9 +110,8 @@ async fn run_lifecycle() -> Result<LifecycleOutcome, String> {
         .task_id
         .ok_or_else(|| "polled task had no task id".to_owned())?;
     let polled_task_id = task_id.to_string();
-    let ulid = *task_id.inner();
 
-    let lock_outcome = lock_task(&pool, &ulid, worker.name())
+    let lock_outcome = lock_task(&pool, &task_id, worker.name())
         .await
         .map(|_| ())
         .map_err(|error| error.to_string());
