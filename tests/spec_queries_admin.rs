@@ -751,12 +751,21 @@ fn list_all_page_zero_rejected_as_invalid_argument()
 // and ordering of `list_all_tasks_rows` had no coverage — a swapped $2/$3 bind
 // (limit/offset) or a lost ORDER BY would pass green.
 //
-// `list_all_tasks` is global (no `job_type` scope), so to stay deterministic on
-// a shared DB we seed three Done rows with `done_at` at ~now() (offsets 2/1/0s
-// in the past). Those are the three most-recently-completed Done rows in the
-// whole table, so `ORDER BY done_at DESC` puts them at global positions 0/1/2
-// regardless of what other queues hold. We then walk pages of size 1 and check
-// the OFFSET carves the expected member of our own newest→oldest sequence.
+// `list_all_tasks` is global (no `job_type` scope), so to stay deterministic
+// on a shared DB we seed three Done rows with `done_at` ~10 years in the
+// future (see FAR_FUTURE_SECS below) rather than near `now()`: this puts them
+// ahead of every real-world Done row regardless of what other queues (or
+// prior test runs) hold, so `ORDER BY done_at DESC` places them at global
+// positions 0/1/2. We then walk pages of size 1 and check the OFFSET carves
+// the expected member of our own newest→oldest sequence.
+//
+// This scenario's four `to` leaves each call this async fn fresh and seed
+// their own far-future rows; like `run_metrics_global_aggregates_across_queues`
+// below, it is race-free only because this crate's DB-gated suite is required
+// to run with `--test-threads=1` (CONTRIBUTING.md; the `postgres` CI job).
+// Under a higher `--test-threads` the four leaves' seeded rows could
+// interleave with each other, since none of them scope `list_all_tasks` to
+// its own queue — that's the global behavior under test.
 // --------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1438,7 +1447,15 @@ fn total_jobs_metric_present()
 // Here we snapshot global TOTAL_JOBS/DONE_JOBS, seed rows across TWO distinct
 // queues, and assert the deltas equal the cross-queue sum — a scoped query
 // could never move the global total by both queues' rows. Deltas (not absolute
-// values) keep this robust against other rows on a shared DB.
+// values) keep this robust against *other rows already on a shared DB*, but
+// the before/after window itself is only race-free because this crate's
+// DB-gated suite is required to run with `--test-threads=1` (see
+// CONTRIBUTING.md and the `postgres` job in .github/workflows/rust.yml,
+// which additionally runs against a per-job ephemeral Postgres service, not
+// a persistent shared one) — no other test can insert/delete rows between
+// the two `global()` calls below. This scenario would be flaky under a
+// higher `--test-threads`, the same way this file's other cross-queue and
+// advisory-lock specs already are.
 // --------------------------------------------------------------------------
 
 #[derive(Debug)]
