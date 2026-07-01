@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use apalis_core::task::status::Status;
 use diesel::{
     RunQueryDsl, sql_query,
@@ -21,7 +23,11 @@ pub(crate) struct AckTaskUpdate {
     /// prevents ack spoofing by a caller who only knows `(task_id, queue,
     /// worker_id, lock_at, attempts)`. When `None`, ack falls back to the
     /// pre-lease-token predicate (callers without a token, e.g. admin).
-    pub(crate) lease_token: Option<String>,
+    ///
+    /// Held as `Arc<str>` (the storage's per-process token) so the ack path
+    /// forwards a cheap refcount clone rather than allocating a fresh `String`
+    /// on every acknowledgement; it is bound to SQL by reference below.
+    pub(crate) lease_token: Option<Arc<str>>,
 }
 
 pub(crate) fn ack_task(
@@ -62,7 +68,7 @@ pub(crate) fn ack_task(
         .bind::<Text, _>(&worker_id)
         .bind::<BigInt, _>(update.lock_at)
         .bind::<Integer, _>(update.started_attempts)
-        .bind::<Nullable<Text>, _>(update.lease_token)
+        .bind::<Nullable<Text>, _>(update.lease_token.as_deref())
         .execute(conn)
         .map_err(Error::database("acknowledging task"))?;
         if count == 0 {
