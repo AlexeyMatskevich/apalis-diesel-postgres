@@ -385,21 +385,24 @@ impl Stream for PgPollFetcher<CompactType> {
                 StreamState::Buffered(buffer) => {
                     if let Some(task) = buffer.pop_front() {
                         if buffer.is_empty() {
-                            // If the just-drained batch filled the fetch limit,
-                            // the queue likely holds more rows, so fetch again
-                            // immediately instead of waiting on the poll
-                            // strategy — whose backoff may still carry a stale
-                            // idle delay chosen before this batch arrived, which
-                            // would throttle backlog drain right after work
-                            // appears. A short batch means we drained everything
-                            // available, so fall back to the configured strategy.
-                            if this.previous_task_count.load(Ordering::Relaxed)
-                                >= this.config.buffer_size().max(1)
-                            {
-                                this.state = this.start_fetch();
-                            } else {
-                                this.state = StreamState::WaitForPoll;
-                            }
+                            // Buffer drained: always return to the configured
+                            // poll strategy for the next fetch. Fetching again
+                            // on our own the moment a limit-filling batch drains
+                            // would drain a backlog faster, but the fetcher only
+                            // holds an opaque `MultiStrategy` and cannot tell the
+                            // default backoff apart from a user-supplied hard
+                            // gate (a rate limiter, or a readiness
+                            // `StreamStrategy`/`FutureStrategy`). A self-issued
+                            // re-fetch would let a single strategy permit claim
+                            // several batches and silently bypass those limits,
+                            // so honour the strategy and wait for its next
+                            // signal. The default `BackoffStrategy` re-reads the
+                            // batch count after each delay and resets to its base
+                            // interval the cycle after work reappears; that
+                            // one-cycle lag is a property of the strategy, not
+                            // something the fetcher can short-circuit without
+                            // breaking custom gates.
+                            this.state = StreamState::WaitForPoll;
                         }
                         return Poll::Ready(Some(Ok(Some(task))));
                     }
@@ -694,12 +697,12 @@ mod tests {
     }
 
     /// Drain a single-element Buffered state and report the state the fetcher
-    /// transitions into. When the prior batch filled the fetch limit
-    /// (`previous_task_count >= buffer_size`, default 10) the drained buffer
-    /// goes straight to a fresh Fetch — drain-aggressive, since more rows
-    /// likely wait and the poll strategy's backoff may still hold a stale idle
-    /// delay. A shorter batch means everything available was drained, so it
-    /// returns to the configured poll strategy.
+    /// transitions into. Whether or not the prior batch filled the fetch limit
+    /// (`previous_task_count` vs the default `buffer_size` of 10), draining
+    /// always returns to the configured poll strategy (`wait_for_poll`): the
+    /// fetcher holds an opaque `MultiStrategy` and must not issue a fetch on its
+    /// own, or a user-supplied rate limiter / readiness gate would be bypassed
+    /// by a single permit claiming multiple batches.
     fn buffered_drain_observation(previous_task_count: usize) -> &'static str {
         let mut fetcher = buffered_with(vec![synthetic_task(b"only")]);
         fetcher
@@ -708,6 +711,37 @@ mod tests {
         let mut cx = Context::from_waker(noop_waker_ref());
         let _ = Pin::new(&mut fetcher).poll_next(&mut cx);
         state_name(&fetcher)
+    }
+
+    /// A full batch must not let the fetcher bypass its poll strategy. The
+    /// drain-aggressive shortcut jumped straight to a fresh `Fetch` when a
+    /// limit-filling batch drained, so one strategy permit could claim several
+    /// batches — silently bypassing a user-supplied rate limiter or readiness
+    /// gate. Model an already-spent gate with a strategy that never yields
+    /// again: after draining a full batch (`previous_task_count == buffer_size`)
+    /// the fetcher must return to `wait_for_poll` and, on the next poll, stay
+    /// Pending (no fetch) until the strategy grants another permit. Reports
+    /// `(state after draining, poll after that)`; the pre-fix shortcut parked in
+    /// `fetch` instead.
+    fn full_batch_respects_a_spent_poll_strategy() -> (&'static str, &'static str) {
+        let mut fetcher = buffered_with(vec![synthetic_task(b"only")]);
+        // Spent gate: no further permits will ever be granted.
+        fetcher.poller = pending_poller();
+        // The just-drained batch filled the fetch limit.
+        let full = fetcher.config.buffer_size().max(1);
+        fetcher.previous_task_count.store(full, Ordering::Relaxed);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        // First poll drains the one buffered task and parks the fetcher.
+        let _ = Pin::new(&mut fetcher).poll_next(&mut cx);
+        let parked = state_name(&fetcher);
+        // Second poll consults the strategy; its permit is already spent, so a
+        // correct fetcher waits instead of issuing another fetch.
+        let follow_up = match Pin::new(&mut fetcher).poll_next(&mut cx) {
+            Poll::Pending => "pending",
+            Poll::Ready(Some(Ok(Some(_)))) => "task",
+            Poll::Ready(_) => "other",
+        };
+        (parked, follow_up)
     }
 
     /// Build a fetcher through its public constructor (so it owns whatever poll
@@ -834,12 +868,20 @@ mod tests {
             let previous_task_count = 10; // == default buffer_size: the batch filled the limit
 
             when the_drained_batch_had_filled_the_fetch_limit {
-                to fetches_again_immediately_to_drain_the_backlog { equal("fetch") }
+                to returns_to_the_configured_poll_strategy { equal("wait_for_poll") }
             }
 
             when the_drained_batch_was_shorter_than_the_fetch_limit {
                 let previous_task_count = 3;
-                to returns_to_the_configured_poll_strategy { equal("wait_for_poll") }
+                to also_returns_to_the_configured_poll_strategy { equal("wait_for_poll") }
+            }
+        }
+
+        expect(full_batch_respects_a_spent_poll_strategy()) {
+            when a_limit_filling_batch_is_drained_and_the_strategy_has_no_further_permit {
+                to returns_to_the_strategy_and_stays_pending_without_fetching {
+                    equal(("wait_for_poll", "pending"))
+                }
             }
         }
 
