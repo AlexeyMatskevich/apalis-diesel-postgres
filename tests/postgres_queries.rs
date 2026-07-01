@@ -876,7 +876,7 @@ async fn run_lock_boundary(lockable: bool) -> Result<Outcome<LockBoundaryRun>, S
         .register_worker(worker_name.clone())
         .await
         .map_err(|e| e.to_string())?;
-    let lock_result = lock_task(&pool, id.inner(), &worker_name).await;
+    let lock_result = lock_task(&pool, &id, &worker_name).await;
     cleanup_queue(pool, queue).await?;
 
     Ok(Outcome::Completed(LockBoundaryRun {
@@ -1196,7 +1196,7 @@ async fn run_lock_status_scenario(
     )
     .await?;
 
-    let lock_result = lock_task(&pool, id.inner(), &primary_worker).await;
+    let lock_result = lock_task(&pool, &id, &primary_worker).await;
     let row = fetch_status_only(pool.clone(), id).await?;
     cleanup_queue(pool, queue).await?;
 
@@ -1249,7 +1249,7 @@ async fn run_lock_in_queue_scenario(
         other => return Err(format!("unknown in-queue scenario: {other}")),
     };
 
-    let lock_result = lock_task_in_queue(&pool, id.inner(), &primary_worker, &lock_queue).await;
+    let lock_result = lock_task_in_queue(&pool, &id, &primary_worker, &lock_queue).await;
     let row = fetch_status_only(pool.clone(), id).await?;
     cleanup_queue(pool, queue).await?;
 
@@ -2283,10 +2283,10 @@ async fn run_lock_already_held() -> Result<Outcome<LockAlreadyHeldRun>, String> 
     let id = task.parts.task_id.expect("task has id");
     storage.push_task(task).await.map_err(|e| e.to_string())?;
 
-    lock_task(&pool, id.inner(), &first_worker)
+    lock_task(&pool, &id, &first_worker)
         .await
         .map_err(|e| format!("first lock failed: {e}"))?;
-    let second = lock_task(&pool, id.inner(), &second_worker).await;
+    let second = lock_task(&pool, &id, &second_worker).await;
 
     let id_text = id.to_string();
     let row = with_conn(pool.clone(), move |conn| {
@@ -2548,7 +2548,7 @@ async fn run_lock_missing_row() -> Result<Outcome<LockMissingRowRun>, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let phantom_id = Ulid::new();
+    let phantom_id = PgTaskId::new(Ulid::new());
     let result = lock_task(&pool, &phantom_id, &worker_name).await;
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(LockMissingRowRun {

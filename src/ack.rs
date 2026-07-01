@@ -16,7 +16,7 @@ use ulid::Ulid;
 
 use std::sync::Arc;
 
-use crate::{Error, PgContext, PgPool, PgTask, queries};
+use crate::{Error, PgContext, PgPool, PgTask, PgTaskId, queries};
 
 /// Acknowledges task completion by updating `apalis.jobs`.
 ///
@@ -857,9 +857,9 @@ pub(crate) fn calculate_status<Res>(
 /// # Cross-queue semantics
 ///
 /// This entry point does **not** filter by `job_type`: a caller holding a
-/// task's `Ulid` can lock it regardless of which queue it belongs to. Prefer
-/// [`lock_task_in_queue`] which scopes the lock to a specific queue and
-/// prevents a caller that learned a `Ulid` from logs or dashboards from
+/// task's [`PgTaskId`] can lock it regardless of which queue it belongs to.
+/// Prefer [`lock_task_in_queue`] which scopes the lock to a specific queue and
+/// prevents a caller that learned a task id from logs or dashboards from
 /// claiming it under an unrelated queue.
 ///
 /// # Errors
@@ -872,8 +872,8 @@ pub(crate) fn calculate_status<Res>(
 /// - [`Error::Pool`] if a pooled connection cannot be acquired.
 /// - [`Error::Blocking`] if the blocking task carrying the query fails to
 ///   complete (a panic in the worker thread, or runtime shutdown).
-pub async fn lock_task(pool: &PgPool, task_id: &Ulid, worker_id: &str) -> Result<(), Error> {
-    queries::lock_task(pool.clone(), *task_id, worker_id.to_owned(), None).await
+pub async fn lock_task(pool: &PgPool, task_id: &PgTaskId, worker_id: &str) -> Result<(), Error> {
+    queries::lock_task(pool.clone(), *task_id.inner(), worker_id.to_owned(), None).await
 }
 
 /// Lock a due task scoped to a specific queue.
@@ -892,13 +892,13 @@ pub async fn lock_task(pool: &PgPool, task_id: &Ulid, worker_id: &str) -> Result
 /// blocking task fails to complete.
 pub async fn lock_task_in_queue(
     pool: &PgPool,
-    task_id: &Ulid,
+    task_id: &PgTaskId,
     worker_id: &str,
     queue: &str,
 ) -> Result<(), Error> {
     queries::lock_task(
         pool.clone(),
-        *task_id,
+        *task_id.inner(),
         worker_id.to_owned(),
         Some(queue.to_owned()),
     )
