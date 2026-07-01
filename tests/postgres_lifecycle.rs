@@ -116,7 +116,7 @@ async fn run_lifecycle() -> Result<LifecycleOutcome, String> {
         .map(|_| ())
         .map_err(|error| error.to_string());
 
-    let mut ack = PgAck::new(pool.clone());
+    let mut ack = PgAck::new(&pool);
     task.parts.attempt = Attempt::new_with_value(1);
     let result: Result<String, BoxDynError> = Ok("processed".to_owned());
     let ack_outcome = ack

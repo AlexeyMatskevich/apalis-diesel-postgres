@@ -64,10 +64,10 @@ pub struct SharedPostgresStorage<Codec = JsonCodec<CompactType>> {
 impl<Codec> SharedPostgresStorage<Codec> {
     /// Create a shared storage factory.
     #[must_use]
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: &PgPool) -> Self {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
         Self {
-            pool,
+            pool: pool.clone(),
             registry,
             listener_alive: Arc::new(AtomicBool::new(false)),
             _marker: PhantomData,
@@ -503,12 +503,12 @@ mod tests {
     }
 
     fn shared_debug() -> String {
-        let shared: SharedPostgresStorage = SharedPostgresStorage::new(unchecked_pool());
+        let shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
         format!("{shared:?}")
     }
 
     fn make_default_shared() -> Result<SharedObservation, SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
         let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared(&mut shared)?;
         Ok(SharedObservation {
             queue: storage.config.queue().to_string(),
@@ -518,7 +518,7 @@ mod tests {
     }
 
     fn make_configured_shared() -> Result<SharedObservation, SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
         let config = Config::new("shared-unit").set_buffer_size(3);
         let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
             &mut shared,
@@ -532,7 +532,7 @@ mod tests {
     }
 
     fn shared_trait_surfaces() -> Result<(String, String), SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
         let config = Config::new("shared-traits");
         let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
             &mut shared,
@@ -728,7 +728,7 @@ mod tests {
     /// succeeds: the broadcast redesign allows multiple consumers per queue, so
     /// the second `make_shared_with_config` must also return `Ok`.
     fn double_make_shared_same_queue() -> Result<(), SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
         let config = Config::new("double-make-shared");
         let _first = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
             &mut shared,
@@ -986,7 +986,7 @@ mod tests {
     /// the only documented way `make_shared_with_config` can return
     /// `SharedPostgresError::RegistryLocked` (shared.rs:170-173).
     fn make_shared_with_poisoned_registry() -> Result<(), SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
         let registry = shared.registry.clone();
         let join = std::thread::spawn(move || {
             let _guard = registry

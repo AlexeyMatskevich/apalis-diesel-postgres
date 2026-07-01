@@ -2241,8 +2241,8 @@ async fn run_ack_predicate(setup: AckSetup) -> Result<Outcome<AckPredicateRun>, 
         .parts;
 
     let mut ack = match setup.pgack_token {
-        Some(t) => PgAck::with_lease_token(pool.clone(), Arc::<str>::from(t)),
-        None => PgAck::new(pool.clone()),
+        Some(t) => PgAck::with_lease_token(&pool, Arc::<str>::from(t)),
+        None => PgAck::new(&pool),
     };
     let result: Result<String, BoxDynError> = Ok("processed".to_owned());
     let ack_result = ack.ack(&result, &parts).await;
