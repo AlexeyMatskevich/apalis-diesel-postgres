@@ -358,7 +358,11 @@ where
             worker.clone(),
             self.lease_token,
         );
-        crate::fetcher::decode_task_stream::<Args, Decode>(compact, pool, worker.name().to_owned())
+        crate::fetcher::decode_task_stream::<Args, Decode>(
+            compact,
+            pool,
+            std::sync::Arc::from(worker.name().as_str()),
+        )
     }
 }
 

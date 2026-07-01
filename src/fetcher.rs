@@ -76,7 +76,7 @@ where
 pub(crate) fn decode_task_stream<Args, Decode>(
     compact: TaskStream<PgTask<CompactType>, Error>,
     pool: PgPool,
-    worker_id: String,
+    worker_id: Arc<str>,
 ) -> TaskStream<PgTask<Args>, Error>
 where
     Args: Send + 'static,
@@ -85,8 +85,12 @@ where
 {
     compact
         .then(move |row| {
+            // Both handles are only consumed on the rare decode-error path, but
+            // each yielded future needs its own copy. `PgPool` is Arc-backed and
+            // `worker_id` is `Arc<str>`, so these per-row clones are refcount
+            // bumps — the previous `String` `worker_id` allocated on every row.
             let pool = pool.clone();
-            let worker_id = worker_id.clone();
+            let worker_id = Arc::clone(&worker_id);
             async move {
                 match row {
                     Ok(Some(task)) => {
@@ -113,7 +117,7 @@ where
                                     let _ = queries::fail_undecodable_task(
                                         pool,
                                         task_id,
-                                        worker_id,
+                                        worker_id.to_string(),
                                         lock_at,
                                         attempts,
                                         error.to_string(),
