@@ -89,6 +89,12 @@ struct CountRow {
     n: i64,
 }
 
+#[derive(QueryableByName, Debug)]
+struct PayloadRow {
+    #[diesel(sql_type = Text)]
+    payload: String,
+}
+
 fn fetch_job(conn: &mut PgConnection, queue: &str) -> Result<Option<JobRow>, String> {
     sql_query(
         "SELECT id, priority, max_attempts, run_at, metadata, idempotency_key
@@ -221,6 +227,10 @@ struct BatchRun {
     distinct_returned_ids: usize,
     db_jobs: i64,
     all_ids_present: bool,
+    /// For each returned id, the `job` payload stored in `apalis.jobs` for that
+    /// id. `returned[i]` must map to the row whose payload is `payload-{i}`,
+    /// pinning the documented "submission order" contract.
+    returned_payloads_in_order: Vec<Option<String>>,
 }
 
 const BATCH_SIZE: usize = 5;
@@ -249,25 +259,42 @@ async fn run_batch_commit_scenario() -> Result<Outcome<BatchRun>, String> {
 
     let q2 = queue.clone();
     let ids_for_check = returned.clone();
-    let (db_jobs, all_ids_present) = with_conn(pool.clone(), move |conn| {
-        let count = count_jobs(conn, &q2)?;
-        let mut present = true;
-        for id in &ids_for_check {
-            let n = sql_query(
-                "SELECT COUNT(*)::bigint AS n FROM apalis.jobs WHERE id = $1 AND job_type = $2",
-            )
-            .bind::<Text, _>(id.to_string())
-            .bind::<Text, _>(&q2)
-            .get_result::<CountRow>(conn)
-            .map(|r| r.n)
-            .map_err(|e| e.to_string())?;
-            if n != 1 {
-                present = false;
+    let (db_jobs, all_ids_present, returned_payloads_in_order) =
+        with_conn(pool.clone(), move |conn| {
+            let count = count_jobs(conn, &q2)?;
+            let mut present = true;
+            // For each returned id, in the order it was returned, read back the
+            // payload stored for that id. `job` is BYTEA holding the
+            // JSON-encoded `String` (e.g. `"payload-0"`); decode it to UTF-8 so
+            // the caller can compare `returned[i]` against `payload-{i}`.
+            let mut payloads_in_order = Vec::with_capacity(ids_for_check.len());
+            for id in &ids_for_check {
+                let n = sql_query(
+                    "SELECT COUNT(*)::bigint AS n FROM apalis.jobs WHERE id = $1 AND job_type = $2",
+                )
+                .bind::<Text, _>(id.to_string())
+                .bind::<Text, _>(&q2)
+                .get_result::<CountRow>(conn)
+                .map(|r| r.n)
+                .map_err(|e| e.to_string())?;
+                if n != 1 {
+                    present = false;
+                }
+                let payload = sql_query(
+                    "SELECT convert_from(job, 'UTF8') AS payload
+                     FROM apalis.jobs WHERE id = $1 AND job_type = $2",
+                )
+                .bind::<Text, _>(id.to_string())
+                .bind::<Text, _>(&q2)
+                .get_result::<PayloadRow>(conn)
+                .optional()
+                .map_err(|e| e.to_string())?
+                .map(|row| row.payload);
+                payloads_in_order.push(payload);
             }
-        }
-        Ok::<_, String>((count, present))
-    })
-    .await?;
+            Ok::<_, String>((count, present, payloads_in_order))
+        })
+        .await?;
 
     cleanup(pool, queue).await?;
     let distinct: std::collections::HashSet<String> =
@@ -277,6 +304,7 @@ async fn run_batch_commit_scenario() -> Result<Outcome<BatchRun>, String> {
         distinct_returned_ids: distinct.len(),
         db_jobs,
         all_ids_present,
+        returned_payloads_in_order,
     }))
 }
 
@@ -307,6 +335,38 @@ fn batch_returns_distinct_ids_present_in_db()
         } else {
             Err("a returned task id was not found in apalis.jobs".to_owned())
         }
+    })
+}
+
+fn batch_returns_ids_in_submission_order()
+-> impl Fn(&Result<Outcome<BatchRun>, String>) -> AssertionResult {
+    observe("batch→submission order", |run: &BatchRun| {
+        // The rustdoc contract is "returns the generated PgTaskId's in
+        // submission order". Payloads are distinguishable (`payload-{i}`), so
+        // the id returned at position `i` must be the row whose stored payload
+        // is `payload-{i}`. A regression that sorts or shuffles the returned
+        // ids before returning them would map `returned[i]` to the wrong row
+        // here even though every id is still present in the table.
+        if run.returned_payloads_in_order.len() != BATCH_SIZE {
+            return Err(format!(
+                "expected {BATCH_SIZE} payloads to check, got {}",
+                run.returned_payloads_in_order.len()
+            ));
+        }
+        for (i, payload) in run.returned_payloads_in_order.iter().enumerate() {
+            // `job` holds the JSON-encoded String, e.g. `"payload-0"` (quotes
+            // included).
+            let expected = format!("\"payload-{i}\"");
+            match payload {
+                Some(actual) if *actual == expected => {}
+                other => {
+                    return Err(format!(
+                        "returned id at position {i} maps to payload {other:?}, expected {expected:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     })
 }
 
@@ -592,6 +652,451 @@ fn custom_idempotency_key_is_stored()
             Err(format!(
                 "expected idempotency_key {:?}, got {:?}",
                 run.expected_idempotency_key, run.db_idempotency_key
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// Scenario 3b: push_tasks_with_conn carries each task's distinct custom fields
+// through the batch. This is the ONLY outbox method that maps per-task
+// idempotency_key / priority / run_at / max_attempts / metadata / task_id
+// inside a single batch, so it must be pinned separately from the single-task
+// `push_task_with_conn` path: a regression that reuses the first task's context
+// for every row, or mis-associates the returned ids with the wrong rows, is
+// only visible when the two tasks differ in every field.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct BatchCustomTaskExpectation {
+    id: String,
+    priority: i32,
+    max_attempts: i32,
+    run_at_secs: i64,
+    metadata: serde_json::Value,
+    idempotency_key: String,
+}
+
+#[derive(Debug)]
+struct BatchCustomTaskObserved {
+    priority: i32,
+    max_attempts: i32,
+    run_at_secs: i64,
+    metadata: serde_json::Value,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug)]
+struct BatchCustomRun {
+    /// The ids returned by `push_tasks_with_conn`, in submission order.
+    returned_ids: Vec<String>,
+    /// What each task was constructed with, in submission order.
+    expected: Vec<BatchCustomTaskExpectation>,
+    /// The row read back keyed by the *returned* id at the same position, so a
+    /// mismatch exposes both mis-carried fields and mis-associated ids.
+    observed_by_returned_id: Vec<Option<BatchCustomTaskObserved>>,
+}
+
+async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-outbox-batch-custom-{}", Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+
+    let storage =
+        PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(1));
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as i64;
+
+    // Two fully-populated tasks that differ in EVERY custom field.
+    let id_a = PgTaskId::new(Ulid::new());
+    let id_b = PgTaskId::new(Ulid::new());
+    let run_at_a = now_secs + 3_600;
+    let run_at_b = now_secs + 7_200;
+    let meta_a = serde_json::json!({ "which": "a", "n": 1 });
+    let meta_b = serde_json::json!({ "which": "b", "n": 2 });
+    let idem_a = format!("idem-a-{queue}");
+    let idem_b = format!("idem-b-{queue}");
+
+    let mut task_a = PgTask::<String>::new("payload-a".to_owned());
+    task_a.parts.task_id = Some(id_a);
+    task_a.parts.run_at = run_at_a as u64;
+    task_a.parts.idempotency_key = Some(idem_a.clone());
+    task_a.parts.ctx = SqlContext::new()
+        .with_max_attempts(3)
+        .with_priority(1)
+        .with_meta(meta_a.as_object().unwrap().clone());
+
+    let mut task_b = PgTask::<String>::new("payload-b".to_owned());
+    task_b.parts.task_id = Some(id_b);
+    task_b.parts.run_at = run_at_b as u64;
+    task_b.parts.idempotency_key = Some(idem_b.clone());
+    task_b.parts.ctx = SqlContext::new()
+        .with_max_attempts(8)
+        .with_priority(6)
+        .with_meta(meta_b.as_object().unwrap().clone());
+
+    let expected = vec![
+        BatchCustomTaskExpectation {
+            id: id_a.to_string(),
+            priority: 1,
+            max_attempts: 3,
+            run_at_secs: run_at_a,
+            metadata: meta_a.clone(),
+            idempotency_key: idem_a,
+        },
+        BatchCustomTaskExpectation {
+            id: id_b.to_string(),
+            priority: 6,
+            max_attempts: 8,
+            run_at_secs: run_at_b,
+            metadata: meta_b.clone(),
+            idempotency_key: idem_b,
+        },
+    ];
+
+    let storage_for_txn = storage.clone();
+    let pool_for_txn = pool.clone();
+    let returned = tokio::task::spawn_blocking(move || -> Result<Vec<PgTaskId>, String> {
+        let mut conn = pool_for_txn.get().map_err(|e| e.to_string())?;
+        conn.transaction::<_, PgError, _>(|c| {
+            storage_for_txn.push_tasks_with_conn(c, vec![task_a, task_b])
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let returned_for_read = returned.clone();
+    let q2 = queue.clone();
+    let observed_by_returned_id = with_conn(pool.clone(), move |conn| {
+        let mut rows = Vec::with_capacity(returned_for_read.len());
+        for id in &returned_for_read {
+            let row = sql_query(
+                "SELECT id, priority, max_attempts, run_at, metadata, idempotency_key
+                 FROM apalis.jobs WHERE id = $1 AND job_type = $2",
+            )
+            .bind::<Text, _>(id.to_string())
+            .bind::<Text, _>(&q2)
+            .get_result::<JobRow>(conn)
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|r| BatchCustomTaskObserved {
+                priority: r.priority,
+                max_attempts: r.max_attempts,
+                run_at_secs: r.run_at.to_unix_timestamp(),
+                metadata: r.metadata,
+                idempotency_key: r.idempotency_key,
+            });
+            rows.push(row);
+        }
+        Ok::<_, String>(rows)
+    })
+    .await?;
+
+    cleanup(pool, queue).await?;
+    Ok(Outcome::Completed(BatchCustomRun {
+        returned_ids: returned.iter().map(ToString::to_string).collect(),
+        expected,
+        observed_by_returned_id,
+    }))
+}
+
+fn batch_custom_returns_each_task_id_in_order()
+-> impl Fn(&Result<Outcome<BatchCustomRun>, String>) -> AssertionResult {
+    observe("batch-custom→task ids", |run: &BatchCustomRun| {
+        let expected_ids: Vec<&str> = run.expected.iter().map(|e| e.id.as_str()).collect();
+        let returned_ids: Vec<&str> = run.returned_ids.iter().map(String::as_str).collect();
+        if returned_ids == expected_ids {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected returned ids {expected_ids:?} in submission order, got {returned_ids:?}"
+            ))
+        }
+    })
+}
+
+fn batch_custom_carries_each_tasks_fields()
+-> impl Fn(&Result<Outcome<BatchCustomRun>, String>) -> AssertionResult {
+    observe("batch-custom→per-task fields", |run: &BatchCustomRun| {
+        for (i, expected) in run.expected.iter().enumerate() {
+            let observed = run
+                .observed_by_returned_id
+                .get(i)
+                .ok_or_else(|| format!("no row read back for position {i}"))?
+                .as_ref()
+                .ok_or_else(|| {
+                    format!(
+                        "returned id {:?} (position {i}) had no row in apalis.jobs",
+                        expected.id
+                    )
+                })?;
+            if observed.priority != expected.priority {
+                return Err(format!(
+                    "task {i}: expected priority {}, got {}",
+                    expected.priority, observed.priority
+                ));
+            }
+            if observed.max_attempts != expected.max_attempts {
+                return Err(format!(
+                    "task {i}: expected max_attempts {}, got {}",
+                    expected.max_attempts, observed.max_attempts
+                ));
+            }
+            if observed.run_at_secs != expected.run_at_secs {
+                return Err(format!(
+                    "task {i}: expected run_at {} sec, got {}",
+                    expected.run_at_secs, observed.run_at_secs
+                ));
+            }
+            if observed.metadata != expected.metadata {
+                return Err(format!(
+                    "task {i}: expected metadata {}, got {}",
+                    expected.metadata, observed.metadata
+                ));
+            }
+            if observed.idempotency_key.as_deref() != Some(expected.idempotency_key.as_str()) {
+                return Err(format!(
+                    "task {i}: expected idempotency_key {:?}, got {:?}",
+                    expected.idempotency_key, observed.idempotency_key
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+// --------------------------------------------------------------------------
+// Scenario 3c: an empty batch is a documented no-op that returns an empty
+// vector, for both `push_batch_with_conn` and `push_tasks_with_conn`. The
+// implementation short-circuits in `prepare_batch` before opening any
+// transaction, so this pins that neither method inserts rows nor returns a
+// non-empty vector on an empty iterator.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct EmptyBatchRun {
+    push_batch_returned_len: usize,
+    push_tasks_returned_len: usize,
+    db_jobs: i64,
+}
+
+async fn run_empty_batch_scenario() -> Result<Outcome<EmptyBatchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-outbox-empty-{}", Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+
+    let storage =
+        PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(1));
+
+    let storage_for_txn = storage.clone();
+    let pool_for_txn = pool.clone();
+    let (push_batch_returned_len, push_tasks_returned_len) =
+        tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
+            let mut conn = pool_for_txn.get().map_err(|e| e.to_string())?;
+            // Empty `Args` iterator → push_batch_with_conn.
+            let batch_ids: Vec<PgTaskId> = storage_for_txn
+                .push_batch_with_conn(&mut conn, Vec::<String>::new())
+                .map_err(|e| e.to_string())?;
+            // Empty `PgTask` iterator → push_tasks_with_conn.
+            let tasks_ids: Vec<PgTaskId> = storage_for_txn
+                .push_tasks_with_conn(&mut conn, Vec::<PgTask<String>>::new())
+                .map_err(|e| e.to_string())?;
+            Ok((batch_ids.len(), tasks_ids.len()))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let q2 = queue.clone();
+    let db_jobs = with_conn(pool.clone(), move |conn| count_jobs(conn, &q2)).await?;
+
+    cleanup(pool, queue).await?;
+    Ok(Outcome::Completed(EmptyBatchRun {
+        push_batch_returned_len,
+        push_tasks_returned_len,
+        db_jobs,
+    }))
+}
+
+fn empty_push_batch_returns_empty_vec()
+-> impl Fn(&Result<Outcome<EmptyBatchRun>, String>) -> AssertionResult {
+    observe("empty→push_batch len", |run: &EmptyBatchRun| {
+        if run.push_batch_returned_len == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected push_batch_with_conn to return an empty vec, got {} ids",
+                run.push_batch_returned_len
+            ))
+        }
+    })
+}
+
+fn empty_push_tasks_returns_empty_vec()
+-> impl Fn(&Result<Outcome<EmptyBatchRun>, String>) -> AssertionResult {
+    observe("empty→push_tasks len", |run: &EmptyBatchRun| {
+        if run.push_tasks_returned_len == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected push_tasks_with_conn to return an empty vec, got {} ids",
+                run.push_tasks_returned_len
+            ))
+        }
+    })
+}
+
+fn empty_batch_inserts_no_rows()
+-> impl Fn(&Result<Outcome<EmptyBatchRun>, String>) -> AssertionResult {
+    observe("empty→job count", |run: &EmptyBatchRun| {
+        if run.db_jobs == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected no jobs inserted by empty batches, got {}",
+                run.db_jobs
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// Scenario 3d: every outbox method documents `Error::Decode` when the codec
+// rejects a task's args. With a codec whose `encode` always fails, each method
+// must surface `Error::Decode` — and it must do so before touching the
+// database, so no rows are inserted.
+// --------------------------------------------------------------------------
+
+/// A codec that always fails to encode, exercising the documented
+/// `Error::Decode` branch of the outbox methods. `decode` is never reached in
+/// these tests but is required by the trait.
+#[derive(Debug, Clone, Default)]
+struct FailingEncodeCodec;
+
+#[derive(Debug)]
+struct FailingEncodeError;
+
+impl std::fmt::Display for FailingEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failing codec: encode always fails")
+    }
+}
+
+impl std::error::Error for FailingEncodeError {}
+
+impl apalis_core::backend::codec::Codec<String> for FailingEncodeCodec {
+    type Error = FailingEncodeError;
+    type Compact = Vec<u8>;
+
+    fn encode(_val: &String) -> Result<Self::Compact, Self::Error> {
+        Err(FailingEncodeError)
+    }
+
+    fn decode(_val: &Self::Compact) -> Result<String, Self::Error> {
+        Err(FailingEncodeError)
+    }
+}
+
+#[derive(Debug)]
+struct EncodeFailureRun {
+    push_with_conn_was_decode: bool,
+    push_task_with_conn_was_decode: bool,
+    push_batch_with_conn_was_decode: bool,
+    push_tasks_with_conn_was_decode: bool,
+    db_jobs: i64,
+}
+
+async fn run_encode_failure_scenario() -> Result<Outcome<EncodeFailureRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-outbox-encode-fail-{}", Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+
+    let storage =
+        PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(1))
+            .with_codec::<FailingEncodeCodec>();
+
+    let pool_for_txn = pool.clone();
+    let observed =
+        tokio::task::spawn_blocking(move || -> Result<(bool, bool, bool, bool), String> {
+            let mut conn = pool_for_txn.get().map_err(|e| e.to_string())?;
+            fn is_decode<T>(r: Result<T, PgError>) -> bool {
+                matches!(r, Err(PgError::Decode(_)))
+            }
+
+            let a = is_decode(storage.push_with_conn(&mut conn, "x".to_owned()));
+
+            let mut task = PgTask::<String>::new("x".to_owned());
+            task.parts.task_id = Some(PgTaskId::new(Ulid::new()));
+            let b = is_decode(storage.push_task_with_conn(&mut conn, task));
+
+            let c = is_decode(storage.push_batch_with_conn(&mut conn, vec!["x".to_owned()]));
+
+            let mut task2 = PgTask::<String>::new("x".to_owned());
+            task2.parts.task_id = Some(PgTaskId::new(Ulid::new()));
+            let d = is_decode(storage.push_tasks_with_conn(&mut conn, vec![task2]));
+
+            Ok((a, b, c, d))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let q2 = queue.clone();
+    let db_jobs = with_conn(pool.clone(), move |conn| count_jobs(conn, &q2)).await?;
+
+    cleanup(pool, queue).await?;
+    Ok(Outcome::Completed(EncodeFailureRun {
+        push_with_conn_was_decode: observed.0,
+        push_task_with_conn_was_decode: observed.1,
+        push_batch_with_conn_was_decode: observed.2,
+        push_tasks_with_conn_was_decode: observed.3,
+        db_jobs,
+    }))
+}
+
+fn encode_failure_surfaces_decode_on_every_method()
+-> impl Fn(&Result<Outcome<EncodeFailureRun>, String>) -> AssertionResult {
+    observe("encode-fail→Error::Decode", |run: &EncodeFailureRun| {
+        let mut wrong = Vec::new();
+        if !run.push_with_conn_was_decode {
+            wrong.push("push_with_conn");
+        }
+        if !run.push_task_with_conn_was_decode {
+            wrong.push("push_task_with_conn");
+        }
+        if !run.push_batch_with_conn_was_decode {
+            wrong.push("push_batch_with_conn");
+        }
+        if !run.push_tasks_with_conn_was_decode {
+            wrong.push("push_tasks_with_conn");
+        }
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected Error::Decode from every outbox method, but these did not: {wrong:?}"
+            ))
+        }
+    })
+}
+
+fn encode_failure_inserts_no_rows()
+-> impl Fn(&Result<Outcome<EncodeFailureRun>, String>) -> AssertionResult {
+    observe("encode-fail→job count", |run: &EncodeFailureRun| {
+        if run.db_jobs == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "encode failure happens before any DB write, expected 0 jobs, got {}",
+                run.db_jobs
             ))
         }
     })
@@ -913,6 +1418,7 @@ lets_expect! { #tokio_test
         when push_batch_with_conn_commits_a_multi_task_batch {
             to inserts_every_task_in_the_batch { batch_inserts_every_task() }
             to returns_distinct_ids_that_all_landed { batch_returns_distinct_ids_present_in_db() }
+            to returns_ids_in_submission_order { batch_returns_ids_in_submission_order() }
         }
     }
 
@@ -934,6 +1440,30 @@ lets_expect! { #tokio_test
             to stores_the_scheduled_run_at { custom_run_at_is_stored() }
             to stores_the_metadata { custom_metadata_is_stored() }
             to stores_the_idempotency_key { custom_idempotency_key_is_stored() }
+        }
+    }
+
+    expect(run_batch_custom_fields_scenario().await) {
+        when push_tasks_with_conn_receives_a_batch_of_distinct_fully_populated_tasks {
+            to returns_each_task_id_in_submission_order { batch_custom_returns_each_task_id_in_order() }
+            to carries_each_tasks_own_custom_fields { batch_custom_carries_each_tasks_fields() }
+        }
+    }
+
+    expect(run_empty_batch_scenario().await) {
+        when the_batch_iterators_are_empty {
+            to push_batch_with_conn_returns_an_empty_vector { empty_push_batch_returns_empty_vec() }
+            to push_tasks_with_conn_returns_an_empty_vector { empty_push_tasks_returns_empty_vec() }
+            to inserts_no_rows { empty_batch_inserts_no_rows() }
+        }
+    }
+
+    expect(run_encode_failure_scenario().await) {
+        when the_codec_rejects_the_args_on_encode {
+            to every_outbox_method_surfaces_error_decode {
+                encode_failure_surfaces_decode_on_every_method()
+            }
+            to no_rows_are_inserted { encode_failure_inserts_no_rows() }
         }
     }
 

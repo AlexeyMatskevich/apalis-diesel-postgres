@@ -363,6 +363,24 @@ mod tests {
         prepare_batch(&config, vec![task])
     }
 
+    fn prepare_empty_batch() -> Result<Option<PreparedBatch>, Error> {
+        let config = Config::new("payload-cap");
+        prepare_batch(&config, Vec::<PgTask<CompactType>>::new())
+    }
+
+    fn skips_the_empty_batch(result: &Result<Option<PreparedBatch>, Error>) -> AssertionResult {
+        match result {
+            Ok(None) => Ok(()),
+            Ok(Some(batch)) => Err(AssertionError::new(vec![format!(
+                "expected an empty batch to produce Ok(None), got a batch of {} task(s)",
+                batch.task_count
+            )])),
+            Err(error) => Err(AssertionError::new(vec![format!(
+                "expected an empty batch to produce Ok(None), got error: {error:?}"
+            )])),
+        }
+    }
+
     fn accepts_one_task(result: &Result<Option<PreparedBatch>, Error>) -> AssertionResult {
         match result {
             Ok(Some(batch)) if batch.task_count == 1 => Ok(()),
@@ -399,6 +417,11 @@ mod tests {
         expect(prepare_batch_for_payload(len)) {
             let len = 128;
 
+            when the_payload_is_empty {
+                let len = 0;
+                to accepts_the_zero_length_payload { accepts_one_task }
+            }
+
             when the_payload_is_well_below_the_cap {
                 to accepts_the_task { accepts_one_task }
             }
@@ -411,6 +434,14 @@ mod tests {
             when the_payload_is_one_byte_over_the_cap {
                 let len = MAX_JOB_PAYLOAD_LEN + 1;
                 to rejects_the_oversized_payload { rejects_with_payload_cap }
+            }
+        }
+    }
+
+    lets_expect! {
+        expect(prepare_empty_batch()) {
+            when the_batch_is_empty {
+                to produces_no_batch { skips_the_empty_batch }
             }
         }
     }
