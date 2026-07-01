@@ -17,24 +17,30 @@
 //!   - `i32_from_u32` / `filter_offset_i32` unit tests in `queries/mod.rs`.
 //!
 //! What we DO pin here (each `expect` block enumerates one scenario):
-//!   - `list_tasks` status filter (Done / Failed / Killed / Pending) scopes
-//!     correctly per queue.
+//!   - `list_tasks` status filter (all six `Status` variants: Pending / Queued
+//!     / Running / Done / Failed / Killed) scopes correctly per queue.
 //!   - `list_tasks` `ORDER BY done_at DESC, run_at DESC`: primary done_at DESC
 //!     across terminal rows, secondary run_at DESC tie-break.
 //!   - `list_tasks` pagination — page=1/page=2 carve disjoint slices, page=0
 //!     surfaces `InvalidArgument`.
 //!   - `list_all_tasks` — the global listing's own axes: `page=0` surfaces
-//!     `InvalidArgument` via `filter_offset_i32`, and a non-zero OFFSET shifts
-//!     the result past the first global row (the cross-queue "rows from many
-//!     job_types coexist" property is owned by `run_listing_metrics`, not here).
+//!     `InvalidArgument` via `filter_offset_i32`, a non-zero OFFSET shifts the
+//!     result past the first global row, AND the `LIMIT $2` bind caps each
+//!     `page_size=1` request at exactly one row (a dropped LIMIT would
+//!     over-return the whole global tail). The cross-queue "rows from many
+//!     job_types coexist" property is owned by `run_listing_metrics`, not here.
 //!   - `list_queues` — a queue with only `apalis.workers` rows (no jobs) still
-//!     appears via the `all_job_types` UNION, AND a jobs-backed queue surfaces
-//!     its `queue_stats` CTE counts (PENDING_JOBS / TOTAL_JOBS) in `stats`.
+//!     appears via the `all_job_types` UNION, a jobs-backed queue surfaces its
+//!     `queue_stats` CTE counts (PENDING_JOBS / TOTAL_JOBS) in `stats`, AND the
+//!     `daily_activity` CTE buckets per-day counts (ordered by `run_date`,
+//!     inside the 7-day window) into `QueueInfo.activity`.
 //!   - `metrics_for_queue` — counts on a queue mixing active (Pending / Running
 //!     / Queued) and terminal (Done / Failed / Killed) rows, including the
-//!     RUNNING_JOBS and ACTIVE_JOBS active-state filters.
+//!     RUNNING_JOBS and ACTIVE_JOBS active-state filters, AND the
+//!     `WHERE job_type` scope excluding a decoy queue's rows.
 //!   - `metrics_global` — non-scoped variant still emits the static metrics
-//!     (DB_PAGE_SIZE, DB_PAGE_COUNT, DB_SIZE).
+//!     (DB_PAGE_SIZE, DB_PAGE_COUNT, DB_SIZE) AND aggregates TOTAL_JOBS /
+//!     DONE_JOBS across more than one queue.
 //!
 //! Tests gate on `DATABASE_URL`; without it every scenario resolves to
 //! `Outcome::Skipped` and the assertions pass.
@@ -56,8 +62,8 @@ use apalis_core::{
 };
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 use diesel::{
-    RunQueryDsl, sql_query,
-    sql_types::{Integer, Text},
+    QueryableByName, RunQueryDsl, sql_query,
+    sql_types::{BigInt, Integer, Text},
 };
 use lets_expect::{AssertionResult, *};
 use ulid::Ulid;
@@ -77,6 +83,34 @@ async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
             .execute(conn)
             .map_err(|e| e.to_string())?;
         Ok(())
+    })
+    .await
+}
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+/// Whether any `Done` row with `done_at IS NULL` exists anywhere in the
+/// shared table. PostgreSQL's default `ORDER BY done_at DESC` sorts NULLs
+/// first, so such a row (schema-permitted, though nothing in this crate's
+/// own test helpers creates one) would sort ahead of any timestamp —
+/// including deliberately far-future ones used to isolate a global-listing
+/// scenario from the rest of the table. Read-only on purpose: this crate's
+/// own tests otherwise only ever mutate rows scoped to a generated queue
+/// name, and a global `DELETE` here could destroy a legitimate row left by
+/// something else entirely on a persistent/shared `DATABASE_URL`.
+async fn has_done_row_with_null_done_at(pool: PgPool) -> Result<bool, String> {
+    with_conn(pool, move |conn| {
+        sql_query(
+            "SELECT count(*)::bigint AS n FROM apalis.jobs
+             WHERE status = 'Done' AND done_at IS NULL",
+        )
+        .load::<CountRow>(conn)
+        .map_err(|e| e.to_string())
+        .map(|rows| rows.first().is_some_and(|row| row.n > 0))
     })
     .await
 }
@@ -159,6 +193,46 @@ async fn insert_job(
     Ok(task_id)
 }
 
+/// Insert a job at an absolute `run_at` (Unix seconds), rather than an offset
+/// evaluated against SQL `now()` at INSERT time. Each `insert_job` call above
+/// computes `now() - offset` fresh on the server, so a caller-supplied
+/// timestamp computed *once* in Rust and reused across several inserts
+/// (see `run_queue_activity_daily_buckets`) is byte-for-byte identical for
+/// all of them — no two inserts can land on different calendar dates just
+/// because a few milliseconds and a date boundary happened to fall between
+/// their separate `now()` evaluations.
+async fn insert_job_at(
+    pool: PgPool,
+    queue: String,
+    status: &'static str,
+    run_at_unix_secs: i64,
+    attempts: i32,
+    max_attempts: i32,
+) -> Result<String, String> {
+    let id = Ulid::new().to_string();
+    let task_id = id.clone();
+    with_conn(pool, move |conn| {
+        let job = serde_json::to_vec("admin-spec-payload").map_err(|e| e.to_string())?;
+        sql_query(
+            "INSERT INTO apalis.jobs (
+                id, job_type, job, status, attempts, max_attempts, run_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))",
+        )
+        .bind::<Text, _>(&id)
+        .bind::<Text, _>(&queue)
+        .bind::<diesel::sql_types::Binary, _>(job)
+        .bind::<Text, _>(status)
+        .bind::<Integer, _>(attempts)
+        .bind::<Integer, _>(max_attempts)
+        .bind::<BigInt, _>(run_at_unix_secs)
+        .execute(conn)
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await?;
+    Ok(task_id)
+}
+
 async fn insert_worker(pool: PgPool, queue: String, worker_id: String) -> Result<(), String> {
     with_conn(pool, move |conn| {
         sql_query(
@@ -209,8 +283,14 @@ async fn run_status_filter(setup: StatusFilterSetup) -> Result<Outcome<StatusFil
     let queue = format!("apalis-spec-admin-status-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    // Seed one row per status. Pending uses no done_at; terminals do.
+    // Seed one row per status. Non-terminal rows (Pending / Queued / Running)
+    // carry no done_at; terminal rows (Done / Failed / Killed) do. All six
+    // `Status` variants are seeded so the filter matrix can pin every reachable
+    // value of the `WHERE status = $1` bind, including the active statuses
+    // Queued and Running (both permitted by the jobs_status_check CHECK).
     let pending = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
+    let queued = insert_job(pool.clone(), queue.clone(), "Queued", 2, None, 0, 3).await?;
+    let running = insert_job(pool.clone(), queue.clone(), "Running", 3, None, 0, 3).await?;
     let done = insert_job(pool.clone(), queue.clone(), "Done", 5, Some(1), 1, 3).await?;
     let failed = insert_job(pool.clone(), queue.clone(), "Failed", 5, Some(1), 3, 3).await?;
     let killed = insert_job(pool.clone(), queue.clone(), "Killed", 5, Some(1), 1, 3).await?;
@@ -218,20 +298,67 @@ async fn run_status_filter(setup: StatusFilterSetup) -> Result<Outcome<StatusFil
     let (expected_id, other_status_ids) = match setup.filter_status {
         Status::Pending => (
             pending.clone(),
-            vec![done.clone(), failed.clone(), killed.clone()],
+            vec![
+                queued.clone(),
+                running.clone(),
+                done.clone(),
+                failed.clone(),
+                killed.clone(),
+            ],
+        ),
+        Status::Queued => (
+            queued.clone(),
+            vec![
+                pending.clone(),
+                running.clone(),
+                done.clone(),
+                failed.clone(),
+                killed.clone(),
+            ],
+        ),
+        Status::Running => (
+            running.clone(),
+            vec![
+                pending.clone(),
+                queued.clone(),
+                done.clone(),
+                failed.clone(),
+                killed.clone(),
+            ],
         ),
         Status::Done => (
             done.clone(),
-            vec![pending.clone(), failed.clone(), killed.clone()],
+            vec![
+                pending.clone(),
+                queued.clone(),
+                running.clone(),
+                failed.clone(),
+                killed.clone(),
+            ],
         ),
         Status::Failed => (
             failed.clone(),
-            vec![pending.clone(), done.clone(), killed.clone()],
+            vec![
+                pending.clone(),
+                queued.clone(),
+                running.clone(),
+                done.clone(),
+                killed.clone(),
+            ],
         ),
         Status::Killed => (
             killed.clone(),
-            vec![pending.clone(), done.clone(), failed.clone()],
+            vec![
+                pending.clone(),
+                queued.clone(),
+                running.clone(),
+                done.clone(),
+                failed.clone(),
+            ],
         ),
+        // `Status` is `#[non_exhaustive]`; every variant that currently exists
+        // is enumerated above. A future variant would need its own seeded row
+        // and matrix arm rather than silently falling through.
         other => return Err(format!("unsupported status in this matrix: {other:?}")),
     };
 
@@ -685,6 +812,222 @@ fn list_all_page_zero_rejected_as_invalid_argument()
 }
 
 // --------------------------------------------------------------------------
+// list_all_tasks non-zero OFFSET + ORDER BY: pins the LIMIT $2 / OFFSET $3
+// binds and the `ORDER BY done_at DESC, run_at DESC` on the GLOBAL listing
+// (src/queries/admin.rs::list_all_tasks_rows). `run_list_all_page_zero` only
+// exercises the pre-scan `filter_offset_i32` rejection, so the actual slicing
+// and ordering of `list_all_tasks_rows` had no coverage — a swapped $2/$3 bind
+// (limit/offset) or a lost ORDER BY would pass green.
+//
+// `list_all_tasks` is global (no `job_type` scope), so to stay deterministic
+// on a shared DB we seed three Done rows with `done_at` ~10 years in the
+// future (see FAR_FUTURE_SECS below) rather than near `now()`: this puts them
+// ahead of every real-world Done row regardless of what other queues (or
+// prior test runs) hold, so `ORDER BY done_at DESC` places them at global
+// positions 0/1/2. We then walk pages of size 1 and check the OFFSET carves
+// the expected member of our own newest→oldest sequence.
+//
+// This scenario's four `to` leaves each call this async fn fresh and seed
+// their own far-future rows; like `run_metrics_global_aggregates_across_queues`
+// below, it is race-free only because this crate's DB-gated suite is required
+// to run with `--test-threads=1` (CONTRIBUTING.md; the `postgres` CI job).
+// Under a higher `--test-threads` the four leaves' seeded rows could
+// interleave with each other, since none of them scope `list_all_tasks` to
+// its own queue — that's the global behavior under test.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct ListAllOffsetRun {
+    /// Our seeded ids, newest done_at first: [newest, middle, oldest].
+    seeded_newest_first: Vec<String>,
+    /// First id returned for page=1,size=1 (offset 0) — expected `newest`.
+    page1_first: Option<String>,
+    /// First id returned for page=2,size=1 (offset 1) — expected `middle`.
+    page2_first: Option<String>,
+    /// First id returned for page=3,size=1 (offset 2) — expected `oldest`.
+    page3_first: Option<String>,
+    /// Row COUNT returned for each size=1 page. With `LIMIT $2 = 1` every page
+    /// holds exactly one row; a regression that dropped `LIMIT` (keeping only
+    /// `OFFSET`) would return the whole global Done tail, so pinning the length
+    /// — not just the first id — is what catches a lost limit.
+    page1_len: usize,
+    page2_len: usize,
+    page3_len: usize,
+}
+
+async fn run_list_all_offset_slice() -> Result<Outcome<ListAllOffsetRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-all-offset-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    // PostgreSQL's default `ORDER BY done_at DESC` puts NULLs *first* (ahead of
+    // every timestamp, including our far-future ones below). The schema does
+    // not forbid a `Done` row with `done_at IS NULL`, so a stray one left by
+    // some unrelated manual/direct-SQL test would otherwise sort ahead of this
+    // scenario's rows and break the offset assertions despite `list_all_tasks`
+    // being correct. Nothing in this crate's own helpers creates such a row.
+    // Rather than a global DELETE (which could destroy a legitimate row on a
+    // persistent/shared DATABASE_URL just to make this probe pass), skip this
+    // scenario outright when one is present: this file's other scenarios only
+    // ever mutate rows scoped to a generated queue name, and this is the one
+    // place a global, unscoped listing is genuinely under test.
+    if has_done_row_with_null_done_at(pool.clone()).await? {
+        cleanup_queue(pool, queue).await?;
+        return Ok(Outcome::Skipped);
+    }
+
+    // Three Done rows with done_at ~10 years in the future (offsets are
+    // negative, and insert_job computes `now() - offset`), so they sort ahead
+    // of every real-world Done row in this shared table regardless of what
+    // other tests (or concurrent runs) have left behind — `list_all_tasks` is
+    // deliberately global (no queue filter), so a mere unique queue name does
+    // not isolate this listing the way it does for queue-scoped specs.
+    // Newest done_at = smallest offset. run_at is crossed against done_at so a
+    // regression to the secondary run_at key alone would reorder them and
+    // fail the assertions below.
+    const FAR_FUTURE_SECS: i64 = 315_360_000; // ~10 years
+    let oldest = insert_job(
+        pool.clone(),
+        queue.clone(),
+        "Done",
+        10,
+        Some(2 - FAR_FUTURE_SECS),
+        1,
+        3,
+    )
+    .await?;
+    let middle = insert_job(
+        pool.clone(),
+        queue.clone(),
+        "Done",
+        20,
+        Some(1 - FAR_FUTURE_SECS),
+        1,
+        3,
+    )
+    .await?;
+    let newest = insert_job(
+        pool.clone(),
+        queue.clone(),
+        "Done",
+        30,
+        Some(-FAR_FUTURE_SECS),
+        1,
+        3,
+    )
+    .await?;
+
+    let config = Config::new(&queue);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+
+    // Collect the FULL page for each size=1 request (not just `.next()`), so we
+    // can pin both the first id (OFFSET carved the right row) AND the page
+    // length (LIMIT capped it to one row). A lost `LIMIT` would leave the first
+    // id correct but blow the length past 1.
+    let page_ids = |page: u32| {
+        let storage = &storage;
+        async move {
+            storage
+                .list_all_tasks(&filter(Status::Done, page, Some(1)))
+                .await
+                .map_err(|e| e.to_string())
+                .map(|tasks| {
+                    tasks
+                        .into_iter()
+                        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                        .collect::<Vec<String>>()
+                })
+        }
+    };
+    let page1 = page_ids(1).await?;
+    let page2 = page_ids(2).await?;
+    let page3 = page_ids(3).await?;
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(ListAllOffsetRun {
+        seeded_newest_first: vec![newest, middle, oldest],
+        page1_first: page1.first().cloned(),
+        page2_first: page2.first().cloned(),
+        page3_first: page3.first().cloned(),
+        page1_len: page1.len(),
+        page2_len: page2.len(),
+        page3_len: page3.len(),
+    }))
+}
+
+fn list_all_orders_newest_done_at_first()
+-> impl Fn(&Result<Outcome<ListAllOffsetRun>, String>) -> AssertionResult {
+    observe::<ListAllOffsetRun, _>("list_all ORDER BY done_at DESC", |run| {
+        let expected = run.seeded_newest_first.first().cloned();
+        if run.page1_first == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the newest done_at row {expected:?} first (offset 0), got {:?}",
+                run.page1_first
+            ))
+        }
+    })
+}
+
+fn list_all_offset_one_skips_the_first_row()
+-> impl Fn(&Result<Outcome<ListAllOffsetRun>, String>) -> AssertionResult {
+    observe::<ListAllOffsetRun, _>("list_all OFFSET 1", |run| {
+        let expected = run.seeded_newest_first.get(1).cloned();
+        if run.page2_first == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected OFFSET 1 to skip to the second-newest row {expected:?}, got {:?}",
+                run.page2_first
+            ))
+        }
+    })
+}
+
+fn list_all_offset_two_skips_the_first_two_rows()
+-> impl Fn(&Result<Outcome<ListAllOffsetRun>, String>) -> AssertionResult {
+    observe::<ListAllOffsetRun, _>("list_all OFFSET 2", |run| {
+        let expected = run.seeded_newest_first.get(2).cloned();
+        if run.page3_first == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected OFFSET 2 to skip to the third-newest row {expected:?}, got {:?}",
+                run.page3_first
+            ))
+        }
+    })
+}
+
+fn list_all_limits_each_page_to_one_row()
+-> impl Fn(&Result<Outcome<ListAllOffsetRun>, String>) -> AssertionResult {
+    observe::<ListAllOffsetRun, _>("list_all LIMIT 1", |run| {
+        // Every request asks for `page_size = 1`, so `LIMIT $2 = 1` must cap
+        // each page at exactly one row. This is the arm the first-id checks
+        // can't cover: if `LIMIT` were dropped while `OFFSET $3` stayed, the
+        // global Done listing would return its whole tail (three seeded rows
+        // here, plus any other Done rows on a shared DB) yet still lead with the
+        // correct id — passing the ordering/offset assertions but failing here.
+        for (page, len) in [
+            (1u32, run.page1_len),
+            (2, run.page2_len),
+            (3, run.page3_len),
+        ] {
+            if len != 1 {
+                return Err(format!(
+                    "expected page={page} (size=1) to return exactly one row, got {len} \
+                     (a dropped LIMIT would over-return here)"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+// --------------------------------------------------------------------------
 // list_queues: workers-only queue still appears (UNION in all_job_types)
 // --------------------------------------------------------------------------
 
@@ -812,6 +1155,87 @@ fn queue_stats_report_one_pending_job()
 }
 
 // --------------------------------------------------------------------------
+// list_queues activity: the `daily_activity` CTE
+// (src/queries/admin.rs::LIST_QUEUES_SQL) buckets jobs by `run_at::date`
+// inside a 7-day window and emits `jsonb_agg(daily_count ORDER BY run_date)`,
+// decoded into `QueueInfo.activity: Vec<usize>`. No integration scenario
+// touched `activity` before, so a regression in the per-day COUNT, the
+// `ORDER BY run_date`, or the 7-day window would pass green. We seed known
+// per-day counts on two distinct calendar days (plus one row outside the
+// window that must be dropped) and assert the resulting activity vector.
+// --------------------------------------------------------------------------
+
+const SECS_PER_DAY: i64 = 86_400;
+const HALF_DAY: i64 = 43_200;
+
+#[derive(Debug)]
+struct QueueActivityRun {
+    activity: Vec<usize>,
+}
+
+async fn run_queue_activity_daily_buckets() -> Result<Outcome<QueueActivityRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-activity-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    // Two rows on the "2 days ago" calendar date and three on "1 day ago".
+    // `now_unix()` is read exactly once and every offset below is computed
+    // from that single value in Rust, then bound directly via `insert_job_at`
+    // (`to_timestamp($n)`, no server-side `now()` re-evaluation per insert):
+    // every row in a group gets a byte-identical `run_at`, so the group can
+    // never straddle a calendar-date boundary no matter what time of day (or
+    // how close to local midnight/noon) the scenario happens to run — unlike
+    // computing each insert's timestamp against SQL's own `now()` separately,
+    // which risks exactly that when the wall clock crosses a date boundary
+    // between two of this group's inserts. run_date ascending is
+    // [day-2, day-1], so ORDER BY run_date yields counts [2, 3].
+    let now = now_unix() as i64;
+    let two_days_ago = now - 2 * SECS_PER_DAY - HALF_DAY;
+    let one_day_ago = now - SECS_PER_DAY - HALF_DAY;
+    for _ in 0..2 {
+        insert_job_at(pool.clone(), queue.clone(), "Pending", two_days_ago, 0, 3).await?;
+    }
+    for _ in 0..3 {
+        insert_job_at(pool.clone(), queue.clone(), "Pending", one_day_ago, 0, 3).await?;
+    }
+    // Outside the 7-day window: must be excluded from `activity` entirely.
+    let eight_days_ago = now - 8 * SECS_PER_DAY - HALF_DAY;
+    insert_job_at(pool.clone(), queue.clone(), "Pending", eight_days_ago, 0, 3).await?;
+
+    let config = Config::new(&queue);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let queues = storage.list_queues().await.map_err(|e| e.to_string())?;
+    let info = queues
+        .into_iter()
+        .find(|q| q.name == queue)
+        .ok_or_else(|| format!("seeded queue {queue} missing from list_queues"))?;
+
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(QueueActivityRun {
+        activity: info.activity,
+    }))
+}
+
+fn queue_activity_buckets_daily_counts_in_run_date_order()
+-> impl Fn(&Result<Outcome<QueueActivityRun>, String>) -> AssertionResult {
+    observe::<QueueActivityRun, _>("daily_activity buckets", |run| {
+        // [2, 3] proves: per-day COUNT (2 then 3), ORDER BY run_date ascending
+        // (day-2 bucket before day-1 bucket), and the 7-day window (the
+        // 8-days-ago row produced no third bucket).
+        if run.activity == vec![2usize, 3usize] {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected activity buckets [2, 3] (day-2 then day-1, 8-days-ago row dropped), got {:?}",
+                run.activity
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // metrics_for_queue: terminal-status counts surface correctly
 // --------------------------------------------------------------------------
 
@@ -914,6 +1338,94 @@ fn metric_value_is(
 }
 
 // --------------------------------------------------------------------------
+// metrics_for_queue scope: the ONLY thing distinguishing `fetch_by_queue`
+// from `global()` is the `WHERE job_type = $1` fragment in `build_metrics_sql`
+// (src/queries/admin.rs). No scenario seeds a SECOND queue, so dropping that
+// WHERE from `metrics_for_queue` would still pass `run_metrics_terminal_mix`
+// on a clean DB (its expected TOTAL_JOBS=7 is unaffected by a queue the test
+// never seeds). Here we seed the target queue AND a decoy queue, then assert
+// `fetch_by_queue()` counts only the target — a positive/negative pair the
+// existing single-queue metrics scenario can't express.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct ScopedMetricsRun {
+    total_jobs: Option<String>,
+    pending_jobs: Option<String>,
+    done_jobs: Option<String>,
+}
+
+async fn run_metrics_scoped_excludes_other_queue() -> Result<Outcome<ScopedMetricsRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-scope-mine-{}", Ulid::new());
+    let other = format!("apalis-spec-admin-scope-other-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    cleanup_queue(pool.clone(), other.clone()).await?;
+
+    // Target queue: 2 Pending + 1 Done => TOTAL_JOBS=3, PENDING_JOBS=2,
+    // DONE_JOBS=1.
+    let _ = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Pending", 2, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Done", 5, Some(1), 1, 3).await?;
+    // Decoy queue: rows that MUST NOT be counted. If the `WHERE job_type = $1`
+    // scope regressed, these would inflate TOTAL_JOBS to 8 and DONE_JOBS to 3.
+    let _ = insert_job(pool.clone(), other.clone(), "Pending", 1, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), other.clone(), "Pending", 2, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), other.clone(), "Done", 5, Some(1), 1, 3).await?;
+    let _ = insert_job(pool.clone(), other.clone(), "Done", 6, Some(2), 1, 3).await?;
+    let _ = insert_job(pool.clone(), other.clone(), "Failed", 5, Some(1), 3, 3).await?;
+
+    let config = Config::new(&queue);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let stats = storage.fetch_by_queue().await.map_err(|e| e.to_string())?;
+
+    let by_title = |title: &str| {
+        stats
+            .iter()
+            .find(|s| s.title == title)
+            .map(|s| s.value.clone())
+    };
+    let run = ScopedMetricsRun {
+        total_jobs: by_title("TOTAL_JOBS"),
+        pending_jobs: by_title("PENDING_JOBS"),
+        done_jobs: by_title("DONE_JOBS"),
+    };
+
+    cleanup_queue(pool.clone(), queue).await?;
+    cleanup_queue(pool, other).await?;
+    Ok(Outcome::Completed(run))
+}
+
+fn scoped_metric_counts_only_target_queue(
+    title: &'static str,
+    expected: f64,
+) -> impl Fn(&Result<Outcome<ScopedMetricsRun>, String>) -> AssertionResult {
+    observe::<ScopedMetricsRun, _>(title, move |run| {
+        let value_opt = match title {
+            "TOTAL_JOBS" => &run.total_jobs,
+            "PENDING_JOBS" => &run.pending_jobs,
+            "DONE_JOBS" => &run.done_jobs,
+            other => return Err(format!("unsupported scoped metric title: {other}")),
+        };
+        let Some(value) = value_opt else {
+            return Err(format!("expected {title} present in scoped metrics"));
+        };
+        let parsed: f64 = value
+            .parse()
+            .map_err(|_| format!("expected {title} to parse, got {value:?}"))?;
+        if (parsed - expected).abs() < 0.5 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected scoped {title} == {expected} (decoy queue excluded), got {parsed}"
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // metrics_global: static metrics (DB_PAGE_SIZE / DB_PAGE_COUNT / DB_SIZE)
 // --------------------------------------------------------------------------
 
@@ -993,6 +1505,111 @@ fn total_jobs_metric_present()
 }
 
 // --------------------------------------------------------------------------
+// metrics_global aggregation: the defining property of `global()` vs
+// `fetch_by_queue()` is that it has NO `WHERE job_type` scope, so its counts
+// sum across EVERY queue (src/queries/admin.rs::build_metrics_sql, scope="").
+// `run_metrics_global` only pins static/present metrics, so a regression that
+// accidentally scoped the global query to a single queue would still pass it.
+// Here we snapshot global TOTAL_JOBS/DONE_JOBS, seed rows across TWO distinct
+// queues, and assert the deltas equal the cross-queue sum — a scoped query
+// could never move the global total by both queues' rows. Deltas (not absolute
+// values) keep this robust against *other rows already on a shared DB*, but
+// the before/after window itself is only race-free because this crate's
+// DB-gated suite is required to run with `--test-threads=1` (see
+// CONTRIBUTING.md and the `postgres` job in .github/workflows/rust.yml,
+// which additionally runs against a per-job ephemeral Postgres service, not
+// a persistent shared one) — no other test can insert/delete rows between
+// the two `global()` calls below. This scenario would be flaky under a
+// higher `--test-threads`, the same way this file's other cross-queue and
+// advisory-lock specs already are.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct GlobalAggregationRun {
+    total_delta: f64,
+    done_delta: f64,
+    expected_total_delta: f64,
+    expected_done_delta: f64,
+}
+
+async fn run_metrics_global_aggregates_across_queues()
+-> Result<Outcome<GlobalAggregationRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue_a = format!("apalis-spec-admin-global-agg-a-{}", Ulid::new());
+    let queue_b = format!("apalis-spec-admin-global-agg-b-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue_a.clone()).await?;
+    cleanup_queue(pool.clone(), queue_b.clone()).await?;
+
+    let config = Config::new(&queue_a);
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+
+    let global_metric = |stats: &[apalis_core::backend::Statistic], title: &str| -> f64 {
+        stats
+            .iter()
+            .find(|s| s.title == title)
+            .and_then(|s| s.value.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+
+    let before = storage.global().await.map_err(|e| e.to_string())?;
+    let total_before = global_metric(&before, "TOTAL_JOBS");
+    let done_before = global_metric(&before, "DONE_JOBS");
+
+    // Queue A: 2 Pending + 1 Done. Queue B: 1 Pending + 2 Done.
+    // Across both queues: +6 total, +3 done. A single-queue-scoped query could
+    // never account for all six rows in the global total.
+    let _ = insert_job(pool.clone(), queue_a.clone(), "Pending", 1, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue_a.clone(), "Pending", 2, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue_a.clone(), "Done", 5, Some(1), 1, 3).await?;
+    let _ = insert_job(pool.clone(), queue_b.clone(), "Pending", 1, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue_b.clone(), "Done", 5, Some(1), 1, 3).await?;
+    let _ = insert_job(pool.clone(), queue_b.clone(), "Done", 6, Some(2), 1, 3).await?;
+
+    let after = storage.global().await.map_err(|e| e.to_string())?;
+    let total_after = global_metric(&after, "TOTAL_JOBS");
+    let done_after = global_metric(&after, "DONE_JOBS");
+
+    cleanup_queue(pool.clone(), queue_a).await?;
+    cleanup_queue(pool, queue_b).await?;
+    Ok(Outcome::Completed(GlobalAggregationRun {
+        total_delta: total_after - total_before,
+        done_delta: done_after - done_before,
+        expected_total_delta: 6.0,
+        expected_done_delta: 3.0,
+    }))
+}
+
+fn global_total_grows_by_both_queues()
+-> impl Fn(&Result<Outcome<GlobalAggregationRun>, String>) -> AssertionResult {
+    observe::<GlobalAggregationRun, _>("global TOTAL_JOBS delta", |run| {
+        if (run.total_delta - run.expected_total_delta).abs() < 0.5 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected global TOTAL_JOBS to grow by {} across both queues, grew by {}",
+                run.expected_total_delta, run.total_delta
+            ))
+        }
+    })
+}
+
+fn global_done_grows_by_both_queues()
+-> impl Fn(&Result<Outcome<GlobalAggregationRun>, String>) -> AssertionResult {
+    observe::<GlobalAggregationRun, _>("global DONE_JOBS delta", |run| {
+        if (run.done_delta - run.expected_done_delta).abs() < 0.5 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected global DONE_JOBS to grow by {} across both queues, grew by {}",
+                run.expected_done_delta, run.done_delta
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // expectations
 // --------------------------------------------------------------------------
 
@@ -1004,6 +1621,18 @@ lets_expect! { #tokio_test
         when filtering_by_pending_returns_only_pending_rows {
             to includes_the_pending_row { includes_expected_status_row() }
             to excludes_done_failed_and_killed { excludes_other_status_rows() }
+        }
+
+        when filtering_by_queued_returns_only_queued_rows {
+            let setup = StatusFilterSetup { filter_status: Status::Queued };
+            to includes_the_queued_row { includes_expected_status_row() }
+            to excludes_the_other_five_statuses { excludes_other_status_rows() }
+        }
+
+        when filtering_by_running_returns_only_running_rows {
+            let setup = StatusFilterSetup { filter_status: Status::Running };
+            to includes_the_running_row { includes_expected_status_row() }
+            to excludes_the_other_five_statuses { excludes_other_status_rows() }
         }
 
         when filtering_by_done_returns_only_done_rows {
@@ -1093,6 +1722,24 @@ lets_expect! { #tokio_test
         }
     }
 
+    // ----- list_all_tasks non-zero OFFSET + global ORDER BY ---------------
+    expect(run_list_all_offset_slice().await) {
+        when three_done_rows_are_the_newest_globally {
+            to lists_the_newest_done_at_row_first_at_offset_zero {
+                list_all_orders_newest_done_at_first()
+            }
+            to carves_the_second_row_at_offset_one {
+                list_all_offset_one_skips_the_first_row()
+            }
+            to carves_the_third_row_at_offset_two {
+                list_all_offset_two_skips_the_first_two_rows()
+            }
+            to limits_each_size_one_page_to_a_single_row {
+                list_all_limits_each_page_to_one_row()
+            }
+        }
+    }
+
     // ----- list_queues UNION over workers ∪ jobs --------------------------
     expect(run_workers_only_queue().await) {
         when a_queue_only_has_workers_no_jobs {
@@ -1109,6 +1756,30 @@ lets_expect! { #tokio_test
                 queue_stats_carry_pending_and_total_titles()
             }
             to reports_one_pending_job_in_its_stats { queue_stats_report_one_pending_job() }
+        }
+    }
+
+    // ----- list_queues daily_activity CTE ---------------------------------
+    expect(run_queue_activity_daily_buckets().await) {
+        when jobs_land_on_two_days_inside_the_window_and_one_outside {
+            to buckets_each_days_count_ordered_by_run_date {
+                queue_activity_buckets_daily_counts_in_run_date_order()
+            }
+        }
+    }
+
+    // ----- metrics_for_queue scope excludes other queues ------------------
+    expect(run_metrics_scoped_excludes_other_queue().await) {
+        when another_queue_holds_rows_that_must_not_be_counted {
+            to counts_only_the_target_queues_total {
+                scoped_metric_counts_only_target_queue("TOTAL_JOBS", 3.0)
+            }
+            to counts_only_the_target_queues_pending {
+                scoped_metric_counts_only_target_queue("PENDING_JOBS", 2.0)
+            }
+            to counts_only_the_target_queues_done {
+                scoped_metric_counts_only_target_queue("DONE_JOBS", 1.0)
+            }
         }
     }
 
@@ -1135,6 +1806,18 @@ lets_expect! { #tokio_test
                 db_page_count_and_size_present()
             }
             to includes_the_total_jobs_aggregate { total_jobs_metric_present() }
+        }
+    }
+
+    // ----- metrics_global aggregates across queues ------------------------
+    expect(run_metrics_global_aggregates_across_queues().await) {
+        when rows_are_seeded_across_two_distinct_queues {
+            to grows_the_global_total_by_both_queues_rows {
+                global_total_grows_by_both_queues()
+            }
+            to grows_the_global_done_count_by_both_queues_rows {
+                global_done_grows_by_both_queues()
+            }
         }
     }
 }

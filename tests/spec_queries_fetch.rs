@@ -40,10 +40,17 @@
 //!   9. `fail_undecodable_task` claim-epoch predicate: the decode-failure
 //!      release applies only to the caller's own live claim; rows that were
 //!      acked, swept, or re-claimed (other worker / later epoch / advanced
-//!      attempts) in the meantime are untouched. The positive direction (a
-//!      decode failure routes the row through Failed→Killed) is covered
-//!      through the public API in `postgres_queries`'s decode_release specs;
-//!      these negatives cannot be reached deterministically from there.
+//!      attempts) in the meantime are untouched. `postgres_queries`'s
+//!      decode_release specs also drive the positive direction through the
+//!      public poll API, but the claim-epoch negatives cannot be reached
+//!      deterministically from there.
+//!  10. `fail_undecodable_task` retry-budget CASE and overflow-safe
+//!      arithmetic, pinned directly against this SQL because the epoch harness
+//!      above fixes `max_attempts = 25` and so can only ever reach the `Failed`
+//!      arm: the `attempts::bigint + 1 >= max_attempts` boundary flips the row
+//!      to `Killed`, `LEAST(attempts::bigint + 1, max_attempts)` clamps the
+//!      stored attempts to the budget, and an `attempts = i32::MAX` row is
+//!      released without an "integer out of range" overflow.
 //!
 //! Tests gate on `DATABASE_URL`; without it every scenario resolves to
 //! `Outcome::Skipped` and the assertions pass.
@@ -1289,6 +1296,139 @@ async fn run_fail_undecodable(setup: &'static str) -> Result<Outcome<FailUndecod
     }))
 }
 
+// --------------------------------------------------------------------------
+// fail_undecodable_task: the retry-budget CASE (`attempts::bigint + 1 >=
+// max_attempts` → Killed) and the overflow-safe attempts arithmetic
+// (`LEAST(attempts::bigint + 1, max_attempts)`).
+//
+// The `run_fail_undecodable` harness above pins the *epoch* axis with a fixed
+// `max_attempts = 25`, so it can only ever reach the `Failed` (budget-left)
+// arm and can never overflow. These specs vary `attempts`/`max_attempts` on a
+// live claim so the CASE crosses into `Killed`, the `LEAST` clamp actually
+// collapses `attempts + 1` back to `max_attempts`, and the `i32::MAX` boundary
+// exercises the `::bigint` promotion (a bare `attempts + 1` would raise
+// "integer out of range").
+// --------------------------------------------------------------------------
+
+/// Insert a live claim (`Running`, owned by `worker`, at `lock_at_epoch`) with a
+/// caller-controlled `attempts`/`max_attempts` so the release CASE and the
+/// `LEAST(...)` clamp can be pinned at their boundaries.
+async fn insert_live_claim_with_budget(
+    pool: PgPool,
+    queue: String,
+    worker: String,
+    attempts: i32,
+    max_attempts: i32,
+    lock_at_epoch: i64,
+) -> Result<PgTaskId, String> {
+    let id = Ulid::new();
+    let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
+    let job = serde_json::to_vec("undecodable-budget-probe").map_err(|e| e.to_string())?;
+    with_conn(pool, move |conn| {
+        sql_query(
+            "INSERT INTO apalis.jobs (
+                id, job_type, job, status, attempts, max_attempts, run_at,
+                lock_by, lock_at
+            ) VALUES (
+                $1, $2, $3, 'Running', $4, $5, now() - INTERVAL '1 second',
+                $6, to_timestamp($7::double precision)
+            )",
+        )
+        .bind::<Text, _>(id.to_string())
+        .bind::<Text, _>(queue)
+        .bind::<diesel::sql_types::Binary, _>(job)
+        .bind::<Integer, _>(attempts)
+        .bind::<Integer, _>(max_attempts)
+        .bind::<Text, _>(worker)
+        .bind::<BigInt, _>(lock_at_epoch)
+        .execute(conn)
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await?;
+    Ok(task_id)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BudgetSetup {
+    attempts: i32,
+    max_attempts: i32,
+}
+
+async fn run_fail_undecodable_budget(
+    setup: BudgetSetup,
+) -> Result<Outcome<FailUndecodableRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-fail-budget-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker = format!("fail-budget-{queue}");
+    insert_worker(pool.clone(), queue.clone(), worker.clone()).await?;
+    let epoch = claim_epoch_secs();
+
+    let task_id = insert_live_claim_with_budget(
+        pool.clone(),
+        queue.clone(),
+        worker.clone(),
+        setup.attempts,
+        setup.max_attempts,
+        epoch,
+    )
+    .await?;
+
+    // The caller presents its own claim epoch and the attempts it saw at claim
+    // time (`setup.attempts`), exactly as the production `fail_undecodable_task`
+    // caller does.
+    let affected = fail_undecodable_sql(
+        pool.clone(),
+        task_id.to_string(),
+        worker,
+        epoch,
+        setup.attempts,
+        serde_json::json!({ "Err": RELEASE_ERROR_TEXT }),
+    )
+    .await?;
+    let row = read_released_row(pool.clone(), task_id.to_string()).await?;
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(FailUndecodableRun {
+        affected,
+        status: row.status,
+        attempts: row.attempts,
+        done_at_present: row.done_at_present,
+        last_result_present: row.last_result_present,
+        last_result_err: row.last_result_err,
+    }))
+}
+
+/// Assert the release fired (affected=1), landed the row in `status` with
+/// exactly `attempts`, and persisted the decode error.
+fn release_lands_in(
+    status: &'static str,
+    attempts: i32,
+) -> impl Fn(&Result<Outcome<FailUndecodableRun>, String>) -> AssertionResult {
+    observe::<FailUndecodableRun, _>("budget release", move |run| {
+        if run.affected != 1 {
+            return Err(format!("expected exactly one released row, got {run:?}"));
+        }
+        if run.status != status {
+            return Err(format!("expected status={status}, got {run:?}"));
+        }
+        if run.attempts != attempts {
+            return Err(format!("expected attempts={attempts}, got {run:?}"));
+        }
+        if !run.done_at_present {
+            return Err(format!("expected done_at to be set, got {run:?}"));
+        }
+        if run.last_result_err.as_deref() != Some(RELEASE_ERROR_TEXT) {
+            return Err(format!(
+                "expected last_result to carry the decode error, got {run:?}"
+            ));
+        }
+        Ok(())
+    })
+}
+
 fn release_fails_the_live_claim()
 -> impl Fn(&Result<Outcome<FailUndecodableRun>, String>) -> AssertionResult {
     observe::<FailUndecodableRun, _>("live-claim release", |run| {
@@ -1376,6 +1516,56 @@ lets_expect! { #tokio_test
             let setup = "attempts_advanced";
             to leaves_the_advanced_row_untouched {
                 release_skips_the_row("Running", 1, false)
+            }
+        }
+    }
+}
+
+lets_expect! { #tokio_test
+    // ----- retry-budget CASE + LEAST clamp + overflow safety ----------------
+    expect(run_fail_undecodable_budget(setup).await) {
+        let setup = BudgetSetup { attempts: 0, max_attempts: 3 };
+
+        when the_incremented_attempt_stays_below_the_budget {
+            // attempts+1 = 1 < max_attempts = 3 → the CASE `ELSE 'Failed'` arm.
+            to fails_the_attempt_but_keeps_it_retryable {
+                release_lands_in("Failed", 1)
+            }
+        }
+
+        when the_incremented_attempt_reaches_the_budget_exactly {
+            // Boundary of `attempts::bigint + 1 >= max_attempts`: attempts+1 = 3
+            // == max_attempts is the first value that flips the row to `Killed`.
+            // A `>` off-by-one would keep it `Failed` here, so pin equality.
+            let setup = BudgetSetup { attempts: 2, max_attempts: 3 };
+            to kills_the_row_when_the_budget_is_hit {
+                release_lands_in("Killed", 3)
+            }
+        }
+
+        when the_incremented_attempt_would_exceed_the_budget {
+            // attempts+1 = 3 > max_attempts = 2 → CASE still Killed, and
+            // `LEAST(attempts + 1, max_attempts)` must clamp attempts back to 2
+            // rather than storing 3. Without LEAST the row would read attempts=3.
+            let setup = BudgetSetup { attempts: 2, max_attempts: 2 };
+            to clamps_the_stored_attempts_to_the_budget {
+                release_lands_in("Killed", 2)
+            }
+        }
+
+        when the_stored_attempts_are_at_the_i32_maximum {
+            // `apalis.jobs` enforces `attempts <= max_attempts` via
+            // `jobs_attempts_lte_max_attempts_check`, so a row with
+            // `attempts = i32::MAX` can only exist when `max_attempts` is also
+            // `i32::MAX`. `attempts::bigint + 1` promotes to bigint so the
+            // `+ 1` (i32::MAX + 1) cannot raise "integer out of range"; a bare
+            // `attempts + 1` would error out and the release would return an
+            // Err instead of an affected row. `LEAST(..., max_attempts)` then
+            // re-bounds the bigint sum (i32::MAX + 1) back down to `i32::MAX`
+            // before it is stored in the int column.
+            let setup = BudgetSetup { attempts: i32::MAX, max_attempts: i32::MAX };
+            to survives_the_overflow_and_clamps_to_the_budget {
+                release_lands_in("Killed", i32::MAX)
             }
         }
     }
