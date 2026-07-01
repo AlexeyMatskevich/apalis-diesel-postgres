@@ -55,12 +55,33 @@ where
 // runs the closure, and the result is forwarded back over a fresh channel.
 // Dropping the caller's future drops only that forwarding receiver — the
 // detached task (and the DB write it carries) still runs to completion.
+//
+// This detour only applies when an ntex `System` is actually running. Without
+// one, `ntex_rt::spawn` panics (`Runtime::with_current`: "not in a neon
+// runtime"), so a caller that drives these futures off the ntex executor — for
+// example a synchronous bootstrap `futures::executor::block_on(setup(&pool))`
+// under `--no-default-features --features ntex`, or both runtime features with
+// no runtime entered — would abort instead of running the query. The free
+// `ntex_rt::spawn_blocking` handles that case for us: when `System::try_current`
+// is `None` it runs the closure *inline* via `ThreadPool::execute_inplace`
+// (`ntex-rt/src/lib.rs`), executing the work synchronously before the await
+// point, which is inherently drop-safe (there is no queued closure to skip). So
+// on the no-`System` path fall back to the plain `spawn_blocking` await —
+// preserving the pre-fix behaviour — and only take the detached path when a
+// runtime exists to host it.
 #[cfg(feature = "ntex")]
 async fn run_blocking_ntex<F, T>(work: F) -> Result<T, Error>
 where
     F: FnOnce() -> Result<T, Error> + Send + 'static,
     T: Send + 'static,
 {
+    if ntex_rt::System::try_current().is_none() {
+        return match ntex_rt::spawn_blocking(work).await {
+            Ok(result) => result,
+            Err(join_error) => Err(Error::Blocking(Box::new(join_error))),
+        };
+    }
+
     let (tx, rx) = futures::channel::oneshot::channel();
     // `ntex_rt::spawn` returns a `JoinHandle` whose `Drop` *detaches* the task
     // (async_task semantics), so dropping it here keeps the task running in the
@@ -299,6 +320,53 @@ mod ntex_drop_safety_tests {
                 );
             }
         });
+    }
+}
+
+// Regression test for the no-`System` fallback. `run_blocking_ntex` normally
+// detaches through `ntex_rt::spawn`, which panics when no ntex `System` is
+// running ("not in a neon runtime"). A caller that drives these futures without
+// an entered ntex runtime — e.g. a synchronous bootstrap
+// `futures::executor::block_on(setup(&pool))` under `--features ntex`, which the
+// free `ntex_rt::spawn_blocking` historically served by running the closure
+// inline via `ThreadPool::execute_inplace` — must keep working rather than
+// abort. This spec polls `run_blocking` with no ntex `System` entered (and,
+// under `--all-features`, no tokio runtime either, so the `Handle::try_current`
+// check routes to the ntex path): before the fix the first poll panicked inside
+// `ntex_rt::spawn`; after it, the closure runs inline and its value is
+// forwarded. A plain `#[test]` (no `#[ntex::test]`/`#[tokio::test]`) is what
+// keeps both runtimes un-entered. Runs under both the `--all-features` and
+// `--no-default-features --features ntex --lib` CI jobs.
+#[cfg(all(test, feature = "ntex"))]
+mod ntex_no_system_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    #[test]
+    fn run_blocking_without_an_ntex_system_runs_inline() {
+        assert!(
+            ntex_rt::System::try_current().is_none(),
+            "this spec must run without an entered ntex System to exercise the fallback"
+        );
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let result = futures::executor::block_on(run_blocking({
+            let ran = ran.clone();
+            move || {
+                ran.store(true, Ordering::SeqCst);
+                Ok::<usize, Error>(7)
+            }
+        }));
+
+        assert_eq!(result.expect("work forwarded its value"), 7);
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the blocking closure must have run inline without an ntex System"
+        );
     }
 }
 
