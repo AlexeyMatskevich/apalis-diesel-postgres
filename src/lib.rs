@@ -264,8 +264,8 @@ where
     ///
     /// # Errors
     /// - [`Error::Decode`] if the codec rejects `args`.
-    /// - [`Error::InvalidArgument`] if serialized metadata exceeds the byte
-    ///   cap, or for unreachable `run_at`.
+    /// - [`Error::InvalidArgument`] if the encoded payload or serialized
+    ///   metadata exceeds its byte cap, or for unreachable `run_at`.
     /// - [`Error::Database`] for SQL/driver failures.
     pub fn push_with_conn(&self, conn: &mut PgConnection, args: Args) -> Result<PgTaskId, Error> {
         let encoded = EncodeCodec::encode(&args).map_err(|err| Error::Decode(Box::new(err)))?;
@@ -293,8 +293,8 @@ where
     ///   savepoint for this batch is rolled back (the whole batch, not just the
     ///   duplicate), but your outer transaction continues; decide whether to
     ///   commit or roll back based on the error.
-    /// - [`Error::InvalidArgument`] if serialized metadata exceeds the byte
-    ///   cap.
+    /// - [`Error::InvalidArgument`] if the encoded payload or serialized
+    ///   metadata exceeds its byte cap.
     /// - [`Error::Database`] for SQL/driver failures.
     pub fn push_task_with_conn(
         &self,

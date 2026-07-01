@@ -27,6 +27,16 @@ pub(crate) const MAX_QUEUE_NAME_LEN: usize = 255;
 /// per-row storage growth.
 pub(crate) const MAX_IDEMPOTENCY_KEY_LEN: usize = 1024;
 
+/// Cap the encoded task payload (`task.args`, stored in the unbounded `job`
+/// BYTEA column) before persisting it. Like `metadata`, the queue name, and
+/// `idempotency_key`, an unbounded payload is a storage-exhaustion vector for
+/// any caller able to enqueue tasks — and the payload is the field most likely
+/// to be large, so it is the most important one to bound. 1 MiB is generous
+/// enough for structured job arguments while keeping per-row growth in check;
+/// jobs that must carry more should store the blob externally (object storage,
+/// a dedicated table) and enqueue a reference instead.
+pub(crate) const MAX_JOB_PAYLOAD_LEN: usize = 1024 * 1024;
+
 /// One `RETURNING idempotency_key` row from the batch INSERT: the keys that
 /// actually landed (ON CONFLICT DO NOTHING skips duplicates). Used to recover
 /// which submitted keys collided.
@@ -204,6 +214,12 @@ fn prepare_batch(
                 .map(|task_id| task_id.to_string())
                 .unwrap_or_else(|| Ulid::new().to_string()),
         );
+        if task.args.len() > MAX_JOB_PAYLOAD_LEN {
+            return Err(Error::InvalidArgument(format!(
+                "task payload is {} bytes, exceeds the {MAX_JOB_PAYLOAD_LEN}-byte cap",
+                task.args.len(),
+            )));
+        }
         jobs.push(task.args);
         max_attempts.push(task.parts.ctx.max_attempts());
         let run_at_secs = i64::try_from(task.parts.run_at).map_err(|_| {
@@ -333,4 +349,69 @@ fn insert_reporting_conflicts(conn: &mut PgConnection, batch: PreparedBatch) -> 
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use lets_expect::{AssertionError, AssertionResult, *};
+
+    use super::*;
+
+    fn prepare_batch_for_payload(len: usize) -> Result<Option<PreparedBatch>, Error> {
+        let config = Config::new("payload-cap");
+        let task = PgTask::<CompactType>::new(vec![0_u8; len]);
+        prepare_batch(&config, vec![task])
+    }
+
+    fn accepts_one_task(result: &Result<Option<PreparedBatch>, Error>) -> AssertionResult {
+        match result {
+            Ok(Some(batch)) if batch.task_count == 1 => Ok(()),
+            Ok(Some(batch)) => Err(AssertionError::new(vec![format!(
+                "expected a prepared batch of one task, got {}",
+                batch.task_count
+            )])),
+            Ok(None) => Err(AssertionError::new(vec![
+                "expected a prepared batch, got an empty batch".to_owned(),
+            ])),
+            Err(error) => Err(AssertionError::new(vec![format!(
+                "expected a prepared batch, got error: {error:?}"
+            )])),
+        }
+    }
+
+    fn rejects_with_payload_cap(result: &Result<Option<PreparedBatch>, Error>) -> AssertionResult {
+        match result {
+            Err(Error::InvalidArgument(message))
+                if message.contains("task payload") && message.contains("cap") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(AssertionError::new(vec![format!(
+                "expected an InvalidArgument citing the task payload cap, got a different error: {error:?}"
+            )])),
+            Ok(_) => Err(AssertionError::new(vec![
+                "expected the payload cap error, but the oversized payload was accepted".to_owned(),
+            ])),
+        }
+    }
+
+    lets_expect! {
+        expect(prepare_batch_for_payload(len)) {
+            let len = 128;
+
+            when the_payload_is_well_below_the_cap {
+                to accepts_the_task { accepts_one_task }
+            }
+
+            when the_payload_is_exactly_at_the_cap {
+                let len = MAX_JOB_PAYLOAD_LEN;
+                to accepts_the_boundary_task { accepts_one_task }
+            }
+
+            when the_payload_is_one_byte_over_the_cap {
+                let len = MAX_JOB_PAYLOAD_LEN + 1;
+                to rejects_the_oversized_payload { rejects_with_payload_cap }
+            }
+        }
+    }
 }
