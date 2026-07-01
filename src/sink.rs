@@ -478,11 +478,18 @@ mod tests {
         }
     }
 
-    fn observation_is_ready_err_and_cleared(obs: &FlushObservation) -> AssertionResult {
-        match (&obs.poll, obs.future_cleared) {
-            (Poll::Ready(Err(_)), true) => Ok(()),
+    /// Asserts the flush surfaced the *specific* error propagated out of the
+    /// flush future, with the future cleared. `poll_flush_inner` returns the
+    /// future's result verbatim (`Poll::Ready(result)`), so injecting
+    /// `SinkBufferFull(1)` must surface exactly that variant — a regression that
+    /// substitutes a different `Err` would slip past a wildcard `Err(_)` match.
+    fn observation_surfaces_buffer_full_at(
+        expected: usize,
+    ) -> impl Fn(&FlushObservation) -> AssertionResult {
+        move |obs| match (&obs.poll, obs.future_cleared) {
+            (Poll::Ready(Err(Error::SinkBufferFull(c))), true) if *c == expected => Ok(()),
             other => Err(AssertionError::new(vec![format!(
-                "expected Ready(Err) with cleared future, got {other:?}"
+                "expected Ready(Err(SinkBufferFull({expected}))) with cleared future, got {other:?}"
             )])),
         }
     }
@@ -584,6 +591,18 @@ mod tests {
                 let existing_items = 1;
                 to rejects_the_send_via_the_minimum_capacity { sink_buffer_full_at(1) }
             }
+
+            when configured_capacity_is_zero_and_the_buffer_is_empty {
+                // Positive side of the capacity clamp: `capacity()` raises a
+                // misconfigured `buffer_size(0)` to 1, so the very first task
+                // must still be buffered instead of deadlocking the sink. Pins
+                // the documented "zero-config still holds one task" guarantee
+                // against a regression to `min(buffer_size, 1)` (== 0) that
+                // would reject even the first push.
+                let buffer_size = 0;
+                let existing_items = 0;
+                to buffers_the_first_task_despite_zero_config { be_ok_and equal(1) }
+            }
         }
 
         expect(poll_ready_via_storage(buffer_size, existing_items)) {
@@ -601,6 +620,17 @@ mod tests {
                 // guard against a `>= cap - 1` off-by-one).
                 let buffer_size = 2;
                 let existing_items = 1;
+                to returns_ready_without_flushing { poll_ready_ok }
+            }
+
+            when configured_capacity_is_zero_and_the_buffer_is_empty {
+                // Positive side of the capacity clamp on the readiness path:
+                // `buffer_size(0)` clamps to 1, so an empty buffer has a free
+                // slot and `poll_ready` must return Ready(Ok) rather than
+                // wedging. A regression to `min(buffer_size, 1)` (== 0) would
+                // make `len >= cap` true at len 0 and drive a flush instead.
+                let buffer_size = 0;
+                let existing_items = 0;
                 to returns_ready_without_flushing { poll_ready_ok }
             }
         }
@@ -631,7 +661,7 @@ mod tests {
             when the_in_flight_flush_resolves_with_an_error {
                 let result = Err(Error::SinkBufferFull(1));
                 to surfaces_the_error_and_clears_the_future {
-                    observation_is_ready_err_and_cleared
+                    observation_surfaces_buffer_full_at(1)
                 }
             }
         }

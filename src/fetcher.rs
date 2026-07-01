@@ -533,8 +533,9 @@ mod tests {
     fn observed_strategy_exhaustion(result: &PollObservation) -> AssertionResult {
         match (result.poll, result.state) {
             // After the strategy ends, the fetcher enters StrategyEnded and
-            // its Delay (100 ms, fetcher.rs:108) has not yet elapsed in this
-            // synchronous test — so the outer poll returns Pending.
+            // its Delay (STRATEGY_EXHAUSTED_BACKOFF, 100 ms) has not yet
+            // elapsed in this synchronous test — so the outer poll returns
+            // Pending.
             ("pending", "strategy_ended") => Ok(()),
             other => Err(AssertionError::new(vec![format!(
                 "expected exhausted strategy to transition into strategy_ended/pending, got {other:?}"
@@ -610,9 +611,10 @@ mod tests {
     }
 
     fn observed_pending_fetch(result: &PollObservation) -> AssertionResult {
-        // The in-flight fetch future is still Pending (fetcher.rs:349): the
-        // poll returns Pending without mutating the state slot or the
-        // previously remembered batch count (12 from `buffered_fetcher`).
+        // The in-flight fetch future is still Pending (the
+        // StreamState::Fetch + Poll::Pending arm of `poll_next`): the poll
+        // returns Pending without mutating the state slot or the previously
+        // remembered batch count (12 from `buffered_fetcher`).
         match (result.poll, result.state, result.previous_task_count) {
             ("pending", "fetch", 12) => Ok(()),
             other => Err(AssertionError::new(vec![format!(
@@ -893,6 +895,75 @@ mod tests {
             when a_fetch_cycle_completes_and_the_next_poll_is_scheduled {
                 to keeps_being_governed_by_the_configured_poll_strategy {
                     equal("wait_for_poll")
+                }
+            }
+        }
+    }
+
+    // These specs drive the two *positive* transitions into `Fetch` — the ones
+    // that actually issue a `fetch_next` query — which the synchronous
+    // `noop_waker` specs above cannot: `queries::fetch_next` goes through
+    // `spawn_blocking`, so it needs a real runtime to make progress. Both let
+    // the fetch fail against the unreachable pool; observing that connection
+    // error is positive proof that a real fetch was launched by the transition
+    // under test (a broken transition would never leave the source state, so
+    // `next().await` would hang on the pending poller instead of yielding the
+    // error).
+    #[cfg(feature = "tokio")]
+    mod tokio_tests {
+        use super::*;
+
+        #[allow(clippy::type_complexity)]
+        fn poll_error_mentions_connection_failure(
+            result: &Option<Result<Option<Task<CompactType, PgContext, ulid::Ulid>>, Error>>,
+        ) -> AssertionResult {
+            match result {
+                Some(Err(Error::Pool(_))) => Ok(()),
+                other => Err(AssertionError::new(vec![format!(
+                    "expected the transition to launch a fetch that fails to connect (Error::Pool), got {other:?}"
+                )])),
+            }
+        }
+
+        /// A poller that grants exactly one permit and then never yields again.
+        /// If `WaitForPoll` consumed the `Ready(Some(()))` permit correctly it
+        /// starts a fetch; if it dropped the permit it would fall back to the
+        /// pending tail and the stream would hang instead of erroring.
+        async fn wait_for_poll_permit_launches_fetch()
+        -> Option<Result<Option<Task<CompactType, PgContext, ulid::Ulid>>, Error>> {
+            let mut fetcher = buffered_fetcher();
+            let poller: Poller =
+                Box::pin(stream::once(future::ready(())).chain(stream::pending::<()>()));
+            fetcher.poller = poller.fuse();
+            fetcher.state = StreamState::WaitForPoll;
+            fetcher.next().await
+        }
+
+        /// A `StrategyEnded` state whose backoff `Delay` is already due. Once it
+        /// elapses the fetcher must leave `StrategyEnded` and start a fetch; a
+        /// broken arm that never transitioned would spin on the ready delay or
+        /// hang instead of yielding the connection error.
+        async fn strategy_ended_delay_elapses_into_fetch()
+        -> Option<Result<Option<Task<CompactType, PgContext, ulid::Ulid>>, Error>> {
+            let mut fetcher = buffered_fetcher();
+            fetcher.state = StreamState::StrategyEnded(Delay::new(Duration::ZERO));
+            fetcher.next().await
+        }
+
+        lets_expect! { #tokio_test
+            expect(wait_for_poll_permit_launches_fetch().await) {
+                when the_poll_strategy_grants_a_permit {
+                    to starts_a_fetch_that_reports_the_connection_failure {
+                        poll_error_mentions_connection_failure
+                    }
+                }
+            }
+
+            expect(strategy_ended_delay_elapses_into_fetch().await) {
+                when the_strategy_exhausted_backoff_delay_elapses {
+                    to starts_a_fetch_that_reports_the_connection_failure {
+                        poll_error_mentions_connection_failure
+                    }
                 }
             }
         }
