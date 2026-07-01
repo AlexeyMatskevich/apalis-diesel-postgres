@@ -146,12 +146,16 @@ pub(crate) fn fail_undecodable_task(
         // `last_result`, so readers observe one format for every failure path.
         let result = serde_json::json!({ "Err": crate::ack::truncate_error_payload(error) });
         sql_query(
+            // `attempts::bigint` promotes the arithmetic so a corrupt row at
+            // i32::MAX cannot overflow the `+ 1` (which PostgreSQL rejects as
+            // "integer out of range"); LEAST re-bounds the result to
+            // `max_attempts`, so it fits the int column again.
             "UPDATE apalis.jobs
              SET status = CASE
-                     WHEN attempts + 1 >= max_attempts THEN 'Killed'
+                     WHEN attempts::bigint + 1 >= max_attempts THEN 'Killed'
                      ELSE 'Failed'
                  END,
-                 attempts = LEAST(attempts + 1, max_attempts),
+                 attempts = LEAST(attempts::bigint + 1, max_attempts),
                  done_at = now(),
                  last_result = $3
              WHERE id = $1
