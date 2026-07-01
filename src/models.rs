@@ -199,6 +199,7 @@ mod tests {
         priority: Option<i32>,
         metadata: Option<Value>,
         idempotency_key: Option<String>,
+        last_result: Option<Value>,
     ) -> JobRow {
         JobRow {
             job: vec![1, 2, 3],
@@ -208,7 +209,7 @@ mod tests {
             attempts,
             max_attempts,
             run_at: DateTime::now(),
-            last_result: Some(json!({"ok": true})),
+            last_result,
             lock_at: Some(DateTime::now()),
             lock_by: Some("worker-1".to_string()),
             done_at: Some(DateTime::now()),
@@ -349,7 +350,14 @@ mod tests {
     /// non-object metadata to an empty object in `From<JobRow>` keeps the
     /// conversion total, matching apalis-sql's own defensive `try_into_task`.
     fn compact_metadata_json(metadata: Value) -> Result<String, String> {
-        let mut row = job_row(1, 3, Some(0), Some(metadata), None);
+        let mut row = job_row(
+            1,
+            3,
+            Some(0),
+            Some(metadata),
+            None,
+            Some(json!({"ok": true})),
+        );
         // `try_into_task_compact` parses `id` and `status`; the shared `job_row`
         // helper stores placeholders that only the (non-parsing) `From`
         // conversion tolerates, so give it a real ULID and a parseable status.
@@ -397,12 +405,13 @@ mod tests {
             }
         }
 
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone()))) {
+        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) {
             let attempts = 1;
             let max_attempts = 3;
             let priority = Some(9);
             let metadata = expected_metadata();
             let idempotency_key = expected_idempotency_key();
+            let last_result: Option<Value> = Some(json!({"ok": true}));
 
             to preserves_the_positive_attempt_count { have(attempts) equal(1) }
 
@@ -458,6 +467,19 @@ mod tests {
                     have(idempotency_key) equal(None)
                 }
             }
+
+            to forwards_the_present_last_result { have(last_result) equal(Some(json!({"ok": true}))) }
+
+            when last_result_is_null {
+                // `last_result` is `Nullable<Jsonb>`; NULL is a legitimate,
+                // documented state (a task that has never produced a result).
+                // `From<JobRow>` forwards it verbatim (`last_result:
+                // row.last_result`), so a regression that dropped or defaulted
+                // it to `None` for a non-null row — or vice versa — must fail
+                // here rather than only on a SQL round-trip.
+                let last_result: Option<Value> = None;
+                to forwards_the_absent_last_result { have(last_result) equal(None) }
+            }
         }
 
         expect(RunningWorker::from(worker_row(last_seen, started_at, layers))) {
@@ -466,6 +488,17 @@ mod tests {
             let layers = Some("layer-a,layer-b".to_string());
 
             to converts_last_seen_to_a_unix_timestamp { have(last_heartbeat) equal(123) }
+
+            when last_seen_is_the_epoch {
+                // Boundary at the `>= 0` edge of `u64::try_from(..).unwrap_or(0)`
+                // (src/models.rs:104): the epoch 1970-01-01 is a valid timestamp
+                // that must convert to `0`, not be rejected as if it were the
+                // negative branch. Pins the successful-conversion side of the
+                // clamp so an off-by-one that treated `0` as invalid would still
+                // be caught by the paired non-zero/`123` case above.
+                let last_seen = <DateTime as DateTimeExt>::from_unix_timestamp(0);
+                to converts_the_epoch_to_zero { have(last_heartbeat) equal(0) }
+            }
 
             when last_seen_is_a_negative_unix_timestamp {
                 // Mirror of started_at below: `u64::try_from(negative).unwrap_or(0)`

@@ -125,4 +125,68 @@ mod tests {
             to passes_the_job_type_through_unchanged { equal("emails".to_string()) }
         }
     }
+
+    /// Parse a raw NOTIFY payload exactly as the LISTEN loops in
+    /// `queries::notify` and `shared` do. Deserialization is the module's whole
+    /// reason to exist: payloads arrive from any sender holding `pg_notify`, so
+    /// the negative/default paths that the `let Ok(event) = from_str… else`
+    /// guards depend on must be pinned here.
+    fn parse(payload: &str) -> Result<InsertEvent, serde_json::Error> {
+        serde_json::from_str::<InsertEvent>(payload)
+    }
+
+    lets_expect! {
+        expect(parse(payload)) {
+            let payload = r#"{"job_type":"emails","ids":["01AN4Z07BY79KA1307SR9X4MV3"]}"#;
+
+            // New statement-level shape `{job_type, ids:[…]}` deserializes.
+            to accepts_the_statement_level_shape {
+                be_ok,
+                have(as_ref().unwrap().job_type.as_str()) { equal("emails") },
+                have(as_ref().unwrap().ids.len()) { equal(1) },
+                have(as_ref().unwrap().id.is_none()) { be_true }
+            }
+
+            when the_payload_uses_the_legacy_single_id_shape {
+                let payload = r#"{"job_type":"emails","id":"01AN4Z07BY79KA1307SR9X4MV3"}"#;
+                // Legacy `{job_type, id}` still deserializes; `ids` defaults to [].
+                to accepts_the_legacy_shape_and_defaults_ids_to_empty {
+                    be_ok,
+                    have(as_ref().unwrap().id.is_some()) { be_true },
+                    have(as_ref().unwrap().ids.len()) { equal(0) }
+                }
+            }
+
+            when only_the_job_type_is_present {
+                let payload = r#"{"job_type":"emails"}"#;
+                // `id`/`ids` carry `#[serde(default)]`, so a bare job_type is
+                // valid and both optional fields take their empty defaults.
+                to applies_the_serde_defaults_for_both_id_fields {
+                    be_ok,
+                    have(as_ref().unwrap().id.is_none()) { be_true },
+                    have(as_ref().unwrap().ids.len()) { equal(0) }
+                }
+            }
+
+            when the_job_type_field_is_missing {
+                let payload = r#"{"ids":["01AN4Z07BY79KA1307SR9X4MV3"]}"#;
+                // `job_type` is NOT `#[serde(default)]`; without it the payload
+                // must fail so the `let Ok(event) = from_str… else` guards skip
+                // it instead of processing a `job_type=""` phantom event.
+                to fails_to_deserialize { be_err }
+            }
+
+            when the_payload_is_the_empty_wake_up_string {
+                let payload = "";
+                // Both Drop impls send an empty payload purely as a wake-up; it
+                // must fail to parse so it is never mistaken for a real event.
+                to fails_to_deserialize { be_err }
+            }
+
+            when the_payload_is_not_valid_json {
+                let payload = "not json";
+                to fails_to_deserialize { be_err }
+            }
+        }
+    }
 }
