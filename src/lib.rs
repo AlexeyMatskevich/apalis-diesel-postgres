@@ -726,9 +726,35 @@ mod tests {
     }
 
     fn constructs_backend_traits(result: &(String, String, String)) -> AssertionResult {
-        if result.0.contains("PgMiddleware")
-            && result.1.contains("Stream")
-            && result.2.contains("Stream")
+        let (middleware, heartbeat, compact) = result;
+        // `std::any::type_name_of_val` resolves type aliases away, so neither
+        // `BoxStream` nor `PgContext` ever appears literally — `BoxStream<T>`
+        // always prints as its expansion `Pin<Box<dyn Stream<Item = T> + Send>>`,
+        // and `PgContext` as its expansion `SqlContext<PgPool>`. Match those
+        // expansions instead of the alias names.
+        //
+        // The heartbeat is `Beat = BoxStream<'static, Result<(), Error>>`: a bare
+        // `()` beat, so its type name carries the `Result`/`Error` item shape but
+        // must NOT name a task — that would mean `heartbeat()` handed back the poll
+        // stream instead.
+        let heartbeat_is_beat_stream = heartbeat.contains("Pin")
+            && heartbeat.contains("Box")
+            && heartbeat.contains("Stream")
+            && heartbeat.contains("Result")
+            && heartbeat.contains("Error")
+            && !heartbeat.contains("SqlContext")
+            && !heartbeat.contains("Task<");
+        // The compact stream is `CompactStream = TaskStream<PgTask<CompactType>,
+        // Error>` = `BoxStream<'static, Result<Option<Task<Vec<u8>, PgContext,
+        // Ulid>>, Error>>`: it must name the `Option`-wrapped task with its
+        // `SqlContext`, distinguishing it from the bare heartbeat beat.
+        let compact_is_task_stream = compact.contains("Pin")
+            && compact.contains("Box")
+            && compact.contains("Stream")
+            && compact.contains("Option")
+            && compact.contains("SqlContext")
+            && compact.contains("Error");
+        if middleware.contains("PgMiddleware") && heartbeat_is_beat_stream && compact_is_task_stream
         {
             Ok(())
         } else {

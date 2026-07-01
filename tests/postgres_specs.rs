@@ -524,17 +524,235 @@ fn refresh_unpopulated_snapshot_populates()
 }
 
 // --------------------------------------------------------------------------
-// queries/metrics.rs: populated branch is implementation-only.
-// A second `refresh_queue_stats_snapshot` after the first must take the
-// CONCURRENTLY arm; covering it as a separate `expect(run_refresh_populated_…)`
-// races against the `WITH NO DATA` reset in `run_refresh_unpopulated_snapshot`
-// (both run in parallel under cargo test). The two arms together form a
-// state-machine where the unpopulated test transitions populated → unpopulated
-// and then back to populated, so the CONCURRENTLY arm is in fact exercised
-// any time the broader test suite runs after the unpopulated test completes.
-// Keeping a separate populated-arm test would require serializing the matview
-// state across the file, which is out of proportion with the value.
+// queries/metrics.rs: CONCURRENTLY (populated) branch.
+//
+// `refresh_queue_stats_snapshot` reads `pg_matviews.ispopulated` and, when the
+// matview is already populated, runs `REFRESH ... CONCURRENTLY` (metrics.rs:33)
+// instead of the blocking form. The unpopulated test only drives the
+// `populated = false` arm; nothing else in the suite calls the helper against a
+// populated matview, so the CONCURRENTLY arm needs its own test.
+//
+// A naive "call it twice and assert success" test is inadequate: an
+// implementation that dropped the `ispopulated` check and always ran the
+// *blocking* `REFRESH` would still succeed and still leave the matview
+// populated, so it would pass without ever exercising CONCURRENTLY. We instead
+// pin the property that actually distinguishes the two arms — the lock level:
+//
+//   * `REFRESH MATERIALIZED VIEW CONCURRENTLY` takes only `ExclusiveLock`,
+//     which is *compatible* with `AccessShareLock`.
+//   * plain `REFRESH MATERIALIZED VIEW` takes `AccessExclusiveLock`, which
+//     *conflicts* with `AccessShareLock`.
+//
+// So we prime the matview to populated, then hold an `ACCESS SHARE` lock on it
+// from a second connection inside an open transaction and, while that lock is
+// held, call the helper on a different pooled connection with a timeout:
+//
+//   * If the helper takes the CONCURRENTLY arm it acquires `ExclusiveLock`,
+//     which does not conflict with our `ACCESS SHARE`, so it completes within
+//     the timeout.
+//   * If a regression makes it take the blocking arm it needs
+//     `AccessExclusiveLock`, which our `ACCESS SHARE` blocks, so the refresh
+//     stalls until the timeout fires — and the test fails.
+//
+// The held `ACCESS SHARE` lock doubles as protection against gap #2: a
+// competing test's `REFRESH ... WITH NO DATA` (which needs `AccessExclusiveLock`
+// and would reset `ispopulated` to false) cannot run while we hold the lock, so
+// the matview cannot be quietly reset out from under us between priming and the
+// concurrent refresh. We additionally re-read `ispopulated` under the held lock
+// and fail loudly if it is not `true`, so a reset that slipped in *before* we
+// grabbed the lock cannot make the test pass vacuously.
+//
+// CONCURRENTLY also depends on the UNIQUE index
+// `queue_stats_snapshot_job_type_idx`; if a future migration drops it,
+// PostgreSQL rejects the statement and `concurrent_result` is an error.
 // --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RefreshPopulatedRun {
+    prime_result: Result<(), String>,
+    /// `ispopulated` observed inside the transaction that holds the `ACCESS
+    /// SHARE` lock, i.e. the exact state the concurrent refresh sees. Must be
+    /// `true`, otherwise the "populated" precondition never held and the arm
+    /// under test was not exercised.
+    populated_under_lock: bool,
+    /// `Ok(())` if the concurrent refresh completed within the timeout while the
+    /// `ACCESS SHARE` lock was held (proving it used the non-conflicting
+    /// CONCURRENTLY arm); `Err` if it errored; `TimedOut` if it blocked on the
+    /// lock (proving it wrongly used the blocking arm).
+    concurrent_outcome: ConcurrentRefreshOutcome,
+    populated_after: bool,
+}
+
+#[derive(Debug)]
+enum ConcurrentRefreshOutcome {
+    /// Refresh returned `Ok` before the timeout while the `ACCESS SHARE` lock
+    /// was held — only possible via the CONCURRENTLY arm.
+    Completed,
+    /// Refresh returned an error (e.g. the CONCURRENTLY unique index was
+    /// dropped).
+    Errored(String),
+    /// Refresh did not return before the timeout — it blocked on the held
+    /// `ACCESS SHARE` lock, which only the blocking arm does.
+    TimedOut,
+}
+
+async fn run_refresh_populated_snapshot() -> Result<Outcome<RefreshPopulatedRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+
+    // Prime: guarantee the matview is populated so the helper under test reads
+    // `ispopulated = true` and must take the CONCURRENTLY arm.
+    let prime_result = refresh_queue_stats_snapshot(&pool)
+        .await
+        .map_err(|e| e.to_string());
+
+    // Hold an `ACCESS SHARE` lock on the matview from a dedicated pooled
+    // connection inside an open transaction. The blocking task acquires the
+    // lock, reports `ispopulated` seen under it, signals readiness, then waits
+    // for a release signal before committing. This keeps a real lock live on the
+    // server for the whole window of the concurrent refresh.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool, String>>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let lock_pool = pool.clone();
+    let lock_holder = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut conn = lock_pool.get().map_err(|e| e.to_string())?;
+        // Explicit BEGIN/COMMIT (not `conn.transaction`) so the transaction —
+        // and thus the lock — stays open across the readiness/release handshake.
+        sql_query("BEGIN").execute(&mut conn).map_err(|e| {
+            let _ = ready_tx.send(Err(e.to_string()));
+            e.to_string()
+        })?;
+        let lock_and_read = (|| -> Result<bool, String> {
+            // PostgreSQL's `LOCK TABLE` does not support materialized views
+            // ("this operation is not supported for materialized views"), so
+            // the `ACCESS SHARE` lock is acquired the way any real reader
+            // would: a `SELECT` against the matview inside this open
+            // transaction. The lock is held until `COMMIT`/`ROLLBACK` below,
+            // exactly like an explicit `LOCK TABLE` would have been.
+            sql_query("SELECT 1 FROM apalis.queue_stats_snapshot LIMIT 1")
+                .execute(&mut conn)
+                .map_err(|e| e.to_string())?;
+            sql_query(
+                "SELECT ispopulated AS populated
+                 FROM pg_matviews
+                 WHERE schemaname = 'apalis' AND matviewname = 'queue_stats_snapshot'",
+            )
+            .load::<PopulatedRow>(&mut conn)
+            .map_err(|e| e.to_string())
+            .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
+        })();
+        match lock_and_read {
+            Ok(populated) => {
+                let _ = ready_tx.send(Ok(populated));
+                // Block until the async side has finished (or timed out) the
+                // concurrent refresh, then release the lock.
+                let _ = release_rx.recv();
+                let _ = sql_query("COMMIT").execute(&mut conn);
+                Ok(())
+            }
+            Err(err) => {
+                let _ = ready_tx.send(Err(err.clone()));
+                let _ = sql_query("ROLLBACK").execute(&mut conn);
+                Err(err)
+            }
+        }
+    });
+
+    // Wait for the lock to be held before racing the refresh against it. The
+    // `recv` is on a `std::sync::mpsc` channel, so hop it onto a blocking thread
+    // to avoid stalling the async runtime.
+    let ready = tokio::task::spawn_blocking(move || ready_rx.recv())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?; // channel closed => lock task panicked
+    let populated_under_lock = ready?;
+
+    // With the `ACCESS SHARE` lock held, call the helper. A CONCURRENTLY refresh
+    // (ExclusiveLock) does not conflict and returns quickly; a blocking refresh
+    // (AccessExclusiveLock) conflicts and stalls until the timeout.
+    let concurrent_outcome =
+        match tokio::time::timeout(Duration::from_secs(5), refresh_queue_stats_snapshot(&pool))
+            .await
+        {
+            Ok(Ok(())) => ConcurrentRefreshOutcome::Completed,
+            Ok(Err(e)) => ConcurrentRefreshOutcome::Errored(e.to_string()),
+            Err(_) => ConcurrentRefreshOutcome::TimedOut,
+        };
+
+    // Release the lock holder and reap it so the connection returns to the pool.
+    let _ = release_tx.send(());
+    let _ = lock_holder.await;
+
+    let populated_after = with_conn(pool.clone(), |conn| {
+        sql_query(
+            "SELECT ispopulated AS populated
+             FROM pg_matviews
+             WHERE schemaname = 'apalis' AND matviewname = 'queue_stats_snapshot'",
+        )
+        .load::<PopulatedRow>(conn)
+        .map_err(|e| e.to_string())
+        .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
+    })
+    .await?;
+
+    Ok(Outcome::Completed(RefreshPopulatedRun {
+        prime_result,
+        populated_under_lock,
+        concurrent_outcome,
+        populated_after,
+    }))
+}
+
+fn refresh_populated_snapshot_uses_concurrently()
+-> impl Fn(&Result<Outcome<RefreshPopulatedRun>, String>) -> AssertionResult {
+    observe::<RefreshPopulatedRun, _>("refresh populated snapshot concurrently", |run| {
+        // Priming must succeed so the matview is populated for the arm under test.
+        run.prime_result
+            .as_ref()
+            .map_err(|err| format!("expected the priming refresh to succeed, got {err}"))?;
+        // The concurrent refresh raced an `ACCESS SHARE` lock that the state it
+        // saw was genuinely populated; if that precondition did not hold the arm
+        // was never exercised, so fail rather than pass vacuously.
+        if !run.populated_under_lock {
+            return Err(
+                "matview was not populated under the held ACCESS SHARE lock, so the \
+                        CONCURRENTLY arm was not exercised"
+                    .into(),
+            );
+        }
+        match &run.concurrent_outcome {
+            ConcurrentRefreshOutcome::Completed => Ok(()),
+            ConcurrentRefreshOutcome::Errored(err) => Err(format!(
+                "expected CONCURRENTLY refresh on a populated matview to succeed, got {err}"
+            )),
+            // The refresh blocked on the ACCESS SHARE lock: it took the blocking
+            // `AccessExclusiveLock` arm instead of the non-conflicting
+            // CONCURRENTLY `ExclusiveLock` arm — the exact regression this pins.
+            ConcurrentRefreshOutcome::TimedOut => Err(
+                "refresh blocked on a held ACCESS SHARE lock, so it used the blocking arm \
+                 (AccessExclusiveLock) rather than CONCURRENTLY (ExclusiveLock)"
+                    .into(),
+            ),
+        }
+    })
+}
+
+fn refresh_populated_snapshot_stays_populated()
+-> impl Fn(&Result<Outcome<RefreshPopulatedRun>, String>) -> AssertionResult {
+    observe::<RefreshPopulatedRun, _>("refresh populated snapshot stays populated", |run| {
+        if run.prime_result.is_err()
+            || !matches!(run.concurrent_outcome, ConcurrentRefreshOutcome::Completed)
+        {
+            return Ok(()); // covered by the other assertion
+        }
+        if run.populated_after {
+            Ok(())
+        } else {
+            Err("matview should remain populated after a CONCURRENTLY refresh".into())
+        }
+    })
+}
 
 // --------------------------------------------------------------------------
 // P4: UNLISTEN after NotifyTaskIds drop.
@@ -2278,9 +2496,20 @@ fn ack_writes_done() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> As
 }
 
 fn ack_persists_result() -> impl Fn(&Result<Outcome<AckPredicateRun>, String>) -> AssertionResult {
-    observe::<AckPredicateRun, _>("ack writes last_result", |run| match &run.row_last_result {
-        Some(_) => Ok(()),
-        None => Err("expected last_result to be populated after successful ack".into()),
+    observe::<AckPredicateRun, _>("ack writes last_result", |run| {
+        // The fixture always acks `Ok("processed")`, which `PgAck` serializes as
+        // the externally-tagged `Result` JSON `{"Ok":"processed"}`. Compare the
+        // exact value so a regression that persists a wrong-but-non-null result
+        // (a stale prior result, a `null` wrapper, or `{"Err":...}`) is caught —
+        // matching only `Some(_)` would let any non-empty value through.
+        let expected = serde_json::json!({ "Ok": "processed" });
+        match &run.row_last_result {
+            Some(v) if *v == expected => Ok(()),
+            Some(other) => Err(format!(
+                "expected last_result to be {expected}, got {other}"
+            )),
+            None => Err("expected last_result to be populated after successful ack".into()),
+        }
     })
 }
 
@@ -2358,6 +2587,17 @@ lets_expect! { #tokio_test
             }
             to leaves_the_matview_populated_for_subsequent_callers {
                 refresh_unpopulated_snapshot_populates()
+            }
+        }
+    }
+
+    expect(run_refresh_populated_snapshot().await) {
+        when refresh_runs_against_an_already_populated_matview {
+            to takes_the_concurrently_arm_and_succeeds {
+                refresh_populated_snapshot_uses_concurrently()
+            }
+            to leaves_the_matview_populated {
+                refresh_populated_snapshot_stays_populated()
             }
         }
     }
@@ -2591,6 +2831,25 @@ lets_expect! { #tokio_test
         let setup = ACK_OK;
 
         when called_without_a_lease_token_on_a_matching_running_row {
+            to marks_the_row_done { ack_writes_done() }
+            to persists_the_serialized_result { ack_persists_result() }
+            to returns_ok { ack_succeeds() }
+        }
+
+        when called_without_a_lease_token_while_the_workers_row_carries_one {
+            // Symmetric to the no-token happy path: the caller supplies no
+            // token (`$9::text IS NULL` is true) so the EXISTS subquery is
+            // short-circuited entirely and the token stored in `apalis.workers`
+            // is ignored — the ack must succeed regardless of `lease_token`.
+            // This is the arm that proves the `$9::text IS NULL OR` guard
+            // bypasses the worker-token check; the `None`/`None` baseline would
+            // still pass if the guard were removed (its worker token is NULL
+            // too), so only this case pins the ignore-worker-token behaviour.
+            let setup = AckSetup {
+                pgack_token: None,
+                workers_token: Some("stored-token"),
+                ..ACK_OK
+            };
             to marks_the_row_done { ack_writes_done() }
             to persists_the_serialized_result { ack_persists_result() }
             to returns_ok { ack_succeeds() }

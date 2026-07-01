@@ -50,6 +50,7 @@ struct WorkerRun {
     in_handler_push_invocations: u64,
     email_status: Option<Status>,
     activity_count: i64,
+    activity_payload: Option<LogActivity>,
 }
 
 #[derive(Debug)]
@@ -93,6 +94,38 @@ async fn count_jobs(pool: PgPool, queue: String) -> Result<i64, String> {
                 .get_result(&mut conn)
                 .map_err(|e| e.to_string())?;
         Ok(row.n)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(diesel::QueryableByName)]
+struct JobPayloadRow {
+    #[diesel(sql_type = diesel::sql_types::Binary)]
+    job: Vec<u8>,
+}
+
+/// Reads back the single follow-up row's stored `job` payload and decodes it
+/// with the same JSON codec the storage encoded it with, so the test can assert
+/// the *content* the handler wrote (not merely that a row exists).
+async fn fetch_activity_payload(
+    pool: PgPool,
+    queue: String,
+) -> Result<Option<LogActivity>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Option<LogActivity>, String> {
+        let mut conn = pool.get().map_err(|e| e.to_string())?;
+        let rows: Vec<JobPayloadRow> = sql_query("SELECT job FROM apalis.jobs WHERE job_type = $1")
+            .bind::<Text, _>(&queue)
+            .load(&mut conn)
+            .map_err(|e| e.to_string())?;
+        match rows.into_iter().next() {
+            None => Ok(None),
+            Some(row) => {
+                let decoded: LogActivity =
+                    serde_json::from_slice(&row.job).map_err(|e| e.to_string())?;
+                Ok(Some(decoded))
+            }
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -237,6 +270,7 @@ async fn run_worker_integration(handler_outcome: HandlerOutcome) -> Result<Worke
     let handler_invocations = invocations.load(Ordering::Relaxed);
     let in_handler_push_invocations = push_ok.load(Ordering::Relaxed);
     let activity_count = count_jobs(pool.clone(), activity_queue.clone()).await?;
+    let activity_payload = fetch_activity_payload(pool.clone(), activity_queue.clone()).await?;
     cleanup_queues(pool, vec![emails_queue, activity_queue]).await?;
 
     Ok(WorkerOutcome::Completed(WorkerRun {
@@ -244,6 +278,7 @@ async fn run_worker_integration(handler_outcome: HandlerOutcome) -> Result<Worke
         in_handler_push_invocations,
         email_status,
         activity_count,
+        activity_payload,
     }))
 }
 
@@ -324,6 +359,36 @@ fn activity_queue_holds_exactly_one_row()
     })
 }
 
+fn activity_row_carries_the_business_payload()
+-> impl Fn(&Result<WorkerOutcome, String>) -> AssertionResult {
+    // The whole point of the in-handler outbox is to durably record business
+    // data *derived from the task*: the handler maps `SendEmail { to }` into
+    // `LogActivity { kind: "email_sent", target: to }`. Reading the stored `job`
+    // payload back and asserting both fields is what proves the payload was
+    // encoded correctly end-to-end — a count-only check would stay green even if
+    // `push_with_conn` wrote an empty/wrong payload or dropped the `target`.
+    observe("activity payload content", |run| {
+        match &run.activity_payload {
+            None => Err("expected a decoded activity payload, found no follow-up row".into()),
+            Some(payload) => {
+                if payload.kind != "email_sent" {
+                    return Err(format!(
+                        "expected activity kind \"email_sent\", got {:?}",
+                        payload.kind
+                    ));
+                }
+                if payload.target != "ada@example.com" {
+                    return Err(format!(
+                        "expected activity target \"ada@example.com\" (derived from the task's `to`), got {:?}",
+                        payload.target
+                    ));
+                }
+                Ok(())
+            }
+        }
+    })
+}
+
 lets_expect! { #tokio_test
     expect(worker_outcome(handler_outcome).await) {
         let handler_outcome = HandlerOutcome::Ok;
@@ -341,6 +406,9 @@ lets_expect! { #tokio_test
             to leaves_the_follow_up_log_row_visible {
                 activity_queue_holds_exactly_one_row()
             }
+            to records_the_task_payload_in_the_follow_up_row {
+                activity_row_carries_the_business_payload()
+            }
         }
 
         when the_handler_returns_err {
@@ -354,6 +422,14 @@ lets_expect! { #tokio_test
                 // commits *before* the handler returns, so the follow-up row
                 // is durable independently of the handler's final result.
                 activity_queue_holds_exactly_one_row()
+            }
+            to still_observes_the_in_handler_push_success {
+                // Symmetric to the ok-branch leaf: `push_ok` only increments when
+                // the handler's own `spawn_blocking` returned `Ok(Ok(()))`, so
+                // this proves the failing handler *observed* the push succeed
+                // (the error wasn't swallowed) — a signal distinct from the
+                // committed-row count above.
+                in_handler_push_succeeded_exactly_once()
             }
             to kills_the_email_task_after_the_exhausted_attempt {
                 email_terminal_status_is_killed()
