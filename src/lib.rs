@@ -341,7 +341,7 @@ where
 
     fn middleware(&self) -> Self::Layer {
         PgMiddleware::with_lease_token(
-            self.pool.clone(),
+            &self.pool,
             self.config.ack(),
             std::sync::Arc::clone(&self.lease_token),
         )

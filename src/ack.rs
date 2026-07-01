@@ -145,7 +145,7 @@ mod tests {
             }
             parts.ctx = ctx;
 
-            let mut ack = PgAck::new(unchecked_pool());
+            let mut ack = PgAck::new(&unchecked_pool());
             let result: Result<(), BoxDynError> = Ok(());
             ack.ack(&result, &parts).await
         })
@@ -187,7 +187,7 @@ mod tests {
     }
 
     fn middleware_auto_ack_enabled(auto_ack: bool) -> bool {
-        PgMiddleware::new(unchecked_pool(), auto_ack).auto_ack()
+        PgMiddleware::new(&unchecked_pool(), auto_ack).auto_ack()
     }
 
     async fn lock_service_call_async(
@@ -274,9 +274,9 @@ mod tests {
 
     fn pg_ack_debug(with_token: bool) -> String {
         let ack = if with_token {
-            PgAck::with_lease_token(unchecked_pool(), Arc::from(SECRET_LEASE_TOKEN))
+            PgAck::with_lease_token(&unchecked_pool(), Arc::from(SECRET_LEASE_TOKEN))
         } else {
-            PgAck::new(unchecked_pool())
+            PgAck::new(&unchecked_pool())
         };
         format!("{ack:?}")
     }
@@ -288,7 +288,7 @@ mod tests {
     fn middleware_debug() -> String {
         format!(
             "{:?}",
-            PgMiddleware::with_lease_token(unchecked_pool(), true, Arc::from(SECRET_LEASE_TOKEN))
+            PgMiddleware::with_lease_token(&unchecked_pool(), true, Arc::from(SECRET_LEASE_TOKEN))
         )
     }
 
@@ -584,7 +584,7 @@ mod tests {
                 .with_queue("ack-queue".to_owned())
                 .with_lock_by(Some("ack-worker".to_owned()))
                 .with_lock_at(Some(1_700_000_000));
-            let mut ack = PgAck::new(unchecked_pool());
+            let mut ack = PgAck::new(&unchecked_pool());
             let result: Result<(), BoxDynError> = Ok(());
             ack.ack(&result, &parts).await
         }
@@ -626,7 +626,7 @@ mod tests {
                 .parts;
             // Need a Parts whose payload-channel type matches PoisonOk.
             let _ = &mut parts;
-            let mut ack = PgAck::new(unchecked_pool());
+            let mut ack = PgAck::new(&unchecked_pool());
             let result: Result<PoisonOk, BoxDynError> = Ok(PoisonOk);
             ack.ack(&result, &parts).await
         }
@@ -721,9 +721,9 @@ impl PgAck {
     /// checks the per-process token. This constructor exists for test harnesses
     /// and admin tooling that do not own a lease token.
     #[must_use]
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: &PgPool) -> Self {
         Self {
-            pool,
+            pool: pool.clone(),
             lease_token: None,
         }
     }
@@ -735,9 +735,9 @@ impl PgAck {
     /// handle's `middleware()` wires this automatically; manual callers should
     /// reuse the token they passed to `initial_heartbeat`/`keep_alive`.
     #[must_use]
-    pub fn with_lease_token(pool: PgPool, lease_token: Arc<str>) -> Self {
+    pub fn with_lease_token(pool: &PgPool, lease_token: Arc<str>) -> Self {
         Self {
-            pool,
+            pool: pool.clone(),
             lease_token: Some(lease_token),
         }
     }
@@ -948,7 +948,7 @@ pub struct PgMiddleware {
 impl PgMiddleware {
     /// Create the PostgreSQL backend middleware.
     #[must_use]
-    pub fn new(pool: PgPool, auto_ack: bool) -> Self {
+    pub fn new(pool: &PgPool, auto_ack: bool) -> Self {
         Self {
             lock: LockTaskLayer::new(pool.clone()),
             ack: auto_ack.then(|| AcknowledgeLayer::new(PgAck::new(pool))),
@@ -959,7 +959,7 @@ impl PgMiddleware {
     /// the auto-ack path. Used by [`crate::PostgresStorage`] so completed jobs
     /// can only be acknowledged by a worker possessing the per-storage token.
     #[must_use]
-    pub fn with_lease_token(pool: PgPool, auto_ack: bool, lease_token: Arc<str>) -> Self {
+    pub fn with_lease_token(pool: &PgPool, auto_ack: bool, lease_token: Arc<str>) -> Self {
         Self {
             lock: LockTaskLayer::new(pool.clone()),
             ack: auto_ack

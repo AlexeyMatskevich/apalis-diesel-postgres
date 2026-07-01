@@ -371,7 +371,7 @@ fn build(pool: PgPool) {
     let _notify = PostgresStorage::<EmailJob>::new_with_notify(&pool, &config);
 
     // One listener shared across many queues, registered via apalis `MakeShared`.
-    let _shared: SharedPostgresStorage = SharedPostgresStorage::new(pool);
+    let _shared: SharedPostgresStorage = SharedPostgresStorage::new(&pool);
 }
 ```
 

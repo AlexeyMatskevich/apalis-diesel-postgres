@@ -171,7 +171,7 @@ async fn run_shared_delivery_and_duplicate() -> Result<Outcome<SharedDuplicateRu
 
     let config = notify_only_config(&queue);
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
-        SharedPostgresStorage::new(pool.clone());
+        SharedPostgresStorage::new(&pool);
     let mut storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
         &mut shared,
         config.clone(),
@@ -224,7 +224,7 @@ async fn run_shared_isolation() -> Result<Outcome<IsolationRun>, String> {
     let config = notify_only_config(&queue);
     let other_config = notify_only_config(&other_queue);
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
-        SharedPostgresStorage::new(pool.clone());
+        SharedPostgresStorage::new(&pool);
     let mut storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
         &mut shared,
         config,
@@ -309,7 +309,7 @@ async fn run_shared_malformed_payload_survival() -> Result<Outcome<MalformedPayl
 
     let config = notify_only_config(&queue);
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
-        SharedPostgresStorage::new(pool.clone());
+        SharedPostgresStorage::new(&pool);
     let mut storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
         &mut shared,
         config.clone(),
@@ -506,7 +506,7 @@ async fn run_listener_recycles_a_clean_connection() -> Result<Outcome<UnlistenRu
 
     let queue = format!("apalis-shared-unlisten-{}", Ulid::new());
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
-        SharedPostgresStorage::new(pool.clone());
+        SharedPostgresStorage::new(&pool);
     let storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
         &mut shared,
         notify_only_config(&queue),

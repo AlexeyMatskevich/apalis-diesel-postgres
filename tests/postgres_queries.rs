@@ -633,7 +633,7 @@ async fn run_ack_boundary_with_error(
         .build()
         .parts;
 
-    let mut ack = PgAck::new(pool.clone());
+    let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Err(std::io::Error::other(error_text).into());
     ack.ack(&result, &parts).await.map_err(|e| e.to_string())?;
 
@@ -774,7 +774,7 @@ async fn run_ack_stale() -> Result<Outcome<AckStaleRun>, String> {
         .build()
         .parts;
 
-    let mut ack = PgAck::new(pool.clone());
+    let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Ok("processed".to_owned());
     let ack_result = ack.ack(&result, &parts).await;
     let status = job_status(pool.clone(), id).await?;
@@ -2383,7 +2383,7 @@ async fn run_ack_on_pending_row() -> Result<Outcome<AckOnPendingRun>, String> {
         .build()
         .parts;
 
-    let mut ack = PgAck::new(pool.clone());
+    let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Ok("processed".to_owned());
     let ack_result = ack.ack(&result, &parts).await;
     let status = job_status(pool.clone(), id).await?;
@@ -2634,7 +2634,7 @@ async fn run_ack_on_terminal_row() -> Result<Outcome<AckOnTerminalRun>, String> 
         .build()
         .parts;
 
-    let mut ack = PgAck::new(pool.clone());
+    let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Ok("second-ack".to_owned());
     let ack_result = ack.ack(&result, &parts).await;
     let status = job_status(pool.clone(), id).await?;
