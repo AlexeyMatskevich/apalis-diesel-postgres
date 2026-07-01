@@ -8,6 +8,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Disable libpq GSSAPI encryption negotiation. Without this the krb5/GSS
+  # finalizers race on process teardown on the CI runners and corrupt the heap:
+  # test runs abort with `malloc(): unaligned tcache chunk detected` / SIGABRT
+  # *after* every test has passed, and the corruption can also surface as
+  # non-deterministic wrong query results mid-run. The tests never exercise
+  # GSSAPI, so disabling it is safe and removes the flake at the source.
+  PGGSSENCMODE: disable
 
 jobs:
   static:
