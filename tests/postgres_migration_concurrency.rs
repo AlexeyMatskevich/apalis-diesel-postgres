@@ -200,7 +200,131 @@ fn all_setups_succeed() -> impl Fn(&Result<Outcome, String>) -> AssertionResult 
     }
 }
 
+/// Run `setup()` once against a cold throwaway database and report how many
+/// advisory locks remain held afterwards. The migration lock is session-scoped
+/// and released inside `setup()`; were the release skipped it would linger on
+/// the pooled (still-open) connection. Querying from a *separate* maintenance
+/// session while the pool is alive detects such a leak. Returns `None` when the
+/// environment cannot provision a database.
+async fn run_setup_releases_lock() -> Result<Option<i64>, String> {
+    let Some(database_url) = support::database_url_or_skip()? else {
+        return Ok(None);
+    };
+
+    let db_name = format!(
+        "apalis_mig_release_{}",
+        Ulid::new().to_string().to_lowercase()
+    );
+    let provisioned = {
+        let create_url = database_url.clone();
+        let db_name = db_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let mut conn = maintenance_conn(&create_url)?;
+            if !can_create_database(&mut conn)? {
+                return Ok(false);
+            }
+            sql_query(format!("CREATE DATABASE \"{db_name}\""))
+                .execute(&mut conn)
+                .map_err(|error| error.to_string())?;
+            Ok(true)
+        })
+        .await
+        .map_err(|error| error.to_string())??
+    };
+    if !provisioned {
+        return Ok(None);
+    }
+
+    let temp_url = match with_database_name(&database_url, &db_name) {
+        Ok(url) => url,
+        Err(_) => {
+            drop_temp_db(&database_url, &db_name).await;
+            return Ok(None);
+        }
+    };
+
+    // Same `?dbname=` safety guard as `run_concurrent_setup`: refuse to proceed
+    // if `temp_url` resolves back to the main database.
+    let on_temp_db = {
+        let temp_url = temp_url.clone();
+        let expected = db_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let mut conn = maintenance_conn(&temp_url)?;
+            #[derive(diesel::QueryableByName)]
+            struct Db {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                db: String,
+            }
+            let actual = sql_query("SELECT current_database()::text AS db")
+                .load::<Db>(&mut conn)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .map(|row| row.db)
+                .ok_or_else(|| "current_database() returned no row".to_owned())?;
+            Ok(actual == expected)
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
+    if !on_temp_db {
+        drop_temp_db(&database_url, &db_name).await;
+        return Ok(None);
+    }
+
+    let count = async {
+        let pool = build_pool_with(&temp_url, |builder| builder.max_size(2).min_idle(Some(0)))
+            .map_err(|error| error.to_string())?;
+        setup(&pool).await.map_err(|error| error.to_string())?;
+        // Query from a separate session while the setup pool (and its now-idle
+        // connection) is still open, so a lock left on that connection shows up.
+        let advisory_url = temp_url.clone();
+        let held = tokio::task::spawn_blocking(move || -> Result<i64, String> {
+            #[derive(diesel::QueryableByName)]
+            struct Count {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                n: i64,
+            }
+            let mut conn = maintenance_conn(&advisory_url)?;
+            sql_query("SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype = 'advisory'")
+                .load::<Count>(&mut conn)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .next()
+                .map(|row| row.n)
+                .ok_or_else(|| "pg_locks count returned no row".to_owned())
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        drop(pool);
+        Ok::<i64, String>(held)
+    }
+    .await;
+
+    drop_temp_db(&database_url, &db_name).await;
+    count.map(Some)
+}
+
+fn setup_releases_the_advisory_lock() -> impl Fn(&Result<Option<i64>, String>) -> AssertionResult {
+    move |result| match result {
+        Err(error) => Err(AssertionError::new(vec![format!(
+            "setup-release scenario failed to run: {error}"
+        )])),
+        Ok(None) => Ok(()),
+        Ok(Some(0)) => Ok(()),
+        Ok(Some(held)) => Err(AssertionError::new(vec![format!(
+            "expected setup() to release its advisory lock, but {held} advisory lock(s) remain held"
+        )])),
+    }
+}
+
 lets_expect! { #tokio_test
+    expect(run_setup_releases_lock().await) {
+        when setup_completes_against_a_cold_database {
+            to leaves_no_advisory_lock_held { setup_releases_the_advisory_lock() }
+        }
+    }
+
     expect(run_concurrent_setup().await) {
         when many_replicas_call_setup_concurrently_against_a_cold_database {
             to applies_the_migrations_without_a_race { all_setups_succeed() }
