@@ -37,16 +37,21 @@ pub(crate) fn reenqueue_orphaned_blocking(
     sql_query(
         "UPDATE apalis.jobs
          SET status = CASE
-                 WHEN attempts + 1 >= max_attempts THEN 'Killed'
+                 WHEN attempts::bigint + 1 >= max_attempts THEN 'Killed'
                  ELSE 'Pending'
              END,
              done_at = CASE
-                 WHEN attempts + 1 >= max_attempts THEN now()
+                 WHEN attempts::bigint + 1 >= max_attempts THEN now()
                  ELSE NULL
              END,
              lock_by = NULL,
              lock_at = NULL,
-             attempts = LEAST(attempts + 1, max_attempts),
+             -- attempts::bigint promotes the arithmetic so a corrupt row
+             -- sitting at i32::MAX cannot overflow the + 1 (which PostgreSQL
+             -- rejects as an integer-out-of-range error); LEAST re-bounds the
+             -- result to max_attempts, so it fits the int column again. The
+             -- >= comparisons above are likewise promoted to avoid the overflow.
+             attempts = LEAST(attempts::bigint + 1, max_attempts),
              -- On terminal `Killed` transitions stamp the timeout marker
              -- unconditionally (no further ack can succeed because
              -- `ack_task` requires status='Running'). On `Pending`
@@ -57,7 +62,7 @@ pub(crate) fn reenqueue_orphaned_blocking(
              -- might have acked the task moments earlier and its outcome
              -- must remain visible.
              last_result = CASE
-                 WHEN attempts + 1 >= max_attempts
+                 WHEN attempts::bigint + 1 >= max_attempts
                      THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
                  WHEN last_result IS NULL
                      THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb

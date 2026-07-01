@@ -1117,10 +1117,10 @@ async fn fail_undecodable_sql(
         sql_query(
             "UPDATE apalis.jobs
              SET status = CASE
-                     WHEN attempts + 1 >= max_attempts THEN 'Killed'
+                     WHEN attempts::bigint + 1 >= max_attempts THEN 'Killed'
                      ELSE 'Failed'
                  END,
-                 attempts = LEAST(attempts + 1, max_attempts),
+                 attempts = LEAST(attempts::bigint + 1, max_attempts),
                  done_at = now(),
                  last_result = $3
              WHERE id = $1

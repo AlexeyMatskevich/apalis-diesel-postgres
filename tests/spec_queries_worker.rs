@@ -247,18 +247,18 @@ fn reenqueue_orphaned_sql_on(
     sql_query(
         "UPDATE apalis.jobs
              SET status = CASE
-                     WHEN attempts + 1 >= max_attempts THEN 'Killed'
+                     WHEN attempts::bigint + 1 >= max_attempts THEN 'Killed'
                      ELSE 'Pending'
                  END,
                  done_at = CASE
-                     WHEN attempts + 1 >= max_attempts THEN now()
+                     WHEN attempts::bigint + 1 >= max_attempts THEN now()
                      ELSE NULL
                  END,
                  lock_by = NULL,
                  lock_at = NULL,
-                 attempts = LEAST(attempts + 1, max_attempts),
+                 attempts = LEAST(attempts::bigint + 1, max_attempts),
                  last_result = CASE
-                     WHEN attempts + 1 >= max_attempts
+                     WHEN attempts::bigint + 1 >= max_attempts
                          THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
                      WHEN last_result IS NULL
                          THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
@@ -1121,6 +1121,87 @@ fn keep_alive_did_not_refresh() -> impl Fn(&Result<Outcome<KeepAliveRun>, String
 }
 
 // --------------------------------------------------------------------------
+// reenqueue_orphaned: an i32::MAX attempt count must not overflow
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct OverflowSweepRun {
+    swept_ok: bool,
+    error: Option<String>,
+    status: Option<String>,
+}
+
+async fn run_overflow_sweep() -> Result<Outcome<OverflowSweepRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-worker-overflow-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    let worker_id = format!("spec-overflow-worker-{queue}");
+    insert_worker_row(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        Some(format!("token-{}", Ulid::new())),
+        10,
+    )
+    .await?;
+
+    // Corrupt row: `attempts` already at i32::MAX. The sweep computes
+    // `attempts::bigint + 1`, which PostgreSQL rejects as "integer out of range"
+    // unless the arithmetic is promoted to bigint.
+    let id = insert_running_row(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        "Running",
+        i32::MAX,
+        i32::MAX,
+        None,
+    )
+    .await?;
+
+    let sweep = reenqueue_orphaned_sql(pool.clone(), 1, queue.clone()).await;
+    let status = if sweep.is_ok() {
+        Some(job_status_row(pool.clone(), id).await?.status)
+    } else {
+        None
+    };
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    Ok(Outcome::Completed(OverflowSweepRun {
+        swept_ok: sweep.is_ok(),
+        error: sweep.err(),
+        status,
+    }))
+}
+
+fn overflow_sweep_does_not_overflow()
+-> impl Fn(&Result<Outcome<OverflowSweepRun>, String>) -> AssertionResult {
+    observe::<OverflowSweepRun, _>("overflow sweep", |run| {
+        if run.swept_ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the sweep to survive an i32::MAX attempt count, got error: {}",
+                run.error.as_deref().unwrap_or("<none>")
+            ))
+        }
+    })
+}
+
+fn overflow_sweep_kills_the_row()
+-> impl Fn(&Result<Outcome<OverflowSweepRun>, String>) -> AssertionResult {
+    observe::<OverflowSweepRun, _>("overflow sweep status", |run| match run.status.as_deref() {
+        Some("Killed") => Ok(()),
+        other => Err(format!(
+            "expected the exhausted row to be Killed, got {other:?}"
+        )),
+    })
+}
+
+// --------------------------------------------------------------------------
 // expectations
 // --------------------------------------------------------------------------
 
@@ -1229,6 +1310,14 @@ fn bounded_second_sweep_drains_the_remainder()
 }
 
 lets_expect! { #tokio_test
+    // ----- reenqueue_orphaned: i32::MAX attempts do not overflow -----------
+    expect(run_overflow_sweep().await) {
+        when a_corrupt_row_sits_at_the_i32_max_attempt_count {
+            to sweeps_without_an_integer_overflow { overflow_sweep_does_not_overflow() }
+            to marks_the_exhausted_row_killed { overflow_sweep_kills_the_row() }
+        }
+    }
+
     // ----- reenqueue_orphaned matrix --------------------------------------
     expect(run_reenqueue(setup).await) {
         let setup = REENQUEUE_DEFAULT;
