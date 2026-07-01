@@ -229,6 +229,9 @@ async fn run_batch_commit_scenario() -> Result<Outcome<BatchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
+    // `cleanup` deletes from the business-marker table too, so ensure it exists
+    // on a cold database (this scenario runs before any commit/rollback one).
+    ensure_business_table(pool.clone()).await?;
     let queue = format!("apalis-outbox-batch-{}", Ulid::new());
     cleanup(pool.clone(), queue.clone()).await?;
 
