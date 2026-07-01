@@ -875,7 +875,7 @@ async fn run_registration_gate_blocks_fetcher() -> Result<Outcome<RegistrationGa
             Ok(Some(item)) => {
                 items_seen += 1;
                 if let Err(err) = item
-                    && matches!(err, PgError::AlreadyRegistered(_))
+                    && matches!(err, PgError::AlreadyRegistered { .. })
                 {
                     saw_already_registered_error = true;
                 }

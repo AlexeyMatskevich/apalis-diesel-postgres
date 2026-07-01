@@ -146,7 +146,7 @@ pub(crate) fn register_worker_blocking(
     .execute(conn)
     .map_err(Error::database("registering worker"))?;
     if count == 0 {
-        Err(Error::AlreadyRegistered(worker.name().to_owned()))
+        Err(Error::already_registered(worker.name(), worker_type))
     } else {
         Ok(())
     }
