@@ -21,6 +21,15 @@ pub(crate) fn mint_lease_token() -> String {
     Ulid::new().to_string()
 }
 
+/// Per-statement cap on the orphan-recovery sweep. Without a bound, a mass
+/// worker death could leave every in-flight row eligible at once and turn the
+/// sweep into a single unbounded UPDATE that locks and rewrites the entire
+/// backlog in one statement. Capping the subselect keeps each sweep's lock
+/// footprint and statement duration bounded; a backlog larger than one batch
+/// drains across subsequent `keep_alive`-interval sweeps (and is further
+/// parallelised across a queue's workers by `FOR UPDATE ... SKIP LOCKED`).
+pub(crate) const REENQUEUE_ORPHANED_BATCH_LIMIT: i32 = 1000;
+
 pub(crate) fn reenqueue_orphaned_blocking(
     conn: &mut PgConnection,
     config: &Config,
@@ -73,11 +82,16 @@ pub(crate) fn reenqueue_orphaned_blocking(
              WHERE (status = 'Running' OR status = 'Queued')
                  AND now() - apalis.workers.last_seen >= ($1 * INTERVAL '1 second')
                  AND jobs.job_type = $2
+             -- Bound the sweep so a mass worker death cannot turn this into one
+             -- unbounded UPDATE over the whole backlog; the remainder drains on
+             -- the next keep_alive-interval sweep.
+             LIMIT $3
              FOR UPDATE OF jobs SKIP LOCKED
          )",
     )
     .bind::<Integer, _>(clamp_i32(config.reenqueue_orphaned_after().as_secs()))
     .bind::<Text, _>(config.queue().to_string())
+    .bind::<Integer, _>(REENQUEUE_ORPHANED_BATCH_LIMIT)
     .execute(conn)
     .map_err(Error::database("re-enqueueing orphaned jobs"))
 }

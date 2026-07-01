@@ -274,11 +274,13 @@ fn reenqueue_orphaned_sql_on(
                  WHERE (status = 'Running' OR status = 'Queued')
                      AND now() - apalis.workers.last_seen >= ($1 * INTERVAL '1 second')
                      AND jobs.job_type = $2
+                 LIMIT $3
                  FOR UPDATE OF jobs SKIP LOCKED
              )",
     )
     .bind::<Integer, _>(threshold_secs)
     .bind::<Text, _>(queue.to_owned())
+    .bind::<Integer, _>(SWEEP_LIMIT)
     .execute(conn)
 }
 
@@ -1122,6 +1124,110 @@ fn keep_alive_did_not_refresh() -> impl Fn(&Result<Outcome<KeepAliveRun>, String
 // expectations
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// reenqueue_orphaned: the sweep is bounded per statement
+// --------------------------------------------------------------------------
+
+/// Per-sweep row cap. MUST match `REENQUEUE_ORPHANED_BATCH_LIMIT` in
+/// `src/queries/worker.rs`: the mirror binds it as the subselect `LIMIT`, just
+/// like the production statement.
+const SWEEP_LIMIT: i32 = 1000;
+
+/// Bulk-insert `count` orphaned `Running` rows locked by `worker_id` in one
+/// statement, so a single sweep faces more eligible rows than one batch.
+async fn bulk_insert_orphans(
+    pool: PgPool,
+    queue: String,
+    worker_id: String,
+    count: i32,
+) -> Result<(), String> {
+    with_conn(pool, move |conn| {
+        sql_query(
+            "INSERT INTO apalis.jobs (id, job_type, job, status, attempts, max_attempts, run_at, lock_by, lock_at)
+             SELECT $1 || '-orphan-' || g::text, $1, ''::bytea, 'Running', 0, 25,
+                    now() - INTERVAL '1 second', $2, now() - INTERVAL '1 second'
+             FROM generate_series(1, $3) AS g",
+        )
+        .bind::<Text, _>(&queue)
+        .bind::<Text, _>(&worker_id)
+        .bind::<Integer, _>(count)
+        .execute(conn)
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+}
+
+#[derive(Debug)]
+struct BoundedSweepRun {
+    total_orphans: i32,
+    first_sweep: usize,
+    second_sweep: usize,
+}
+
+async fn run_bounded_sweep() -> Result<Outcome<BoundedSweepRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-worker-bounded-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+
+    let worker_id = format!("spec-bounded-worker-{queue}");
+    // Stale worker (last_seen 10s ago; sweep threshold is 1s below).
+    insert_worker_row(
+        pool.clone(),
+        queue.clone(),
+        worker_id.clone(),
+        Some(format!("token-{}", Ulid::new())),
+        10,
+    )
+    .await?;
+
+    // One full batch plus a few, so the first (bounded) sweep cannot clear them
+    // all and a second sweep must finish draining the backlog.
+    let total = SWEEP_LIMIT + 5;
+    bulk_insert_orphans(pool.clone(), queue.clone(), worker_id.clone(), total).await?;
+
+    let first_sweep = reenqueue_orphaned_sql(pool.clone(), 1, queue.clone()).await?;
+    let second_sweep = reenqueue_orphaned_sql(pool.clone(), 1, queue.clone()).await?;
+
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    Ok(Outcome::Completed(BoundedSweepRun {
+        total_orphans: total,
+        first_sweep,
+        second_sweep,
+    }))
+}
+
+fn bounded_first_sweep_hits_the_cap()
+-> impl Fn(&Result<Outcome<BoundedSweepRun>, String>) -> AssertionResult {
+    observe::<BoundedSweepRun, _>("bounded first sweep", |run| {
+        if run.first_sweep == SWEEP_LIMIT as usize {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the first sweep to reclaim exactly the {SWEEP_LIMIT}-row cap, got {} (of {} orphans)",
+                run.first_sweep, run.total_orphans
+            ))
+        }
+    })
+}
+
+fn bounded_second_sweep_drains_the_remainder()
+-> impl Fn(&Result<Outcome<BoundedSweepRun>, String>) -> AssertionResult {
+    observe::<BoundedSweepRun, _>("bounded second sweep", |run| {
+        let remainder = run.total_orphans as usize - SWEEP_LIMIT as usize;
+        if run.second_sweep == remainder {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the second sweep to drain the remaining {remainder} orphans, got {}",
+                run.second_sweep
+            ))
+        }
+    })
+}
+
 lets_expect! { #tokio_test
     // ----- reenqueue_orphaned matrix --------------------------------------
     expect(run_reenqueue(setup).await) {
@@ -1207,6 +1313,16 @@ lets_expect! { #tokio_test
                 ..REENQUEUE_DEFAULT
             };
             to leaves_the_terminal_row_alone { reenqueue_left_row_untouched() }
+        }
+    }
+
+    // ----- reenqueue_orphaned: bounded per-statement sweep ----------------
+    expect(run_bounded_sweep().await) {
+        when more_orphans_exist_than_a_single_sweep_may_reclaim {
+            to caps_the_first_sweep_at_the_batch_limit { bounded_first_sweep_hits_the_cap() }
+            to drains_the_remainder_on_the_next_sweep {
+                bounded_second_sweep_drains_the_remainder()
+            }
         }
     }
 
