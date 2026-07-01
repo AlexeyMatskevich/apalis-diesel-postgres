@@ -87,9 +87,7 @@ impl<Codec> SharedPostgresStorage<Codec> {
                         exit_listener(
                             &registry,
                             &listener_alive,
-                            Some(format!(
-                                "failed to get pooled connection for shared LISTEN: {error}"
-                            )),
+                            format!("failed to get pooled connection for shared LISTEN: {error}"),
                         );
                         return;
                     }
@@ -100,7 +98,7 @@ impl<Codec> SharedPostgresStorage<Codec> {
                     exit_listener(
                         &registry,
                         &listener_alive,
-                        Some(format!("failed to start shared LISTEN listener: {error}")),
+                        format!("failed to start shared LISTEN listener: {error}"),
                     );
                     return;
                 }
@@ -118,7 +116,7 @@ impl<Codec> SharedPostgresStorage<Codec> {
             exit_listener(
                 &self.registry,
                 &self.listener_alive,
-                Some(format!("failed to spawn listener: {error}")),
+                format!("failed to spawn listener: {error}"),
             );
         }
     }
@@ -144,7 +142,7 @@ fn run_listener_loop(
                     exit_listener(
                         registry,
                         listener_alive,
-                        Some(format!("failed to receive shared notification: {error}")),
+                        format!("failed to receive shared notification: {error}"),
                     );
                     return;
                 }
@@ -200,12 +198,10 @@ fn run_listener_loop(
 /// spawning a fresh listener; (b) listener runs first, sees an empty registry,
 /// stores `false`, and a subsequent registrant spawns. Without this serialization
 /// a registrant could observe stale `true` and skip spawn.
-fn exit_listener(registry: &SharedRegistry, listener_alive: &AtomicBool, error: Option<String>) {
+fn exit_listener(registry: &SharedRegistry, listener_alive: &AtomicBool, error: String) {
     match registry.lock() {
         Ok(mut guard) => {
-            if let Some(message) = error {
-                broadcast_notify_error_locked(&mut guard, message);
-            }
+            broadcast_notify_error_locked(&mut guard, error);
             listener_alive.store(false, Ordering::Release);
             drop(guard);
         }
@@ -234,9 +230,14 @@ fn deliver_to_queue(registry: &mut RegistryMap, queue: &str, ids: &[PgTaskId]) {
             senders.retain_mut(|(_, sender)| match sender.try_send(Ok(id)) {
                 Ok(()) => true,
                 Err(error) if error.is_disconnected() => false,
-                // Channel full: keep the sender (the job is durable, the poll
-                // fetcher will pick it up) but stop pushing this event into a
-                // saturated channel.
+                // Channel full: drop this wakeup but keep the sender registered
+                // (the job is durable, the poll fetcher will pick it up). Unlike
+                // the single-queue listener in `queries/notify.rs`, which
+                // `break`s out of the id loop on the first full channel, this
+                // broadcast path has no early exit — the outer `for &id in ids`
+                // loop still attempts every remaining id against this saturated
+                // channel, because a broadcast serves multiple consumers and one
+                // full sender must not short-circuit delivery to the others.
                 Err(_) => true,
             });
         }
@@ -899,11 +900,49 @@ mod tests {
         exit_listener(
             &registry,
             &listener_alive,
-            Some("synthetic listener spawn failure".to_owned()),
+            "synthetic listener spawn failure".to_owned(),
         );
         let alive_after = listener_alive.load(Ordering::Acquire);
         let error_delivered = matches!(receiver.try_recv(), Ok(Err(_)));
         (alive_after, error_delivered)
+    }
+
+    /// Poison the registry mutex (panic while holding the lock, like
+    /// `make_shared_with_poisoned_registry`) with `listener_alive` still `true`,
+    /// then call `exit_listener`. The `Err(_)` arm must run: it cannot acquire
+    /// the lock to broadcast, but it must still best-effort flip `listener_alive`
+    /// to false so a later registrant observes a dead listener and spawns a
+    /// replacement. If this arm forgot the store, the flag would stay `true`
+    /// forever and no replacement listener would ever be spawned. Returns
+    /// `alive_after` — `false` proves the flag was cleared; the helper returning
+    /// at all proves `exit_listener` did not panic on the poison.
+    fn exit_listener_with_poisoned_registry() -> bool {
+        let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, _receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        registry
+            .lock()
+            .expect("fresh registry is not poisoned")
+            .insert(
+                "shared-exit-poisoned".to_owned(),
+                vec![(Ulid::new(), sender)],
+            );
+
+        let poison_target = registry.clone();
+        let join = std::thread::spawn(move || {
+            let _guard = poison_target
+                .lock()
+                .expect("fresh registry lock is not poisoned");
+            panic!("synthetic poisoning panic");
+        });
+        let _ = join.join();
+
+        let listener_alive = AtomicBool::new(true);
+        exit_listener(
+            &registry,
+            &listener_alive,
+            "synthetic listener failure on poisoned registry".to_owned(),
+        );
+        listener_alive.load(Ordering::Acquire)
     }
 
     /// First claim on a fresh flag must spawn (false→true edge), the second must
@@ -1137,6 +1176,12 @@ mod tests {
         expect(exit_listener_observation()) {
             when the_listener_exits_after_a_spawn_or_connection_failure {
                 to clears_the_alive_flag_and_broadcasts_the_error { equal((false, true)) }
+            }
+        }
+
+        expect(exit_listener_with_poisoned_registry()) {
+            when the_listener_exits_while_the_registry_mutex_is_poisoned {
+                to still_clears_the_alive_flag_so_a_replacement_can_spawn { be_false }
             }
         }
 

@@ -97,6 +97,97 @@ mod tests {
         }
     }
 
+    /// A `Service` that records whether a given instance was made ready by
+    /// `poll_ready` before `call` was invoked on it. `Clone` deliberately
+    /// resets the flag, so a fresh clone starts *unreserved*. This lets a spec
+    /// assert the Tower reservation contract in `LockTaskService::call`: the
+    /// instance handed to `call` must be the exact one `poll_ready` reserved,
+    /// not the clone left behind by `std::mem::replace`.
+    ///
+    /// The `Clone` impl is hand-written on purpose: a `#[derive(Clone)]` would
+    /// copy `reserved` verbatim, so a clone of an already-reserved instance
+    /// would *also* report `reserved = true`. That would make the spec
+    /// tautological — a regression that ran `call` on the leftover clone (e.g.
+    /// `self.inner.clone().call(req)`, or a swapped `std::mem::replace`) would
+    /// still see `reserved = true` and pass. Resetting to `false` here is what
+    /// makes "only the poll_ready-reserved instance succeeds" an observable,
+    /// falsifiable property.
+    #[derive(Debug, Default)]
+    struct ReservationService {
+        reserved: bool,
+    }
+
+    impl Clone for ReservationService {
+        fn clone(&self) -> Self {
+            // A fresh clone is a not-yet-ready instance: the reservation made
+            // by `poll_ready` on the source does NOT carry over. This mirrors
+            // the Tower contract that each instance must be `poll_ready`-ed
+            // before it may be `call`-ed.
+            Self { reserved: false }
+        }
+    }
+
+    impl Service<PgTask<()>> for ReservationService {
+        type Response = ();
+        type Error = std::io::Error;
+        type Future = Ready<Result<(), Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.reserved = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: PgTask<()>) -> Self::Future {
+            if self.reserved {
+                ready(Ok(()))
+            } else {
+                ready(Err(std::io::Error::other(
+                    "call reached an instance that was never reserved by poll_ready",
+                )))
+            }
+        }
+    }
+
+    /// Drive `LockTaskService`'s Tower cycle: `poll_ready` (which reserves
+    /// `self.inner`), then `call`. The task is pre-claimed so the SQL
+    /// `lock_task` round-trip is skipped and `call` reaches the inner service
+    /// with the unchecked pool. Returns the result of the inner service, which
+    /// is `Ok` only if `call` consumed the reserved instance (the one
+    /// `poll_ready` marked) rather than the fresh clone left behind.
+    fn lock_service_consumes_reserved_inner() -> Result<(), BoxDynError> {
+        let mut task = TaskBuilder::new(())
+            .with_task_id(task_id())
+            .with_ctx(
+                PgContext::new()
+                    .with_queue("reservation-unit".to_owned())
+                    .with_lock_by(Some("reservation-worker".to_owned()))
+                    .with_lock_at(Some(1_700_000_000)),
+            )
+            .build();
+        task.parts
+            .data
+            .insert(WorkerContext::new::<()>("reservation-worker"));
+
+        let mut service = LockTaskService {
+            inner: ReservationService::default(),
+            pool: unchecked_pool(),
+        };
+        let mut cx = Context::from_waker(noop_waker_ref());
+        // Reserve the inner instance, exactly as the Tower runtime would.
+        assert!(matches!(service.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+        block_on(service.call(task))
+    }
+
+    fn call_consumed_the_reserved_instance(result: &Result<(), BoxDynError>) -> AssertionResult {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(AssertionError::new(vec![format!(
+                "expected call to consume the poll_ready-reserved inner instance, but it ran on \
+                 an unreserved clone: {error}"
+            )])),
+        }
+    }
+
     fn unchecked_pool() -> PgPool {
         let manager = ConnectionManager::<PgConnection>::new("postgres://127.0.0.1:1/not-used");
         Pool::builder()
@@ -314,6 +405,37 @@ mod tests {
         }
     }
 
+    /// Serialize a successful `Ok(())` job through the exact path `PgAck::ack`
+    /// uses to build the persisted `last_result`. `()` renders as JSON `null`,
+    /// so the externally-tagged result is `{"Ok": null}` — the case the
+    /// `build_ack_response` doc-comment warns must never collapse to SQL NULL.
+    fn unit_ok_ack_response() -> Result<Option<serde_json::Value>, serde_json::Error> {
+        let result: Result<(), BoxDynError> = Ok(());
+        build_ack_response(&result)
+    }
+
+    /// The persisted value for `Ok(())` must be `Some({"Ok": null})`. A
+    /// regression collapsing the trivial-Ok case to `None` (SQL NULL) would
+    /// make the completed job look unread to `WaitForCompletion`; a regression
+    /// dropping the `{"Ok": ...}` wrapper would break `from_value` round-trips.
+    fn is_persisted_ok_null(
+        result: &Result<Option<serde_json::Value>, serde_json::Error>,
+    ) -> AssertionResult {
+        match result {
+            Ok(Some(value)) if *value == serde_json::json!({ "Ok": null }) => Ok(()),
+            Ok(Some(value)) => Err(AssertionError::new(vec![format!(
+                "expected Some({{\"Ok\": null}}), got Some({value})"
+            )])),
+            Ok(None) => Err(AssertionError::new(vec![
+                "expected Some({\"Ok\": null}) but response collapsed to None (SQL NULL)"
+                    .to_owned(),
+            ])),
+            Err(error) => Err(AssertionError::new(vec![format!(
+                "expected Some({{\"Ok\": null}}), got serialization error {error}"
+            )])),
+        }
+    }
+
     fn abort_contains(expected: &'static str) -> impl Fn(&BoxDynError) -> AssertionResult {
         move |error| {
             let message = error.to_string();
@@ -452,6 +574,14 @@ mod tests {
             to wraps_the_inner_service_with_the_pool { debug_mentions_lock_service }
         }
 
+        expect(lock_service_consumes_reserved_inner()) {
+            when poll_ready_has_reserved_the_inner_service_before_call {
+                to calls_the_reserved_instance_not_the_clone_left_behind {
+                    call_consumed_the_reserved_instance
+                }
+            }
+        }
+
         expect(middleware_auto_ack_enabled(auto_ack)) {
             let auto_ack = true;
 
@@ -546,6 +676,12 @@ mod tests {
             when payload_overflows_the_budget {
                 let input_len = 8 * 1024 + 1;
                 to appends_the_truncation_marker { equal(true) }
+            }
+        }
+
+        expect(unit_ok_ack_response()) {
+            when the_job_returns_a_trivial_unit_ok {
+                to persists_the_ok_null_object_rather_than_sql_null { is_persisted_ok_null }
             }
         }
 
@@ -766,6 +902,30 @@ pub(crate) fn truncate_error_payload(mut text: String) -> String {
     text
 }
 
+/// Serialize a job result into the value persisted in `apalis.jobs.last_result`.
+///
+/// The value is always the externally-tagged `Result<O, String>` JSON
+/// (`{"Ok": ...}` or `{"Err": "..."}`), with the error `Display` capped by
+/// [`truncate_error_payload`], and is always wrapped in `Some(...)`.
+///
+/// `WaitForCompletion::wait_for` reads `last_result` back with
+/// `serde_json::from_value` and the spec (`queries/mod.rs
+/// tests::last_result_is_missing`) requires a SQL NULL to surface as
+/// `MissingField("last_result")`. A trivial `Ok(())` job serializes to the JSON
+/// object `{"Ok": null}` (serde renders `()` as JSON `null`); wrapping in
+/// `Some(...)` — rather than collapsing that inner `null` to a SQL NULL — keeps
+/// a completed `Ok(())` job visible as read to consumers of `WaitForCompletion`
+/// instead of looking unacknowledged.
+pub(crate) fn build_ack_response<Res: Serialize>(
+    res: &Result<Res, BoxDynError>,
+) -> Result<Option<serde_json::Value>, serde_json::Error> {
+    serde_json::to_value(
+        res.as_ref()
+            .map_err(|error| truncate_error_payload(error.to_string())),
+    )
+    .map(Some)
+}
+
 impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
     type Error = Error;
     type Future = BoxFuture<'static, Result<(), Self::Error>>;
@@ -779,20 +939,8 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         let worker_id = parts.ctx.lock_by().clone();
         let queue = parts.ctx.queue().clone();
         let lock_at = *parts.ctx.lock_at();
-        let response = serde_json::to_value(
-            res.as_ref()
-                .map_err(|error| truncate_error_payload(error.to_string())),
-        );
+        let response = build_ack_response(res);
         let status = calculate_status(parts, res);
-        // `last_result` is always persisted as the externally-tagged
-        // `Result<O, String>` JSON (`{"Ok": ...}` or `{"Err": "..."}`).
-        // `WaitForCompletion::wait_for` reads it back with `serde_json::from_value`
-        // and the spec (queries/mod.rs tests::last_result_is_missing) requires
-        // a SQL NULL to surface as `MissingField("last_result")`. So we wrap
-        // every serialized value in `Some(...)` rather than collapsing the
-        // trivial-Ok case to SQL NULL, which would make completed Ok(()) jobs
-        // appear unread to consumers of `WaitForCompletion`.
-        let response = response.map(Some);
         // Silent saturation would corrupt the ack's lock-check predicate:
         // `ack_task` matches on `attempts = $started_attempts`, so a capped
         // value would silently mismatch the stored row and the ack would be
