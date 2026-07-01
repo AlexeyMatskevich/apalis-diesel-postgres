@@ -5,9 +5,7 @@ use diesel::PgConnection;
 use lets_expect::{AssertionError, AssertionResult};
 
 pub fn database_url_or_skip() -> Result<Option<String>, String> {
-    let database_url = std::env::var("DATABASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let database_url = std::env::var("DATABASE_URL").ok().and_then(normalize_url);
 
     if database_url.is_none() && require_database() {
         Err(
@@ -19,10 +17,35 @@ pub fn database_url_or_skip() -> Result<Option<String>, String> {
     }
 }
 
+/// Normalize a raw `DATABASE_URL` value: trim surrounding whitespace and treat a
+/// value that is empty after trimming as unset (`None`). The trimmed form is what
+/// gets returned so surrounding whitespace never reaches `build_pool_with` /
+/// `ConnectionManager::new` (libpq does not strip whitespace around the whole URI).
+fn normalize_url(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 fn require_database() -> bool {
+    std::env::var("APALIS_DIESEL_POSTGRES_REQUIRE_DATABASE")
+        .as_deref()
+        .map(is_truthy_flag)
+        .unwrap_or(false)
+}
+
+/// Whether an environment-flag value means "enabled". Trims surrounding
+/// whitespace and matches case-insensitively so common truthy spellings
+/// (`True`, `Yes`, `On`, `y`, `enabled`, ...) all count — the point of the
+/// require-database gate is to turn a silent skip into a hard error, so it must
+/// not silently degrade on an unexpected-but-obviously-truthy spelling.
+fn is_truthy_flag(value: &str) -> bool {
     matches!(
-        std::env::var("APALIS_DIESEL_POSTGRES_REQUIRE_DATABASE").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on" | "enabled"
     )
 }
 
@@ -118,4 +141,74 @@ where
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// These cover the two pure helpers behind the env-driven gate without touching
+// process env, so they are safe to run in parallel with the DB-gated specs.
+// `mod support` is included by several integration binaries, so these run in each
+// one; that is redundant but harmless.
+
+#[test]
+fn is_truthy_flag_accepts_the_canonical_enabled_spellings() {
+    for value in ["1", "true", "yes", "y", "on", "enabled"] {
+        assert!(
+            is_truthy_flag(value),
+            "{value:?} should enable the require-database gate"
+        );
+    }
+}
+
+#[test]
+fn is_truthy_flag_accepts_mixed_case_and_surrounding_whitespace() {
+    // The regression this guards: a boolean YAML value rendered as `True`, or a
+    // hand-exported `Yes`/`On`/`  true  `, must not silently degrade the gate.
+    for value in [
+        "True", "TRUE", "Yes", "On", "Y", "Enabled", "  true  ", "\tyes\n",
+    ] {
+        assert!(
+            is_truthy_flag(value),
+            "{value:?} should enable the require-database gate"
+        );
+    }
+}
+
+#[test]
+fn is_truthy_flag_rejects_falsy_and_unrelated_values() {
+    for value in [
+        "", "0", "false", "no", "off", "disabled", "  ", "truthy", "onward",
+    ] {
+        assert!(
+            !is_truthy_flag(value),
+            "{value:?} must not enable the require-database gate"
+        );
+    }
+}
+
+#[test]
+fn normalize_url_strips_surrounding_whitespace_from_a_real_url() {
+    // Whitespace around the whole URI must be trimmed before it reaches
+    // `ConnectionManager::new`, since libpq does not strip it itself.
+    assert_eq!(
+        normalize_url(" postgres://user@host/db ".to_owned()),
+        Some("postgres://user@host/db".to_owned())
+    );
+    assert_eq!(
+        normalize_url("\tpostgres://user@host/db\n".to_owned()),
+        Some("postgres://user@host/db".to_owned())
+    );
+}
+
+#[test]
+fn normalize_url_treats_whitespace_only_and_empty_values_as_unset() {
+    assert_eq!(normalize_url(String::new()), None);
+    assert_eq!(normalize_url("   ".to_owned()), None);
+    assert_eq!(normalize_url("\t\n".to_owned()), None);
+}
+
+#[test]
+fn normalize_url_leaves_a_clean_url_untouched() {
+    assert_eq!(
+        normalize_url("postgres://user@host/db".to_owned()),
+        Some("postgres://user@host/db".to_owned())
+    );
 }
