@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While
 the crate is pre-1.0, a minor version bump may carry breaking changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `database_hint`'s structured foreign-key match required both
+  `constraint_name` and `table_name == Some("jobs")` to fire; some drivers
+  report the constraint but leave `table_name` unset, so the "register the
+  worker for this queue before locking or acknowledging jobs" hint silently
+  fell through to the locale-dependent message match (and could be lost
+  entirely on non-English PostgreSQL servers). `constraint_name` alone is
+  already specific to this schema's `jobs.lock_by` FK, so the structured match
+  now fires whenever the constraint name matches and `table_name` is either
+  absent or `"jobs"`; only a `table_name` naming some other table rules it
+  out.
+
 ## [0.4.1]
 
 ### Fixed
@@ -175,6 +190,7 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 See the git history for changes before this changelog was introduced.
 
+[Unreleased]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.1...HEAD
 [0.4.1]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.2.0...v0.3.0
