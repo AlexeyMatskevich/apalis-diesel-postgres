@@ -62,9 +62,12 @@ pub type CompactType = Vec<u8>;
 pub(crate) const STORAGE_NAME: &str = "PostgresStorage";
 
 /// Returns the crate name.
+///
+/// Sourced from `CARGO_PKG_NAME` so it cannot drift from `Cargo.toml` if the
+/// crate is ever renamed.
 #[must_use]
 pub const fn crate_name() -> &'static str {
-    "apalis-diesel-postgres"
+    env!("CARGO_PKG_NAME")
 }
 
 // apalis `WorkerBuilder::build()` requires the backend to be `Send + Sync`.
