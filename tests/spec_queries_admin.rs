@@ -785,14 +785,46 @@ async fn run_list_all_offset_slice() -> Result<Outcome<ListAllOffsetRun>, String
     let queue = format!("apalis-spec-admin-all-offset-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    // Three Done rows completed at ~now (done_at offsets 2s/1s/0s in the past).
-    // Newest done_at = smallest offset. These are the newest Done rows in the
-    // table, so global ORDER BY done_at DESC lists them at positions 0/1/2.
-    // run_at is crossed against done_at so a regression to the secondary run_at
-    // key alone would reorder them and fail the assertions below.
-    let oldest = insert_job(pool.clone(), queue.clone(), "Done", 10, Some(2), 1, 3).await?;
-    let middle = insert_job(pool.clone(), queue.clone(), "Done", 20, Some(1), 1, 3).await?;
-    let newest = insert_job(pool.clone(), queue.clone(), "Done", 30, Some(0), 1, 3).await?;
+    // Three Done rows with done_at ~10 years in the future (offsets are
+    // negative, and insert_job computes `now() - offset`), so they sort ahead
+    // of every real-world Done row in this shared table regardless of what
+    // other tests (or concurrent runs) have left behind — `list_all_tasks` is
+    // deliberately global (no queue filter), so a mere unique queue name does
+    // not isolate this listing the way it does for queue-scoped specs.
+    // Newest done_at = smallest offset. run_at is crossed against done_at so a
+    // regression to the secondary run_at key alone would reorder them and
+    // fail the assertions below.
+    const FAR_FUTURE_SECS: i64 = 315_360_000; // ~10 years
+    let oldest = insert_job(
+        pool.clone(),
+        queue.clone(),
+        "Done",
+        10,
+        Some(2 - FAR_FUTURE_SECS),
+        1,
+        3,
+    )
+    .await?;
+    let middle = insert_job(
+        pool.clone(),
+        queue.clone(),
+        "Done",
+        20,
+        Some(1 - FAR_FUTURE_SECS),
+        1,
+        3,
+    )
+    .await?;
+    let newest = insert_job(
+        pool.clone(),
+        queue.clone(),
+        "Done",
+        30,
+        Some(-FAR_FUTURE_SECS),
+        1,
+        3,
+    )
+    .await?;
 
     let config = Config::new(&queue);
     let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
