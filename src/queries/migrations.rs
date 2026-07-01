@@ -1,5 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use apalis_core::error::BoxDynError;
 use diesel::{PgConnection, QueryableByName, RunQueryDsl, sql_query};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
@@ -108,6 +109,34 @@ fn release_migration_lock(conn: &mut PgConnection) -> Result<(), Error> {
     Ok(())
 }
 
+/// Run `migrate` under [`catch_unwind`], draining the migration advisory lock
+/// on every path — success, a returned `Err`, or a panic — before propagating
+/// the outcome. A panic resumes only *after* the lock is released, so r2d2
+/// never returns a connection to the pool with a leaked session lock; a
+/// returned `Err` is reported as [`Error::Migration`] once the lock is
+/// confirmed drained.
+///
+/// Extracted out of [`setup`] (rather than inlined there) so this exact
+/// panic-safety sequence can be driven directly in tests with a synthetic
+/// panicking `migrate`, since the real migration runner
+/// (`diesel_migrations::MigrationHarness`) never panics on its own — see the
+/// `tests` module below.
+fn run_migration_with_panic_safe_release(
+    conn: &mut PgConnection,
+    migrate: impl FnOnce(&mut PgConnection) -> Result<(), BoxDynError>,
+) -> Result<(), Error> {
+    let migrated = catch_unwind(AssertUnwindSafe(|| migrate(conn)));
+    let released = release_migration_lock(conn);
+    match migrated {
+        Err(panic) => std::panic::resume_unwind(panic),
+        // A migration failure is the more useful error to surface; the lock
+        // was still drained above.
+        Ok(Err(error)) => Err(Error::Migration(error)),
+        // On a clean run, surface any failure to drain or verify the lock.
+        Ok(Ok(())) => released,
+    }
+}
+
 pub(crate) async fn setup(pool: PgPool) -> Result<(), Error> {
     with_conn(pool, |conn| {
         // Serialize concurrent `setup()` — e.g. several application replicas
@@ -126,18 +155,9 @@ pub(crate) async fn setup(pool: PgPool) -> Result<(), Error> {
         // re-enter it (higher lock count) without ever blocking — silently
         // defeating the serialization. `release_migration_lock` drains every
         // hold and verifies none remain.
-        let migrated = catch_unwind(AssertUnwindSafe(|| {
+        run_migration_with_panic_safe_release(conn, |conn| {
             conn.run_pending_migrations(MIGRATIONS).map(|_| ())
-        }));
-        let released = release_migration_lock(conn);
-        match migrated {
-            Err(panic) => std::panic::resume_unwind(panic),
-            // A migration failure is the more useful error to surface; the lock
-            // was still drained above.
-            Ok(Err(error)) => Err(Error::Migration(error)),
-            // On a clean run, surface any failure to drain or verify the lock.
-            Ok(Ok(())) => released,
-        }
+        })
     })
     .await
 }
@@ -163,4 +183,81 @@ pub(crate) async fn verify_schema(pool: PgPool) -> Result<(), Error> {
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    fn database_url_or_skip() -> Option<String> {
+        std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    fn test_pool(url: &str) -> PgPool {
+        crate::build_pool(url).expect("build a pool for the migrations white-box test")
+    }
+
+    /// `setup()`'s panic-safety contract, exercised directly against the real
+    /// `run_migration_with_panic_safe_release` (not a mirrored copy): a panic
+    /// inside `migrate` must still drain the advisory lock before resuming the
+    /// unwind. The real migration runner never panics on its own, so a
+    /// synthetic panicking closure stands in for it here — everything else
+    /// (the lock, the drain, the resume) is the genuine production path.
+    #[test]
+    fn panic_inside_migrate_still_drains_the_lock_before_resuming() {
+        let Some(url) = database_url_or_skip() else {
+            return;
+        };
+        let pool = test_pool(&url);
+        let mut conn = pool.get().expect("check out a pooled connection");
+        sql_query(ACQUIRE_MIGRATION_LOCK)
+            .execute(&mut *conn)
+            .expect("acquire the migration advisory lock");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_migration_with_panic_safe_release(&mut conn, |_conn| {
+                panic!("synthetic migration panic")
+            })
+        }));
+
+        assert!(
+            result.is_err(),
+            "expected the panic to propagate out of run_migration_with_panic_safe_release, \
+             not be swallowed"
+        );
+        assert!(
+            !migration_lock_held(&mut conn).expect("inspect the migration advisory lock"),
+            "expected the advisory lock to be drained after the panic unwound"
+        );
+    }
+
+    /// `release_migration_lock`'s defensive `drained == 0` branch — "the lock
+    /// was not held at release time" — called directly on a connection that
+    /// never acquired it. This is the one state `setup()` itself can never
+    /// reach (it always acquires first), so it is exercised here rather than
+    /// through the public API.
+    #[test]
+    fn release_without_a_prior_acquire_reports_the_lock_was_not_held() {
+        let Some(url) = database_url_or_skip() else {
+            return;
+        };
+        let pool = test_pool(&url);
+        let mut conn = pool.get().expect("check out a pooled connection");
+
+        match release_migration_lock(&mut conn) {
+            Err(Error::Migration(message)) => {
+                assert!(
+                    message.to_string().contains("was not held at release time"),
+                    "expected the not-held-at-release invariant message, got: {message}"
+                );
+            }
+            other => panic!(
+                "expected Error::Migration(\"...was not held at release time\"), got {other:?}"
+            ),
+        }
+    }
 }
