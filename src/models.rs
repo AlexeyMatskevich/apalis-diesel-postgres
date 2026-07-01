@@ -60,7 +60,16 @@ impl From<JobRow> for TaskRow {
             lock_by: row.lock_by,
             done_at: row.done_at,
             priority: row.priority.map(|priority| priority.max(0) as usize),
-            metadata: row.metadata,
+            // apalis-sql's `try_into_task_compact` does
+            // `metadata.as_object().cloned().unwrap()`, which panics on any
+            // non-object JSONB — and a third-party writer can store a bare
+            // number, string, array, bool, or null straight into
+            // `apalis.jobs`, bypassing this crate's push API. Coerce non-object
+            // metadata to `None` so the downstream conversion falls back to an
+            // empty object instead of panicking (and, on the polling path,
+            // stranding every co-claimed row). Mirrors apalis-sql's own
+            // defensive `try_into_task`, which already uses `unwrap_or_default`.
+            metadata: row.metadata.filter(Value::is_object),
             idempotency_key: row.idempotency_key,
         }
     }
@@ -330,7 +339,64 @@ mod tests {
         }
     }
 
+    /// Convert a `JobRow` carrying the given `metadata` JSON into a compact task
+    /// and return its metadata re-serialized. apalis-sql's
+    /// `try_into_task_compact` does `metadata.as_object().cloned().unwrap()`
+    /// (`from_row.rs`), so any non-object JSONB — which a third-party writer can
+    /// insert straight into `apalis.jobs`, bypassing this crate's push API —
+    /// used to panic during row conversion. In the polling path that panic
+    /// fires mid-batch, stranding every co-claimed row as `Running`. Coercing
+    /// non-object metadata to an empty object in `From<JobRow>` keeps the
+    /// conversion total, matching apalis-sql's own defensive `try_into_task`.
+    fn compact_metadata_json(metadata: Value) -> Result<String, String> {
+        let mut row = job_row(1, 3, Some(0), Some(metadata), None);
+        // `try_into_task_compact` parses `id` and `status`; the shared `job_row`
+        // helper stores placeholders that only the (non-parsing) `From`
+        // conversion tolerates, so give it a real ULID and a parseable status.
+        row.id = Ulid::new().to_string();
+        row.status = "Pending".to_owned();
+        let task = TaskRow::from(row)
+            .try_into_task_compact::<Ulid, crate::PgPool>()
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(task.parts.ctx.meta()).map_err(|error| error.to_string())
+    }
+
     lets_expect! {
+        expect(compact_metadata_json(metadata)) {
+            let metadata: Value = json!({"trace": "abc"});
+
+            when metadata_is_a_json_object {
+                to preserves_the_object_verbatim {
+                    be_ok_and equal(r#"{"trace":"abc"}"#.to_owned())
+                }
+            }
+
+            when metadata_is_a_bare_number {
+                let metadata: Value = json!(42);
+                to coerces_the_non_object_to_an_empty_object { be_ok_and equal("{}".to_owned()) }
+            }
+
+            when metadata_is_a_bare_string {
+                let metadata: Value = json!("nope");
+                to coerces_the_non_object_to_an_empty_object { be_ok_and equal("{}".to_owned()) }
+            }
+
+            when metadata_is_a_json_array {
+                let metadata: Value = json!([1, 2, 3]);
+                to coerces_the_non_object_to_an_empty_object { be_ok_and equal("{}".to_owned()) }
+            }
+
+            when metadata_is_a_boolean {
+                let metadata: Value = json!(true);
+                to coerces_the_non_object_to_an_empty_object { be_ok_and equal("{}".to_owned()) }
+            }
+
+            when metadata_is_json_null {
+                let metadata: Value = json!(null);
+                to coerces_the_non_object_to_an_empty_object { be_ok_and equal("{}".to_owned()) }
+            }
+        }
+
         expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone()))) {
             let attempts = 1;
             let max_attempts = 3;
