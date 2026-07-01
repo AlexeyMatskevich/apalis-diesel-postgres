@@ -29,17 +29,43 @@
 
 mod support;
 
-use support::{Outcome, observe, with_conn};
-
 use std::time::Duration;
 
 use apalis_core::{backend::Backend, worker::context::WorkerContext};
 use apalis_diesel_postgres::{Config, PgPool, PgTask, PostgresStorage};
 use diesel::{PgConnection, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
-use lets_expect::{AssertionResult, *};
+use lets_expect::{AssertionError, AssertionResult, *};
 use serde_json::Value;
 use ulid::Ulid;
+
+// --------------------------------------------------------------------------
+// shared scaffolding
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum Outcome<T> {
+    Skipped,
+    Completed(T),
+}
+
+fn observe<T, F>(
+    label: &'static str,
+    body: F,
+) -> impl Fn(&Result<Outcome<T>, String>) -> AssertionResult
+where
+    F: Fn(&T) -> Result<(), String>,
+{
+    move |result| match result {
+        Err(error) => Err(AssertionError::new(vec![format!(
+            "{label}: scenario failed: {error}"
+        )])),
+        Ok(Outcome::Skipped) => Ok(()),
+        Ok(Outcome::Completed(run)) => {
+            body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
+        }
+    }
+}
 
 /// Build a pool with at least two connections so the LISTEN observer and the
 /// INSERT/`pg_notify` writer can run on independent connections.
@@ -48,6 +74,19 @@ async fn test_pool_multi() -> Result<Option<PgPool>, String> {
     // observer thread, one for the writer); the shared per-binary pool is sized
     // well above that.
     support::shared_pool().await
+}
+
+async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
+where
+    F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut conn = pool.get().map_err(|e| e.to_string())?;
+        work(&mut conn)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {

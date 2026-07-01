@@ -559,6 +559,18 @@ fn reenqueue_stamped_completion_timestamp()
     })
 }
 
+fn reenqueue_left_done_at_null()
+-> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
+    observe::<ReenqueueRun, _>("reenqueue leaves done_at NULL", |run| {
+        if run.done_at_present {
+            Err("expected the Pending (retry) branch to leave done_at NULL, got a stamped timestamp"
+                .into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
 fn reenqueue_preserves_lock_by()
 -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
     observe::<ReenqueueRun, _>("reenqueue preserves lock_by", |run| {
@@ -1129,6 +1141,7 @@ struct OverflowSweepRun {
     swept_ok: bool,
     error: Option<String>,
     status: Option<String>,
+    attempts: Option<i32>,
 }
 
 async fn run_overflow_sweep() -> Result<Outcome<OverflowSweepRun>, String> {
@@ -1163,10 +1176,11 @@ async fn run_overflow_sweep() -> Result<Outcome<OverflowSweepRun>, String> {
     .await?;
 
     let sweep = reenqueue_orphaned_sql(pool.clone(), 1, queue.clone()).await;
-    let status = if sweep.is_ok() {
-        Some(job_status_row(pool.clone(), id).await?.status)
+    let (status, attempts) = if sweep.is_ok() {
+        let row = job_status_row(pool.clone(), id).await?;
+        (Some(row.status), Some(row.attempts))
     } else {
-        None
+        (None, None)
     };
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
@@ -1174,6 +1188,7 @@ async fn run_overflow_sweep() -> Result<Outcome<OverflowSweepRun>, String> {
         swept_ok: sweep.is_ok(),
         error: sweep.err(),
         status,
+        attempts,
     }))
 }
 
@@ -1197,6 +1212,23 @@ fn overflow_sweep_kills_the_row()
         Some("Killed") => Ok(()),
         other => Err(format!(
             "expected the exhausted row to be Killed, got {other:?}"
+        )),
+    })
+}
+
+fn overflow_sweep_clamps_attempts_to_max()
+-> impl Fn(&Result<Outcome<OverflowSweepRun>, String>) -> AssertionResult {
+    // `LEAST(attempts::bigint + 1, max_attempts)` re-bounds the bigint-promoted
+    // arithmetic back to `max_attempts` (= i32::MAX here) so the result fits the
+    // int column again. A regression that dropped the right-hand bound of
+    // `LEAST`, or wrote the raw bigint back incorrectly, would land some value
+    // other than i32::MAX (or blow up the UPDATE) — this reads the persisted
+    // value back to pin the clamp itself, not merely the terminal status.
+    observe::<OverflowSweepRun, _>("overflow sweep attempts", |run| match run.attempts {
+        Some(a) if a == i32::MAX => Ok(()),
+        other => Err(format!(
+            "expected attempts clamped to max_attempts (i32::MAX = {}), got {other:?}",
+            i32::MAX
         )),
     })
 }
@@ -1315,6 +1347,7 @@ lets_expect! { #tokio_test
         when a_corrupt_row_sits_at_the_i32_max_attempt_count {
             to sweeps_without_an_integer_overflow { overflow_sweep_does_not_overflow() }
             to marks_the_exhausted_row_killed { overflow_sweep_kills_the_row() }
+            to clamps_attempts_back_to_max_attempts { overflow_sweep_clamps_attempts_to_max() }
         }
     }
 
@@ -1327,6 +1360,7 @@ lets_expect! { #tokio_test
             to transitions_to_pending { reenqueue_row_status("Pending") }
             to increments_attempts { reenqueue_row_attempts(1) }
             to clears_the_lock_by_column { reenqueue_clears_lock_by() }
+            to leaves_done_at_null_on_the_retry_branch { reenqueue_left_done_at_null() }
             to stamps_the_heartbeat_timeout_marker { reenqueue_writes_heartbeat_marker() }
         }
 
