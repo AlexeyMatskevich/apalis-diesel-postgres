@@ -196,7 +196,9 @@ pub(crate) fn keep_alive(
         // lease_token does not match — both mean *this* process is no longer
         // the authoritative heartbeater (e.g. another registration took over).
         // Recreating the worker stream rotates the token.
-        heartbeat_outcome(count, &worker, config.queue().to_string())
+        // Pass the queue by reference: the successful (non-zero) path never
+        // needs it, so the `String` is allocated only when building the error.
+        heartbeat_outcome(count, &worker, config.queue().as_ref())
     })
 }
 
@@ -207,13 +209,14 @@ pub(crate) fn keep_alive(
 fn heartbeat_outcome(
     updated_rows: usize,
     worker: &WorkerContext,
-    queue: String,
+    queue: &str,
 ) -> Result<(), Error> {
     if updated_rows == 0 {
         Err(Error::worker_not_registered(
             "updating worker heartbeat",
             worker.name(),
-            queue,
+            // Allocated here (the cold path) rather than on every heartbeat.
+            queue.to_owned(),
             "the worker may not be registered for this queue, or another process has re-registered with a different lease token; recreate the worker stream",
         ))
     } else {
@@ -256,16 +259,19 @@ mod tests {
 
     fn worker_not_registered(error: &Error) -> AssertionResult {
         match error {
-            Error::WorkerNotRegistered { .. } => Ok(()),
+            // Also pins the queue on the error: `heartbeat_outcome` now defers
+            // the `String` allocation to this cold path, so the surfaced queue
+            // must still be the one the caller passed by reference.
+            Error::WorkerNotRegistered { queue, .. } if queue == "heartbeat-queue" => Ok(()),
             other => Err(AssertionError::new(vec![format!(
-                "expected WorkerNotRegistered, got {other:?}"
+                "expected WorkerNotRegistered for queue \"heartbeat-queue\", got {other:?}"
             )])),
         }
     }
 
     fn heartbeat(updated_rows: usize) -> Result<(), Error> {
         let worker = WorkerContext::new::<()>("heartbeat-worker");
-        heartbeat_outcome(updated_rows, &worker, "heartbeat-queue".to_owned())
+        heartbeat_outcome(updated_rows, &worker, "heartbeat-queue")
     }
 
     lets_expect! {
