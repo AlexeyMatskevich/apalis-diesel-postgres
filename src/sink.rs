@@ -16,8 +16,9 @@ use crate::{CompactType, Config, Error, PgPool, PgTask, PostgresStorage, queries
 // hot path lock-free.
 type FlushFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>;
 
-/// Buffered task sink used by [`PostgresStorage`].
-pub struct PgSink<Args, Codec = JsonCodec<CompactType>> {
+/// Buffered task sink used internally by [`PostgresStorage`]. Not part of the
+/// public API: the `Sink<PgTask>` impl lives on `PostgresStorage` itself.
+pub(crate) struct PgSink<Args, Codec = JsonCodec<CompactType>> {
     pool: PgPool,
     config: Config,
     buffer: Vec<PgTask<CompactType>>,
@@ -55,7 +56,7 @@ impl<Args, Codec> Clone for PgSink<Args, Codec> {
 impl<Args, Codec> PgSink<Args, Codec> {
     /// Create a sink for the given pool and config.
     #[must_use]
-    pub fn new(pool: &PgPool, config: &Config) -> Self {
+    pub(crate) fn new(pool: &PgPool, config: &Config) -> Self {
         Self {
             pool: pool.clone(),
             config: config.clone(),

@@ -26,8 +26,13 @@ pub use crate::{
     pool::{build_pool, build_pool_with},
     queries::migrations::MIGRATIONS,
     shared::{SharedFetcher, SharedPostgresError, SharedPostgresStorage},
-    sink::PgSink,
 };
+// `PgSink` is an internal implementation detail of `PostgresStorage`: the
+// public `Sink<PgTask>` impl lives on `PostgresStorage`, not on `PgSink`, and
+// `PgSink`'s own methods are crate-private, so a re-exported `PgSink` gave
+// downstream code nothing usable. Kept in scope for the `PostgresStorage.sink`
+// field but no longer part of the public API.
+use crate::sink::PgSink;
 
 mod ack;
 mod admin;
