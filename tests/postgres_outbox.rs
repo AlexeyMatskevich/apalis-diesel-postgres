@@ -212,6 +212,105 @@ fn commit_returns_id_matching_db() -> impl Fn(&Result<Outcome<CommitRun>, String
 }
 
 // --------------------------------------------------------------------------
+// Scenario 1b: push_batch_with_conn inserts every task in one committed batch.
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct BatchRun {
+    returned_ids: usize,
+    distinct_returned_ids: usize,
+    db_jobs: i64,
+    all_ids_present: bool,
+}
+
+const BATCH_SIZE: usize = 5;
+
+async fn run_batch_commit_scenario() -> Result<Outcome<BatchRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    // `cleanup` deletes from the business-marker table too, so ensure it exists
+    // on a cold database (this scenario runs before any commit/rollback one).
+    ensure_business_table(pool.clone()).await?;
+    let queue = format!("apalis-outbox-batch-{}", Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+
+    let storage =
+        PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(1));
+    let payloads: Vec<String> = (0..BATCH_SIZE).map(|i| format!("payload-{i}")).collect();
+    let pool_for_txn = pool.clone();
+    let returned = tokio::task::spawn_blocking(move || -> Result<Vec<PgTaskId>, String> {
+        let mut conn = pool_for_txn.get().map_err(|e| e.to_string())?;
+        conn.transaction::<_, PgError, _>(|c| storage.push_batch_with_conn(c, payloads))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let q2 = queue.clone();
+    let ids_for_check = returned.clone();
+    let (db_jobs, all_ids_present) = with_conn(pool.clone(), move |conn| {
+        let count = count_jobs(conn, &q2)?;
+        let mut present = true;
+        for id in &ids_for_check {
+            let n = sql_query(
+                "SELECT COUNT(*)::bigint AS n FROM apalis.jobs WHERE id = $1 AND job_type = $2",
+            )
+            .bind::<Text, _>(id.to_string())
+            .bind::<Text, _>(&q2)
+            .get_result::<CountRow>(conn)
+            .map(|r| r.n)
+            .map_err(|e| e.to_string())?;
+            if n != 1 {
+                present = false;
+            }
+        }
+        Ok::<_, String>((count, present))
+    })
+    .await?;
+
+    cleanup(pool, queue).await?;
+    let distinct: std::collections::HashSet<String> =
+        returned.iter().map(ToString::to_string).collect();
+    Ok(Outcome::Completed(BatchRun {
+        returned_ids: returned.len(),
+        distinct_returned_ids: distinct.len(),
+        db_jobs,
+        all_ids_present,
+    }))
+}
+
+fn batch_inserts_every_task() -> impl Fn(&Result<Outcome<BatchRun>, String>) -> AssertionResult {
+    observe("batch→job count", |run: &BatchRun| {
+        if run.db_jobs == BATCH_SIZE as i64 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected {BATCH_SIZE} jobs after the committed batch, got {}",
+                run.db_jobs
+            ))
+        }
+    })
+}
+
+fn batch_returns_distinct_ids_present_in_db()
+-> impl Fn(&Result<Outcome<BatchRun>, String>) -> AssertionResult {
+    observe("batch→returned ids", |run: &BatchRun| {
+        if run.returned_ids != BATCH_SIZE || run.distinct_returned_ids != BATCH_SIZE {
+            return Err(format!(
+                "expected {BATCH_SIZE} distinct returned ids, got {} ({} distinct)",
+                run.returned_ids, run.distinct_returned_ids
+            ));
+        }
+        if run.all_ids_present {
+            Ok(())
+        } else {
+            Err("a returned task id was not found in apalis.jobs".to_owned())
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // Scenario 2: rollback hides both the task and the business row.
 // --------------------------------------------------------------------------
 
@@ -807,6 +906,13 @@ lets_expect! { #tokio_test
             to persists_exactly_one_task { commit_persists_one_job() }
             to persists_exactly_one_business_row { commit_persists_one_business_row() }
             to returns_a_task_id_that_matches_the_stored_row { commit_returns_id_matching_db() }
+        }
+    }
+
+    expect(run_batch_commit_scenario().await) {
+        when push_batch_with_conn_commits_a_multi_task_batch {
+            to inserts_every_task_in_the_batch { batch_inserts_every_task() }
+            to returns_distinct_ids_that_all_landed { batch_returns_distinct_ids_present_in_db() }
         }
     }
 
