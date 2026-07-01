@@ -701,6 +701,11 @@ async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, S
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
+    // `cleanup` deletes from the business-marker table too; lets_expect
+    // expands each `to` into its own test, and test execution order is not
+    // guaranteed, so this scenario cannot rely on another one having already
+    // created the table on a cold database.
+    ensure_business_table(pool.clone()).await?;
     let queue = format!("apalis-outbox-batch-custom-{}", Ulid::new());
     cleanup(pool.clone(), queue.clone()).await?;
 
@@ -890,6 +895,9 @@ async fn run_empty_batch_scenario() -> Result<Outcome<EmptyBatchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
+    // `cleanup` deletes from the business-marker table too; see the comment
+    // in `run_batch_custom_fields_scenario`.
+    ensure_business_table(pool.clone()).await?;
     let queue = format!("apalis-outbox-empty-{}", Ulid::new());
     cleanup(pool.clone(), queue.clone()).await?;
 
@@ -1017,6 +1025,9 @@ async fn run_encode_failure_scenario() -> Result<Outcome<EncodeFailureRun>, Stri
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
+    // `cleanup` deletes from the business-marker table too; see the comment
+    // in `run_batch_custom_fields_scenario`.
+    ensure_business_table(pool.clone()).await?;
     let queue = format!("apalis-outbox-encode-fail-{}", Ulid::new());
     cleanup(pool.clone(), queue.clone()).await?;
 
