@@ -385,7 +385,21 @@ impl Stream for PgPollFetcher<CompactType> {
                 StreamState::Buffered(buffer) => {
                     if let Some(task) = buffer.pop_front() {
                         if buffer.is_empty() {
-                            this.state = StreamState::WaitForPoll;
+                            // If the just-drained batch filled the fetch limit,
+                            // the queue likely holds more rows, so fetch again
+                            // immediately instead of waiting on the poll
+                            // strategy — whose backoff may still carry a stale
+                            // idle delay chosen before this batch arrived, which
+                            // would throttle backlog drain right after work
+                            // appears. A short batch means we drained everything
+                            // available, so fall back to the configured strategy.
+                            if this.previous_task_count.load(Ordering::Relaxed)
+                                >= this.config.buffer_size().max(1)
+                            {
+                                this.state = this.start_fetch();
+                            } else {
+                                this.state = StreamState::WaitForPoll;
+                            }
                         }
                         return Poll::Ready(Some(Ok(Some(task))));
                     }
@@ -679,11 +693,18 @@ mod tests {
         }
     }
 
-    /// Poll twice on a single-element Buffered state. The first call should
-    /// yield the task and emit a transition to WaitForPoll (the buffer is now
-    /// empty). The second call sits in WaitForPoll.
-    fn buffered_drain_observation() -> &'static str {
+    /// Drain a single-element Buffered state and report the state the fetcher
+    /// transitions into. When the prior batch filled the fetch limit
+    /// (`previous_task_count >= buffer_size`, default 10) the drained buffer
+    /// goes straight to a fresh Fetch — drain-aggressive, since more rows
+    /// likely wait and the poll strategy's backoff may still hold a stale idle
+    /// delay. A shorter batch means everything available was drained, so it
+    /// returns to the configured poll strategy.
+    fn buffered_drain_observation(previous_task_count: usize) -> &'static str {
         let mut fetcher = buffered_with(vec![synthetic_task(b"only")]);
+        fetcher
+            .previous_task_count
+            .store(previous_task_count, Ordering::Relaxed);
         let mut cx = Context::from_waker(noop_waker_ref());
         let _ = Pin::new(&mut fetcher).poll_next(&mut cx);
         state_name(&fetcher)
@@ -809,11 +830,16 @@ mod tests {
             }
         }
 
-        expect(buffered_drain_observation()) {
-            when buffer_holds_exactly_one_task {
-                to transitions_to_wait_for_poll_after_emitting_the_task {
-                    equal("wait_for_poll")
-                }
+        expect(buffered_drain_observation(previous_task_count)) {
+            let previous_task_count = 10; // == default buffer_size: the batch filled the limit
+
+            when the_drained_batch_had_filled_the_fetch_limit {
+                to fetches_again_immediately_to_drain_the_backlog { equal("fetch") }
+            }
+
+            when the_drained_batch_was_shorter_than_the_fetch_limit {
+                let previous_task_count = 3;
+                to returns_to_the_configured_poll_strategy { equal("wait_for_poll") }
             }
         }
 
