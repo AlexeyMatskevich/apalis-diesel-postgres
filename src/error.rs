@@ -83,9 +83,17 @@ pub enum Error {
     )]
     MissingField(&'static str),
 
-    /// A worker or queue registration already exists.
-    #[error("worker registration already exists or is being registered concurrently: {0}")]
-    AlreadyRegistered(String),
+    /// A worker registration already exists for the queue, or is being
+    /// registered concurrently.
+    #[error(
+        "worker `{worker_id}` is already registered for queue `{queue}`, or is being registered concurrently"
+    )]
+    AlreadyRegistered {
+        /// Worker id whose registration collided.
+        worker_id: String,
+        /// Queue (`worker_type`) the worker was registering for.
+        queue: String,
+    },
 
     /// A task could not be locked because it was absent or not currently lockable.
     #[error("task not found while {operation} (task_id: {task_id}, queue: {queue}); {hint}")]
@@ -204,6 +212,16 @@ impl Error {
             worker_id: worker_id.into(),
             queue: queue.into(),
             hint,
+        }
+    }
+
+    pub(crate) fn already_registered(
+        worker_id: impl Into<String>,
+        queue: impl Into<String>,
+    ) -> Self {
+        Self::AlreadyRegistered {
+            worker_id: worker_id.into(),
+            queue: queue.into(),
         }
     }
 
@@ -464,8 +482,10 @@ mod tests {
             to has_no_error_source { has_no_source }
         }
 
-        expect(Error::AlreadyRegistered("worker-1".to_string())) {
-            to displays_the_registration_error { displays_as("worker registration already exists or is being registered concurrently: worker-1") }
+        expect(Error::already_registered("worker-1", "emails")) {
+            to displays_the_registration_error_with_worker_and_queue {
+                displays_as("worker `worker-1` is already registered for queue `emails`, or is being registered concurrently")
+            }
             to has_no_error_source { has_no_source }
         }
 
