@@ -243,8 +243,16 @@ where
 
 type Poller = Pin<Box<dyn Stream<Item = ()> + Send>>;
 
+/// The configured poll strategy, built exactly once per fetcher and then polled
+/// for the fetcher's whole lifetime. `Fuse` keeps it safe to poll past
+/// exhaustion: a finite custom strategy that yields `None` stays `None` on
+/// subsequent polls instead of risking a panic.
+type FusedPoller = futures::stream::Fuse<Poller>;
+
 enum StreamState<Args> {
-    WaitForPoll(Poller),
+    /// Waiting for the persistent `poller` (see [`PgPollFetcher::poller`]) to
+    /// signal that the next fetch should run.
+    WaitForPoll,
     StrategyEnded(Delay),
     Fetch(BoxFuture<'static, Result<Vec<PgTask<Args>>, Error>>),
     Buffered(VecDeque<PgTask<Args>>),
@@ -261,6 +269,13 @@ pub(crate) struct PgPollFetcher<Compact> {
     pool: PgPool,
     config: Config,
     worker: WorkerContext,
+    /// The configured poll strategy, built **once** at construction and polled
+    /// for the fetcher's whole lifetime. Rebuilding it per cycle (the pre-fix
+    /// behaviour) drained the shared `MultiStrategy` after the first build, so
+    /// every later cycle fell back to a hardcoded delay. It reads
+    /// `previous_task_count` live through the `PollContext` Arc, so backoff
+    /// keeps adapting to fetch sizes without a rebuild.
+    poller: FusedPoller,
     state: StreamState<Compact>,
     previous_task_count: Arc<AtomicUsize>,
 }
@@ -272,7 +287,8 @@ impl<Compact> Clone for PgPollFetcher<Compact> {
             pool: self.pool.clone(),
             config: self.config.clone(),
             worker: self.worker.clone(),
-            state: poll_state(&self.config, &self.worker, previous_task_count.clone()),
+            poller: build_poller(&self.config, &self.worker, previous_task_count.clone()),
+            state: StreamState::WaitForPoll,
             previous_task_count,
         }
     }
@@ -287,7 +303,8 @@ impl PgPollFetcher<CompactType> {
             pool: pool.clone(),
             config: config.clone(),
             worker: worker.clone(),
-            state: poll_state(config, worker, previous_task_count.clone()),
+            poller: build_poller(config, worker, previous_task_count.clone()),
+            state: StreamState::WaitForPoll,
             previous_task_count,
         }
     }
@@ -329,7 +346,10 @@ impl Stream for PgPollFetcher<CompactType> {
 
         loop {
             match &mut this.state {
-                StreamState::WaitForPoll(poller) => match poller.poll_next_unpin(cx) {
+                // Poll the persistent strategy stream (built once in `new`),
+                // not a freshly rebuilt one — rebuilding drained the shared
+                // `MultiStrategy` after the first cycle.
+                StreamState::WaitForPoll => match this.poller.poll_next_unpin(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(())) => {
                         this.state = this.start_fetch();
@@ -349,11 +369,7 @@ impl Stream for PgPollFetcher<CompactType> {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(tasks)) if tasks.is_empty() => {
                         this.previous_task_count.store(0, Ordering::Relaxed);
-                        this.state = poll_state(
-                            &this.config,
-                            &this.worker,
-                            this.previous_task_count.clone(),
-                        );
+                        this.state = StreamState::WaitForPoll;
                     }
                     Poll::Ready(Ok(tasks)) => {
                         this.previous_task_count
@@ -362,40 +378,35 @@ impl Stream for PgPollFetcher<CompactType> {
                     }
                     Poll::Ready(Err(error)) => {
                         this.previous_task_count.store(0, Ordering::Relaxed);
-                        this.state = poll_state(
-                            &this.config,
-                            &this.worker,
-                            this.previous_task_count.clone(),
-                        );
+                        this.state = StreamState::WaitForPoll;
                         return Poll::Ready(Some(Err(error)));
                     }
                 },
                 StreamState::Buffered(buffer) => {
                     if let Some(task) = buffer.pop_front() {
                         if buffer.is_empty() {
-                            this.state = poll_state(
-                                &this.config,
-                                &this.worker,
-                                this.previous_task_count.clone(),
-                            );
+                            this.state = StreamState::WaitForPoll;
                         }
                         return Poll::Ready(Some(Ok(Some(task))));
                     }
-                    this.state =
-                        poll_state(&this.config, &this.worker, this.previous_task_count.clone());
+                    this.state = StreamState::WaitForPoll;
                 }
             }
         }
     }
 }
 
-fn poll_state<Compact>(
+fn build_poller(
     config: &Config,
     worker: &WorkerContext,
     previous_task_count: Arc<AtomicUsize>,
-) -> StreamState<Compact> {
+) -> FusedPoller {
     let context = PollContext::new(worker.clone(), previous_task_count);
-    StreamState::WaitForPoll(config.poll_strategy().clone().build_stream(&context))
+    // `build_stream` consumes the `MultiStrategy` — its `poll_strategy` drains
+    // the shared `Arc<Mutex<Vec<_>>>` — so this must run exactly once per
+    // fetcher. The resulting stream reads `previous_task_count` live through the
+    // `PollContext` Arc, so backoff keeps adapting without a rebuild.
+    config.poll_strategy().clone().build_stream(&context).fuse()
 }
 
 #[cfg(test)]
@@ -416,7 +427,7 @@ mod tests {
         PgConnection,
         r2d2::{ConnectionManager, Pool},
     };
-    use futures::{FutureExt, future, stream, task::noop_waker_ref};
+    use futures::{FutureExt, StreamExt, future, stream, task::noop_waker_ref};
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
@@ -435,11 +446,20 @@ mod tests {
             .build_unchecked(manager)
     }
 
+    /// A poll-strategy stream that never yields, used as a placeholder poller
+    /// for fetchers whose tests drive the state machine directly rather than
+    /// through the configured strategy.
+    fn pending_poller() -> FusedPoller {
+        let poller: Poller = Box::pin(stream::pending::<()>());
+        poller.fuse()
+    }
+
     fn buffered_fetcher() -> PgPollFetcher<CompactType> {
         PgPollFetcher {
             pool: unchecked_pool(),
             config: Config::new("fetcher-test"),
             worker: WorkerContext::new::<()>("fetcher-worker"),
+            poller: pending_poller(),
             state: StreamState::Buffered(VecDeque::new()),
             previous_task_count: Arc::new(AtomicUsize::new(12)),
         }
@@ -447,7 +467,7 @@ mod tests {
 
     fn state_name(fetcher: &PgPollFetcher<CompactType>) -> &'static str {
         match &fetcher.state {
-            StreamState::WaitForPoll(_) => "wait_for_poll",
+            StreamState::WaitForPoll => "wait_for_poll",
             StreamState::StrategyEnded(_) => "strategy_ended",
             StreamState::Fetch(_) => "fetch",
             StreamState::Buffered(_) => "buffered",
@@ -472,16 +492,20 @@ mod tests {
 
     fn pending_poll_strategy_observation() -> PollObservation {
         let mut fetcher = buffered_fetcher();
-        fetcher.state = StreamState::WaitForPoll(Box::pin(stream::pending()));
+        let poller: Poller = Box::pin(stream::pending());
+        fetcher.poller = poller.fuse();
+        fetcher.state = StreamState::WaitForPoll;
         poll_observation(&mut fetcher)
     }
 
     fn exhausted_poll_strategy_observation() -> PollObservation {
-        // Stream::poll_next returning `Ready(None)` must transition the
-        // fetcher into `StrategyEnded` (fetcher.rs:106-109) — the only way
-        // out of WaitForPoll besides starting a fetch.
+        // A poller that yields `Ready(None)` must transition the fetcher into
+        // `StrategyEnded` — the only way out of WaitForPoll besides starting a
+        // fetch.
         let mut fetcher = buffered_fetcher();
-        fetcher.state = StreamState::WaitForPoll(Box::pin(stream::empty::<()>()));
+        let poller: Poller = Box::pin(stream::empty::<()>());
+        fetcher.poller = poller.fuse();
+        fetcher.state = StreamState::WaitForPoll;
         poll_observation(&mut fetcher)
     }
 
@@ -526,7 +550,7 @@ mod tests {
 
     fn cloned_state(fetcher: &PgPollFetcher<CompactType>) -> &'static str {
         match &fetcher.clone().state {
-            StreamState::WaitForPoll(_) => "wait_for_poll",
+            StreamState::WaitForPoll => "wait_for_poll",
             StreamState::StrategyEnded(_) => "strategy_ended",
             StreamState::Fetch(_) => "fetch",
             StreamState::Buffered(_) => "buffered",
@@ -603,7 +627,9 @@ mod tests {
             "buffered_empty" => buffered_with(Vec::new()),
             "wait_for_poll" => {
                 let mut fetcher = buffered_fetcher();
-                fetcher.state = StreamState::WaitForPoll(Box::pin(stream::pending()));
+                let poller: Poller = Box::pin(stream::pending());
+                fetcher.poller = poller.fuse();
+                fetcher.state = StreamState::WaitForPoll;
                 fetcher
             }
             "fetch" => {
@@ -658,6 +684,29 @@ mod tests {
     /// empty). The second call sits in WaitForPoll.
     fn buffered_drain_observation() -> &'static str {
         let mut fetcher = buffered_with(vec![synthetic_task(b"only")]);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let _ = Pin::new(&mut fetcher).poll_next(&mut cx);
+        state_name(&fetcher)
+    }
+
+    /// Build a fetcher through its public constructor (so it owns whatever poll
+    /// strategy `Config` carries), run it through one completed fetch cycle, and
+    /// report the state it parks in. The configured `MultiStrategy` must keep
+    /// governing the fetcher: the pre-fix code rebuilt the strategy every cycle
+    /// via `config.poll_strategy().clone().build_stream(...)`, and because
+    /// `MultiStrategy::poll_strategy` *drains* its shared `Arc<Mutex<Vec<_>>>`,
+    /// the second build saw an empty strategy — collapsing to the hardcoded
+    /// 100ms `StrategyEnded` fallback (losing the configured interval/backoff)
+    /// after a single cycle. Parking back in `wait_for_poll` proves the
+    /// configured strategy still drives polling.
+    fn state_after_one_empty_fetch_cycle() -> &'static str {
+        let pool = unchecked_pool();
+        let config = Config::new("poll-strategy-drain");
+        let worker = WorkerContext::new::<()>("poll-strategy-drain-worker");
+        let mut fetcher = PgPollFetcher::new(&pool, &config, &worker);
+        // Inject a completed, empty fetch so the fetcher schedules its next
+        // poll through the configured strategy.
+        fetcher.state = StreamState::Fetch(future::ready(Ok(Vec::new())).boxed());
         let mut cx = Context::from_waker(noop_waker_ref());
         let _ = Pin::new(&mut fetcher).poll_next(&mut cx);
         state_name(&fetcher)
@@ -763,6 +812,14 @@ mod tests {
         expect(buffered_drain_observation()) {
             when buffer_holds_exactly_one_task {
                 to transitions_to_wait_for_poll_after_emitting_the_task {
+                    equal("wait_for_poll")
+                }
+            }
+        }
+
+        expect(state_after_one_empty_fetch_cycle()) {
+            when a_fetch_cycle_completes_and_the_next_poll_is_scheduled {
+                to keeps_being_governed_by_the_configured_poll_strategy {
                     equal("wait_for_poll")
                 }
             }
