@@ -247,14 +247,20 @@ fn database_hint(error: &diesel::result::Error) -> &'static str {
         // (locale-independent) over `message()` substring matching, which fails
         // on non-English PostgreSQL servers.
         DieselError::DatabaseError(_, info) => {
-            if matches!(info.table_name(), Some(name) if name == "jobs")
-                && matches!(
-                    info.constraint_name(),
-                    Some(name)
-                        if name == "jobs_lock_by_worker_type_fkey"
-                            || name == "jobs_lock_by_fkey"
-                )
-            {
+            // `constraint_name` alone is specific enough (these two names are
+            // unique to this schema's FK on `apalis.jobs.lock_by`); requiring
+            // `table_name == Some("jobs")` in addition would miss the common
+            // real-world shape where a driver reports the constraint but
+            // leaves `table_name` unset, silently falling back to the
+            // locale-dependent message match this structured check exists to
+            // avoid. Only a table_name naming some *other* table rules it out
+            // (e.g. an unrelated table that happens to reuse the FK name).
+            let constraint_is_lock_by_fk = matches!(
+                info.constraint_name(),
+                Some(name) if name == "jobs_lock_by_worker_type_fkey" || name == "jobs_lock_by_fkey"
+            );
+            let table_name_rules_it_out = matches!(info.table_name(), Some(name) if name != "jobs");
+            if constraint_is_lock_by_fk && !table_name_rules_it_out {
                 return "; register the worker for this queue before locking or acknowledging jobs";
             }
             // Fallback: message-based detection for installations where neither
@@ -700,31 +706,30 @@ mod tests {
             when structured_constraint_is_an_fk_name_but_table_name_is_absent {
                 // Realistic PostgreSQL FK-violation shape: the driver populates
                 // `constraint_name` with the FK but leaves `table_name` (of the
-                // referencing relation) as `None`. The structured arm at
-                // error.rs:250-256 is a conjunction requiring
-                // `table_name == Some("jobs")`, so a `None` table makes it MISS
-                // even though the constraint matches. The hint is then decided
-                // purely by the message-based fallback.
+                // referencing relation) as `None`. `constraint_name` alone is
+                // specific enough to identify the jobs lock_by FK, so the
+                // structured arm fires on this shape regardless of `message` —
+                // it does not depend on the free-text fallback, which is the
+                // point: a non-English PostgreSQL server's translated message
+                // would defeat a message-only check.
                 let table_name: Option<&'static str> = None;
                 let constraint_name = Some("jobs_lock_by_worker_type_fkey");
 
                 when the_message_does_not_name_the_foreign_key {
-                    // Nothing in `message` re-signals the FK, so the structural
-                    // miss is not rescued by the fallback: the overall result is
-                    // no hint. This pins that the structured branch does NOT
-                    // fire on the `None`-table side of the conjunction.
                     let message = "update or delete violates a constraint";
-                    to returns_no_hint_because_the_structured_branch_missed { equal("") }
+                    to returns_the_hint_from_the_structured_match_alone {
+                        equal(
+                            "; register the worker for this queue before locking or acknowledging jobs",
+                        )
+                    }
                 }
 
                 when the_message_still_names_the_foreign_key {
-                    // Same `None`-table / matching-constraint state, but now the
-                    // FK name survives in the free-text `message`. The structural
-                    // branch still misses; the recommendation is recovered only
-                    // via the message fallback — documenting that the hint
-                    // depends solely on `message` in this shape.
+                    // Same `None`-table / matching-constraint state, with the FK
+                    // name also present in `message`; the structured match
+                    // already decides it, so the message content is irrelevant.
                     let message = "jobs_lock_by_worker_type_fkey violated";
-                    to recovers_the_hint_only_via_the_message_fallback {
+                    to returns_the_hint_from_the_structured_match_alone {
                         equal(
                             "; register the worker for this queue before locking or acknowledging jobs",
                         )
