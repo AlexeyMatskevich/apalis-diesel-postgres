@@ -72,7 +72,10 @@ where
 
 impl<Args, D, F> ListWorkers for PostgresStorage<Args, D, F>
 where
-    Args: Sync,
+    // No `Args: Sync` bound: `list_workers` / `list_all_workers` query only
+    // `apalis.workers` and never read `Args`, so requiring it would needlessly
+    // exclude otherwise valid `Send + !Sync` argument types — every other admin
+    // impl on this storage already omits it.
     PostgresStorage<Args, D, F>:
         BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
 {
@@ -86,6 +89,16 @@ where
         queries::list_workers(self.pool.clone(), None)
     }
 }
+
+// Compile-time guard: `list_workers` / `list_all_workers` read only
+// `apalis.workers` and never touch `Args`, so the impl must not require
+// `Args: Sync`. `Cell<u8>` is `Send + !Sync` (and Serialize/Deserialize), so
+// this fails to compile while the redundant bound is present.
+#[cfg(test)]
+const _: fn() = || {
+    fn assert_list_workers<T: ListWorkers>() {}
+    assert_list_workers::<PostgresStorage<std::cell::Cell<u8>>>();
+};
 
 impl<Args, D, F> ListQueues for PostgresStorage<Args, D, F>
 where
