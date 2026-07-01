@@ -821,7 +821,9 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
                     worker_id: worker_id.ok_or(Error::MissingField("lock_by"))?,
                     queue: queue.ok_or(Error::MissingField("queue"))?,
                     lock_at: lock_at.ok_or(Error::MissingField("lock_at"))?,
-                    lease_token: lease_token.as_deref().map(str::to_owned),
+                    // Forward the `Arc<str>` clone straight through — no
+                    // per-ack `String` allocation; bound to SQL by reference.
+                    lease_token,
                 },
             )
             .await
