@@ -151,15 +151,6 @@ mod tests {
         filter_offset_i32(&filter(page, page_size))
     }
 
-    fn invalid_argument_message(error: &Error) -> AssertionResult {
-        match error {
-            Error::InvalidArgument(_) => Ok(()),
-            other => Err(AssertionError::new(vec![format!(
-                "expected InvalidArgument, got {other:?}"
-            )])),
-        }
-    }
-
     fn invalid_argument_with(expected: &'static str) -> impl Fn(&Error) -> AssertionResult {
         move |error| match error {
             Error::InvalidArgument(message) if message.contains(expected) => Ok(()),
@@ -369,7 +360,11 @@ mod tests {
                 let page = u32::MAX;
                 let page_size = Some(u32::MAX);
                 to returns_invalid_argument_for_overflow {
-                    be_err_and invalid_argument_message
+                    // Pin the u32-multiply branch specifically (not merely any
+                    // InvalidArgument): the adjacent i32-cast case below matches
+                    // "exceeds i32::MAX", so this must match its own distinct
+                    // "overflows u32" message to tell the two branches apart.
+                    be_err_and invalid_argument_with("overflows u32")
                 }
             }
 
@@ -438,6 +433,68 @@ mod tests {
                 to rejects_with_a_json_error { be_err_and json_error }
             }
         }
+    }
+
+    /// Build a pool that never opens a connection (`min_idle(0)`), so
+    /// `batch_ids_into_tasks` can be driven for branches that short-circuit
+    /// before `queue_by_id` ever touches the database.
+    fn lazy_pool() -> PgPool {
+        crate::build_pool_with("postgres://127.0.0.1:1/unused", |builder| {
+            builder.min_idle(Some(0))
+        })
+        .expect("lazy pool build should not open a connection")
+    }
+
+    // Finding 1: an `Err` element anywhere in the id stream must fail-fast the
+    // whole chunk — the collect into `Result<Vec<_>, Error>` short-circuits on
+    // the first error, so `queue_by_id` is never invoked and the output stream
+    // yields exactly one `Err` (not a skip-and-continue). Because the error
+    // aborts the chunk before any DB access, the lazy pool is never touched.
+    #[test]
+    fn batch_ids_into_tasks_propagates_a_stream_error_as_a_single_err() {
+        use futures::{StreamExt, executor::block_on, stream};
+
+        let good = crate::PgTaskId::new(Ulid::new());
+        let ids = stream::iter(vec![
+            Ok(good),
+            Err(Error::InvalidArgument("decode failed".to_owned())),
+            Ok(crate::PgTaskId::new(Ulid::new())),
+        ]);
+
+        let out: Vec<Result<Option<PgTask<CompactType>>, Error>> = block_on(
+            batch_ids_into_tasks(lazy_pool(), "queue".to_owned(), "worker".to_owned(), 8, ids)
+                .collect(),
+        );
+
+        // The entire chunk collapses to a single Err carrying the decode error;
+        // the surrounding Ok ids are dropped, not emitted as tasks.
+        assert_eq!(out.len(), 1, "expected exactly one Err, got {out:?}");
+        match &out[0] {
+            Err(Error::InvalidArgument(message)) => {
+                assert_eq!(message, "decode failed")
+            }
+            other => panic!("expected InvalidArgument(\"decode failed\"), got {other:?}"),
+        }
+    }
+
+    // Finding 2: `chunk_size == 0` must be guarded by `chunk_size.max(1)` so
+    // `ready_chunks(0)` cannot panic (`ready_chunks` asserts capacity > 0). With
+    // an empty id stream no chunk is ever produced, so the stream completes
+    // empty instead of panicking, and `queue_by_id` is never reached.
+    #[test]
+    fn batch_ids_into_tasks_with_zero_chunk_size_does_not_panic() {
+        use futures::{StreamExt, executor::block_on, stream};
+
+        let ids = stream::iter(Vec::<Result<crate::PgTaskId, Error>>::new());
+
+        let out: Vec<Result<Option<PgTask<CompactType>>, Error>> = block_on(
+            batch_ids_into_tasks(lazy_pool(), "queue".to_owned(), "worker".to_owned(), 0, ids)
+                .collect(),
+        );
+
+        // Guard held: no panic from `ready_chunks(0)`, empty input yields no
+        // output batches.
+        assert!(out.is_empty(), "expected no output, got {out:?}");
     }
 }
 

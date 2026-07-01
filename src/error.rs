@@ -696,6 +696,41 @@ mod tests {
                 let message = "violates check constraint";
                 to falls_through_to_message_matching_and_returns_no_hint { equal("") }
             }
+
+            when structured_constraint_is_an_fk_name_but_table_name_is_absent {
+                // Realistic PostgreSQL FK-violation shape: the driver populates
+                // `constraint_name` with the FK but leaves `table_name` (of the
+                // referencing relation) as `None`. The structured arm at
+                // error.rs:250-256 is a conjunction requiring
+                // `table_name == Some("jobs")`, so a `None` table makes it MISS
+                // even though the constraint matches. The hint is then decided
+                // purely by the message-based fallback.
+                let table_name: Option<&'static str> = None;
+                let constraint_name = Some("jobs_lock_by_worker_type_fkey");
+
+                when the_message_does_not_name_the_foreign_key {
+                    // Nothing in `message` re-signals the FK, so the structural
+                    // miss is not rescued by the fallback: the overall result is
+                    // no hint. This pins that the structured branch does NOT
+                    // fire on the `None`-table side of the conjunction.
+                    let message = "update or delete violates a constraint";
+                    to returns_no_hint_because_the_structured_branch_missed { equal("") }
+                }
+
+                when the_message_still_names_the_foreign_key {
+                    // Same `None`-table / matching-constraint state, but now the
+                    // FK name survives in the free-text `message`. The structural
+                    // branch still misses; the recommendation is recovered only
+                    // via the message fallback — documenting that the hint
+                    // depends solely on `message` in this shape.
+                    let message = "jobs_lock_by_worker_type_fkey violated";
+                    to recovers_the_hint_only_via_the_message_fallback {
+                        equal(
+                            "; register the worker for this queue before locking or acknowledging jobs",
+                        )
+                    }
+                }
+            }
         }
     }
 }
