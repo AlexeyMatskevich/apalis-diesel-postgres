@@ -7,6 +7,35 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Batch outbox enqueue on a caller-supplied connection: `push_batch_with_conn`
+  and `push_tasks_with_conn` insert many tasks in one round trip inside the
+  caller's own transaction, mirroring the single-task `push_with_conn` /
+  `push_task_with_conn` and sharing their SAVEPOINT-per-batch conflict
+  semantics.
+
+### Changed (breaking)
+
+- `lock_task` and `lock_task_in_queue` now take `&PgTaskId` instead of `&Ulid`,
+  so callers pass the storage's own task-id type rather than a raw ULID.
+- Storage constructors and builders now borrow the pool (`&PgPool`) instead of
+  taking it by value, so one pool can seed several storages without a `.clone()`
+  at every call site.
+- `Error::AlreadyRegistered` is now a struct variant that also carries the queue
+  it collided on — `AlreadyRegistered { worker_id, queue }` — so the error
+  identifies which queue's registration was already held, not just the worker.
+- `PgSink` is now a crate-internal type. It was never meant to be named directly
+  (construct sinks through `PostgresStorage`), so it no longer appears in the
+  public API.
+
+### Changed
+
+- The encoded task payload is capped at 1 MiB (`MAX_JOB_PAYLOAD_LEN`): a larger
+  payload is rejected up front with `Error::InvalidArgument` instead of being
+  written to the row unbounded.
+- The `ListWorkers` admin trait no longer requires `Args: Sync`.
+
 ### Fixed
 
 - `database_hint`'s structured foreign-key match required both
@@ -19,6 +48,58 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   now fires whenever the constraint name matches and `table_name` is either
   absent or `"jobs"`; only a `table_name` naming some other table rules it
   out.
+- Under the `ntex` feature, a dropped ack or sink-flush future could cancel a
+  still-queued blocking database write: ntex-rt's blocking pool skips a closure
+  whose result receiver was already dropped, so a cancelled future could strand
+  a row in `Running` under a healthy heartbeat, or lose tasks a flush had
+  already drained from its buffer. `run_blocking` now detaches the submission
+  onto a background task that owns the receiver, so the write always runs to
+  completion; when no ntex runtime is entered it falls back to the inline
+  blocking pool, which runs the closure synchronously and is inherently
+  drop-safe.
+- The polling fetcher rebuilt its poll strategy on every cycle. Because
+  `MultiStrategy::poll_strategy` drains its shared strategy list, every rebuild
+  after the first saw an empty strategy and collapsed to a hardcoded 100 ms
+  fallback — silently discarding the configured interval and backoff after a
+  single cycle. The strategy is now built once per fetcher and polled for its
+  whole lifetime (it still reads the live task count, so backoff keeps
+  adapting). Draining a batch always returns to the configured strategy instead
+  of issuing its own follow-up fetch, so a user-supplied rate limiter or
+  readiness gate is never bypassed.
+- A `JobRow` whose `metadata` column held a non-object JSON value (an array,
+  string, number, or bool) panicked while converting into `TaskRow`; non-object
+  metadata is now coerced to absent instead of panicking.
+- `attempts + 1` was evaluated in `i32` on the fail and re-enqueue paths, so a
+  row that reached `i32::MAX` attempts would overflow; the increment is now
+  promoted to `bigint` (`attempts::bigint + 1`) before the `max_attempts`
+  comparison.
+- The orphan-recovery sweep (`reenqueue_orphaned`) reclaimed every eligible
+  stale row in a single `UPDATE`, so a large backlog produced an unbounded
+  transaction. Each sweep now reclaims at most 1000 rows and drains the
+  remainder on subsequent sweeps.
+- `setup()` released the migration advisory lock exactly once, but PostgreSQL
+  session advisory locks are reentrant: a pooled connection that already held a
+  leaked copy (from a prior `setup()` whose release failed while its session
+  stayed alive) would return to the pool still holding the lock, letting the
+  next `setup()` re-enter it without blocking and defeating the serialization.
+  `setup()` now drains every hold the backend has on the lock — unlocking while
+  `pg_locks` still reports it held, which also avoids the "lock is not held"
+  server warning an unlock-until-`false` loop would emit — and confirms the
+  connection owns zero copies before returning.
+
+### Performance
+
+- The decode stage carries the worker id as `Arc<str>` and the ack path forwards
+  the per-process lease token as `Arc<str>`, replacing a `String` allocation on
+  every decoded row and every acknowledgement with a refcount bump.
+- The worker heartbeat defers its queue-name allocation to the error path, so
+  the common success path does not allocate it.
+
+### Documentation
+
+- `list_tasks` and `list_all_tasks` now document the `OFFSET` pagination cost:
+  the query still scans and discards the skipped rows, so deep pages grow
+  linearly more expensive.
 
 ## [0.4.1]
 
