@@ -47,6 +47,17 @@ where
     D::Error: std::error::Error + Send + Sync + 'static,
     Args: 'static,
 {
+    /// List this queue's tasks matching `filter.status`, newest-completed first
+    /// (`done_at DESC, run_at DESC`).
+    ///
+    /// `filter.page`/`filter.page_size` map to `LIMIT ... OFFSET ...`. The
+    /// `(job_type, status)` filter and the ordering are covered by the
+    /// `jobs_list_by_queue_idx` index, so the scan runs in index order without a
+    /// sort — but `OFFSET` still walks and discards the skipped rows, so a
+    /// **deep page costs O(offset)**. This is inherent to apalis's page-based
+    /// [`Filter`]; keep pages shallow (or narrow the `status`) on large tables,
+    /// and prefer [`apalis_core::backend::FetchById`] /
+    /// [`apalis_core::backend::WaitForCompletion`] for targeted lookups.
     fn list_tasks(
         &self,
         filter: &Filter,
@@ -60,6 +71,14 @@ where
     PostgresStorage<Args, D, F>:
         BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
 {
+    /// List tasks across **every** queue matching `filter.status`,
+    /// newest-completed first (`done_at DESC, run_at DESC`).
+    ///
+    /// Same `LIMIT ... OFFSET ...` pagination as [`Self::list_tasks`], covered
+    /// by the `jobs_list_all_idx` index (`status`, `done_at DESC`, `run_at
+    /// DESC`) so no sort is needed — but the same **O(offset) deep-page cost**
+    /// applies, and this listing scans the whole table's `status` slice rather
+    /// than one queue's. Prefer shallow pages on large tables.
     fn list_all_tasks(
         &self,
         filter: &Filter,
