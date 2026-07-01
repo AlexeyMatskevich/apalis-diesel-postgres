@@ -11,9 +11,12 @@ use apalis_core::{
     worker::{context::WorkerContext, ext::ack::Acknowledge},
 };
 use apalis_diesel_postgres::{
-    Config, PgAck, PgPool, PostgresStorage, build_pool, lock_task, setup,
+    Config, PgAck, PgPool, PgTaskId, PostgresStorage, build_pool, lock_task, setup,
 };
-use diesel::{RunQueryDsl, sql_query, sql_types::Text};
+use diesel::{
+    QueryableByName, RunQueryDsl, sql_query,
+    sql_types::{Jsonb, Nullable, Text},
+};
 use futures::StreamExt;
 use lets_expect::{AssertionError, AssertionResult, *};
 use ulid::Ulid;
@@ -25,16 +28,19 @@ use ulid::Ulid;
 #[derive(Debug)]
 struct LifecycleRun {
     polled_payload: String,
-    /// The task id carried by the polled row (the pipeline cannot proceed
-    /// without it; its presence is a hard precondition guarded upstream).
-    polled_task_id: String,
     lock_outcome: Result<(), String>,
     ack_outcome: Result<(), String>,
     fetched_args: Option<String>,
     fetched_status: Option<Status>,
-    /// The task id carried by the row fetched back by id, used to assert the
-    /// id round-trips through `fetch_by_id` rather than asserting a literal.
-    fetched_task_id: Option<String>,
+    /// Whether `fetch_by_id` returns `None` when handed a fresh, never-inserted
+    /// task id. Unlike round-tripping the *matching* id (which the `WHERE id =
+    /// $1` filter makes tautological), a miss exercises the filter's ability to
+    /// reject a non-matching id and is not fixed by the setup.
+    fetched_by_absent_id: Option<String>,
+    /// The `last_result` JSONB persisted for the acked row, read straight from
+    /// `apalis.jobs`. Asserts ack wrote the serialized `Ok("processed")` payload
+    /// rather than only that the ack call returned `Ok(())`.
+    acked_last_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -55,6 +61,35 @@ async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
             .execute(&mut conn)
             .map_err(|error| error.to_string())?;
         Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(QueryableByName)]
+struct LastResultRow {
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    last_result: Option<serde_json::Value>,
+}
+
+/// Read the `last_result` JSONB persisted for a given task id/queue directly
+/// from `apalis.jobs`, so the ack leaf can assert the stored payload rather than
+/// only that the ack call returned `Ok(())`.
+async fn last_result_for_id(
+    pool: PgPool,
+    task_id: String,
+    queue: String,
+) -> Result<Option<serde_json::Value>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut conn = pool.get().map_err(|error| error.to_string())?;
+        let rows = sql_query(
+            "SELECT last_result FROM apalis.jobs WHERE id = $1 AND job_type = $2 LIMIT 1",
+        )
+        .bind::<Text, _>(task_id)
+        .bind::<Text, _>(queue)
+        .load::<LastResultRow>(&mut conn)
+        .map_err(|error| error.to_string())?;
+        Ok(rows.into_iter().next().and_then(|row| row.last_result))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -132,20 +167,31 @@ async fn run_lifecycle() -> Result<LifecycleOutcome, String> {
         .map_err(|error| error.to_string())?;
     let fetched_args = fetched.as_ref().map(|task| task.args.clone());
     let fetched_status = fetched.as_ref().map(|task| task.parts.status.load());
-    let fetched_task_id = fetched
-        .as_ref()
-        .and_then(|task| task.parts.task_id.as_ref().map(|id| id.to_string()));
+
+    // `fetch_by_id` for a fresh id that was never inserted must return `None`:
+    // this exercises the `WHERE id = $1` filter rejecting a non-match, which the
+    // matching-id lookup above cannot (any returned row necessarily has that id).
+    let absent_id = PgTaskId::new(Ulid::new());
+    let fetched_by_absent_id = decoded
+        .fetch_by_id(&absent_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|task| task.args.clone());
+
+    // Read the persisted `last_result` directly so we can assert ack wrote the
+    // serialized result, not merely that the ack call returned `Ok(())`.
+    let acked_last_result = last_result_for_id(pool.clone(), polled_task_id, queue.clone()).await?;
 
     cleanup_queue(pool, queue).await?;
 
     Ok(LifecycleOutcome::Completed(LifecycleRun {
         polled_payload,
-        polled_task_id,
         lock_outcome,
         ack_outcome,
         fetched_args,
         fetched_status,
-        fetched_task_id,
+        fetched_by_absent_id,
+        acked_last_result,
     }))
 }
 
@@ -186,15 +232,13 @@ fn polled_payload_matches_pushed() -> impl Fn(&Result<LifecycleOutcome, String>)
     })
 }
 
-fn fetch_by_id_round_trips_the_task_id()
--> impl Fn(&Result<LifecycleOutcome, String>) -> AssertionResult {
-    observe("task id round-trip", |run| match &run.fetched_task_id {
-        Some(id) if *id == run.polled_task_id => Ok(()),
-        Some(other) => Err(format!(
-            "expected fetch_by_id to return task id {}, got {other}",
-            run.polled_task_id
+fn fetch_by_id_misses_an_absent_id() -> impl Fn(&Result<LifecycleOutcome, String>) -> AssertionResult
+{
+    observe("fetch_by_id miss", |run| match &run.fetched_by_absent_id {
+        None => Ok(()),
+        Some(args) => Err(format!(
+            "expected fetch_by_id for a never-inserted id to return None, got a row with args {args:?}"
         )),
-        None => Err("fetch_by_id returned a task without a task id".into()),
     })
 }
 
@@ -207,12 +251,20 @@ fn lock_task_acquires_the_row() -> impl Fn(&Result<LifecycleOutcome, String>) ->
     })
 }
 
-fn ack_marks_the_row_done() -> impl Fn(&Result<LifecycleOutcome, String>) -> AssertionResult {
+fn ack_succeeds_and_persists_the_result()
+-> impl Fn(&Result<LifecycleOutcome, String>) -> AssertionResult {
     observe("ack", |run| {
         run.ack_outcome
             .as_ref()
-            .map(|_| ())
-            .map_err(|error| format!("expected ack to succeed, got error: {error}"))
+            .map_err(|error| format!("expected ack to succeed, got error: {error}"))?;
+        // ack could return Ok yet write the wrong (or no) `last_result`; assert
+        // the row carries the externally-tagged serialized `Ok("processed")`.
+        let expected = serde_json::json!({ "Ok": "processed" });
+        match &run.acked_last_result {
+            Some(value) if *value == expected => Ok(()),
+            Some(other) => Err(format!("expected last_result {expected}, got {other}")),
+            None => Err("expected ack to persist last_result, got SQL NULL".into()),
+        }
     })
 }
 
@@ -240,14 +292,14 @@ lets_expect! { #tokio_test
             to polls_the_pushed_payload {
                 polled_payload_matches_pushed()
             }
-            to round_trips_the_polled_task_id_through_fetch_by_id {
-                fetch_by_id_round_trips_the_task_id()
+            to returns_none_when_fetch_by_id_is_given_an_absent_id {
+                fetch_by_id_misses_an_absent_id()
             }
             to acquires_a_row_lock_for_the_worker {
                 lock_task_acquires_the_row()
             }
-            to acknowledges_the_completed_task {
-                ack_marks_the_row_done()
+            to acknowledges_and_persists_the_completed_result {
+                ack_succeeds_and_persists_the_result()
             }
             to fetches_the_acked_task_back_by_id {
                 fetch_by_id_returns_the_task()

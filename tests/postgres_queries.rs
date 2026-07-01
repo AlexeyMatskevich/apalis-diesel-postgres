@@ -1056,6 +1056,8 @@ struct StatusOnly {
     lock_by: Option<String>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
     lock_at: Option<DateTime>,
+    #[diesel(sql_type = Nullable<Timestamptz>)]
+    done_at: Option<DateTime>,
 }
 
 #[derive(Debug)]
@@ -1067,6 +1069,11 @@ struct LockScenarioRun {
     /// running-by-self leaf to assert the CASE preserve arm kept the original
     /// (clearly-past) timestamp instead of resetting it to `now()`.
     final_lock_at: Option<i64>,
+    /// Whether `done_at` is NULL after the lock attempt. The two self-owned
+    /// re-lock scenarios seed a non-NULL `done_at`; a successful re-lock must
+    /// clear it (SQL sets `done_at = NULL`). This is the seed-independent post
+    /// condition the owner leaf checks — it can fail if the re-lock is a no-op.
+    final_done_at_is_null: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1079,6 +1086,7 @@ async fn insert_status_row(
     run_at_offset_seconds: i64,
     lock_by: Option<String>,
     lock_at: Option<DateTime>,
+    done_at: Option<DateTime>,
 ) -> Result<PgTaskId, String> {
     let id = Ulid::new();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|error| error.to_string())?;
@@ -1086,7 +1094,7 @@ async fn insert_status_row(
     with_conn(pool, move |conn| {
         sql_query(
             "INSERT INTO apalis.jobs (
-                id, job_type, job, status, attempts, max_attempts, run_at, lock_by, lock_at
+                id, job_type, job, status, attempts, max_attempts, run_at, lock_by, lock_at, done_at
             ) VALUES (
                 $1,
                 $2,
@@ -1096,7 +1104,8 @@ async fn insert_status_row(
                 $6,
                 now() + ($7 || ' seconds')::interval,
                 $8,
-                $9
+                $9,
+                $10
             )",
         )
         .bind::<Text, _>(id.to_string())
@@ -1108,6 +1117,7 @@ async fn insert_status_row(
         .bind::<Text, _>(run_at_offset_seconds.to_string())
         .bind::<Nullable<Text>, _>(lock_by)
         .bind::<Nullable<Timestamptz>, _>(lock_at)
+        .bind::<Nullable<Timestamptz>, _>(done_at)
         .execute(conn)
         .map_err(|error| error.to_string())?;
         Ok(())
@@ -1118,7 +1128,7 @@ async fn insert_status_row(
 
 async fn fetch_status_only(pool: PgPool, id: PgTaskId) -> Result<StatusOnly, String> {
     with_conn(pool, move |conn| {
-        sql_query("SELECT status, lock_by, lock_at FROM apalis.jobs WHERE id = $1")
+        sql_query("SELECT status, lock_by, lock_at, done_at FROM apalis.jobs WHERE id = $1")
             .bind::<Text, _>(id.to_string())
             .load::<StatusOnly>(conn)
             .map_err(|error| error.to_string())?
@@ -1155,10 +1165,16 @@ async fn run_lock_status_scenario(
     // preserve arm (keeps this value) apart from a reset to ~now().
     let past = <DateTime as DateTimeExt>::from_unix_timestamp(now_unix() as i64 - 3600);
 
-    // (status, attempts, max_attempts, run_at_offset_seconds, lock_by, lock_at)
-    let (status, attempts, max_attempts, run_offset, lock_by, lock_at) = match scenario {
-        "pending_due" => ("Pending", 0, 25, -1, None, None),
-        "pending_future" => ("Pending", 0, 25, 3600, None, None),
+    // (status, attempts, max_attempts, run_at_offset_seconds, lock_by, lock_at, done_at)
+    //
+    // The two self-owned re-lock scenarios seed a non-NULL `done_at` (~1h old,
+    // same as `past`). A successful re-lock must set `done_at = NULL`, so this
+    // gives the owner leaf a value the setup did NOT already fix: the assertion
+    // can distinguish a real re-lock (done_at cleared) from a no-op that leaves
+    // the seeded row untouched. Every other scenario keeps `done_at` NULL.
+    let (status, attempts, max_attempts, run_offset, lock_by, lock_at, done_at) = match scenario {
+        "pending_due" => ("Pending", 0, 25, -1, None, None, None),
+        "pending_future" => ("Pending", 0, 25, 3600, None, None, None),
         "queued_by_self" => (
             "Queued",
             0,
@@ -1166,8 +1182,17 @@ async fn run_lock_status_scenario(
             -1,
             Some(primary_worker.clone()),
             Some(past),
+            Some(past),
         ),
-        "queued_by_other" => ("Queued", 0, 25, -1, Some(other_worker.clone()), Some(now)),
+        "queued_by_other" => (
+            "Queued",
+            0,
+            25,
+            -1,
+            Some(other_worker.clone()),
+            Some(now),
+            None,
+        ),
         "running_by_self" => (
             "Running",
             0,
@@ -1175,12 +1200,21 @@ async fn run_lock_status_scenario(
             -1,
             Some(primary_worker.clone()),
             Some(past),
+            Some(past),
         ),
-        "running_by_other" => ("Running", 0, 25, -1, Some(other_worker.clone()), Some(now)),
-        "failed_retryable" => ("Failed", 1, 3, -1, None, None),
-        "failed_exhausted" => ("Failed", 3, 3, -1, None, None),
-        "done" => ("Done", 1, 3, -1, None, None),
-        "killed" => ("Killed", 3, 3, -1, None, None),
+        "running_by_other" => (
+            "Running",
+            0,
+            25,
+            -1,
+            Some(other_worker.clone()),
+            Some(now),
+            None,
+        ),
+        "failed_retryable" => ("Failed", 1, 3, -1, None, None, None),
+        "failed_exhausted" => ("Failed", 3, 3, -1, None, None, None),
+        "done" => ("Done", 1, 3, -1, None, None, None),
+        "killed" => ("Killed", 3, 3, -1, None, None, None),
         other => return Err(format!("unknown lock scenario: {other}")),
     };
 
@@ -1193,6 +1227,7 @@ async fn run_lock_status_scenario(
         run_offset,
         lock_by,
         lock_at,
+        done_at,
     )
     .await?;
 
@@ -1205,6 +1240,7 @@ async fn run_lock_status_scenario(
         final_status: row.status,
         final_lock_by: row.lock_by,
         final_lock_at: row.lock_at.map(|dt| dt.to_unix_timestamp()),
+        final_done_at_is_null: row.done_at.is_none(),
     }))
 }
 
@@ -1238,6 +1274,7 @@ async fn run_lock_in_queue_scenario(
         -1,
         None,
         None,
+        None,
     )
     .await?;
 
@@ -1258,6 +1295,7 @@ async fn run_lock_in_queue_scenario(
         final_status: row.status,
         final_lock_by: row.lock_by,
         final_lock_at: row.lock_at.map(|dt| dt.to_unix_timestamp()),
+        final_done_at_is_null: row.done_at.is_none(),
     }))
 }
 
@@ -1311,6 +1349,26 @@ fn lock_matrix_owned_by(
             other => Err(format!(
                 "expected lock_by containing {expected_substring:?}, got {other:?}"
             )),
+        }
+    })
+}
+
+/// Asserts a self-owned re-lock actually rewrote the row rather than leaving
+/// the seeded state untouched. The self scenarios seed a non-NULL `done_at`;
+/// the `lock_task` SQL sets `done_at = NULL` on a successful lock, so a cleared
+/// `done_at` proves the UPDATE matched and re-locked the row for the same
+/// worker. Unlike a `lock_by` substring check (whose seed value equals the
+/// success value), this can fail if the re-lock silently no-ops.
+fn lock_matrix_cleared_done_at()
+-> impl Fn(&Result<Outcome<LockScenarioRun>, String>) -> AssertionResult {
+    observe::<LockScenarioRun, _>("lock_task matrix done_at", |run| {
+        if run.final_done_at_is_null {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected a successful self re-lock to clear done_at, but it was left set (status={:?}, lock_by={:?})",
+                run.final_status, run.final_lock_by
+            ))
         }
     })
 }
@@ -2783,7 +2841,18 @@ async fn run_check_status_variants(
         // A Failed row that still has retries left is non-terminal: it must be
         // excluded by `completed_task_rows` exactly like a Pending row.
         "failed_retryable" => {
-            insert_status_row(pool.clone(), queue.clone(), "Failed", 1, 3, -1, None, None).await?
+            insert_status_row(
+                pool.clone(),
+                queue.clone(),
+                "Failed",
+                1,
+                3,
+                -1,
+                None,
+                None,
+                None,
+            )
+            .await?
         }
         // A Failed row whose attempts reached max_attempts crosses the `>=`
         // boundary into terminal — the one arm whose terminality hinges on a
@@ -3071,7 +3140,7 @@ lets_expect! { #tokio_test
             let scenario = "queued_by_self";
             to re_locks_the_row_for_the_same_worker { lock_matrix_succeeds() }
             to leaves_the_row_in_running_state { lock_matrix_status_equals("Running") }
-            to keeps_the_lock_holder_as_the_primary_worker { lock_matrix_owned_by("primary") }
+            to clears_done_at_when_re_locking_the_row { lock_matrix_cleared_done_at() }
             to preserves_the_existing_lock_at_timestamp { lock_matrix_preserved_past_lock_at() }
         }
 
@@ -3086,7 +3155,7 @@ lets_expect! { #tokio_test
             let scenario = "running_by_self";
             to re_locks_the_already_running_row_for_the_same_worker { lock_matrix_succeeds() }
             to keeps_the_row_in_running_state { lock_matrix_status_equals("Running") }
-            to keeps_the_lock_holder_as_the_primary_worker { lock_matrix_owned_by("primary") }
+            to clears_done_at_when_re_locking_the_row { lock_matrix_cleared_done_at() }
             to preserves_the_existing_lock_at_timestamp { lock_matrix_preserved_past_lock_at() }
         }
 
