@@ -315,6 +315,82 @@ where
         queries::push_tasks_on_conn(conn, &self.config, vec![compact])?;
         Ok(task_id)
     }
+
+    /// Enqueue a batch of tasks from their `Args` on a caller-supplied
+    /// connection, in a single INSERT.
+    ///
+    /// The batch form of [`Self::push_with_conn`]: identical transaction /
+    /// NOTIFY contract, but the whole batch is inserted with one statement (one
+    /// round-trip, one NOTIFY) instead of one INSERT per task. Returns the
+    /// generated [`PgTaskId`]s in submission order. An empty batch is a no-op
+    /// that returns an empty vector.
+    ///
+    /// # Errors
+    /// - [`Error::Decode`] if the codec rejects any task's `args`.
+    /// - [`Error::InvalidArgument`] if any encoded payload or serialized
+    ///   metadata exceeds its byte cap.
+    /// - [`Error::Database`] for SQL/driver failures.
+    pub fn push_batch_with_conn(
+        &self,
+        conn: &mut PgConnection,
+        args_batch: impl IntoIterator<Item = Args>,
+    ) -> Result<Vec<PgTaskId>, Error> {
+        let mut tasks = Vec::new();
+        let mut ids = Vec::new();
+        for args in args_batch {
+            let encoded = EncodeCodec::encode(&args).map_err(|err| Error::Decode(Box::new(err)))?;
+            let task_id = PgTaskId::new(Ulid::new());
+            let mut task = PgTask::<CompactType>::new(encoded);
+            task.parts.task_id = Some(task_id);
+            tasks.push(task);
+            ids.push(task_id);
+        }
+        queries::push_tasks_on_conn(conn, &self.config, tasks)?;
+        Ok(ids)
+    }
+
+    /// Enqueue a batch of fully-constructed [`PgTask<Args>`] values on a
+    /// caller-supplied connection, in a single INSERT.
+    ///
+    /// The batch form of [`Self::push_task_with_conn`]: use it when the tasks
+    /// carry custom `idempotency_key`, `priority`, `run_at`, `max_attempts`,
+    /// `metadata`, or `task_id`. Returns each task's [`PgTaskId`] in submission
+    /// order (a fresh Ulid wherever `task_id` was `None`). An empty batch is a
+    /// no-op that returns an empty vector.
+    ///
+    /// # Errors
+    /// - [`Error::Decode`] if the codec rejects any task's `args`.
+    /// - [`Error::IdempotencyConflict`] on an `idempotency_key` conflict — the
+    ///   whole batch's savepoint is rolled back while the outer transaction
+    ///   continues (see [`Self::push_task_with_conn`]).
+    /// - [`Error::InvalidArgument`] if any encoded payload or serialized
+    ///   metadata exceeds its byte cap.
+    /// - [`Error::Database`] for SQL/driver failures.
+    pub fn push_tasks_with_conn(
+        &self,
+        conn: &mut PgConnection,
+        tasks: impl IntoIterator<Item = PgTask<Args>>,
+    ) -> Result<Vec<PgTaskId>, Error> {
+        let mut compact_tasks = Vec::new();
+        let mut ids = Vec::new();
+        for task in tasks {
+            let encoded =
+                EncodeCodec::encode(&task.args).map_err(|err| Error::Decode(Box::new(err)))?;
+            let task_id = task
+                .parts
+                .task_id
+                .unwrap_or_else(|| PgTaskId::new(Ulid::new()));
+            let mut compact = PgTask::<CompactType> {
+                args: encoded,
+                parts: task.parts,
+            };
+            compact.parts.task_id = Some(task_id);
+            compact_tasks.push(compact);
+            ids.push(task_id);
+        }
+        queries::push_tasks_on_conn(conn, &self.config, compact_tasks)?;
+        Ok(ids)
+    }
 }
 
 /// Single generic `Backend` impl covering every `Fetcher: PgFetcherSource`.
