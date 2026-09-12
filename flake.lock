@@ -20,16 +20,16 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1764950072,
-        "narHash": "sha256-BmPWzogsG2GsXZtlT+MTcAWeDK5hkbGRZTeZNW42fwA=",
+        "lastModified": 1789114715,
+        "narHash": "sha256-ugpsyk3NM2s87vXfUiIIiibbJ4Pp0JPS5p/3mfs+q+c=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "f61125a668a320878494449750330ca58b78c557",
+        "rev": "21a67dc470149f337cecafbe965d8d252a390518",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "nixos-unstable",
+        "ref": "nixos-26.05",
         "repo": "nixpkgs",
         "type": "github"
       }
@@ -52,11 +52,11 @@
     },
     "process-compose-flake": {
       "locked": {
-        "lastModified": 1767863885,
-        "narHash": "sha256-XXekPAxzbv1DmHFo3Elmj/vDnvWc1V0jdDUvM0/Wf7k=",
+        "lastModified": 1782060835,
+        "narHash": "sha256-Q8HH2t1l3MITtWCWY4ytcH5F/Q7aAHo3Iq/QTMAKTe0=",
         "owner": "Platonic-Systems",
         "repo": "process-compose-flake",
-        "rev": "99bea96cf269cfd235833ebdf645b567069fd398",
+        "rev": "464ff6880737f063c3f0d3d2c7781fda9190868f",
         "type": "github"
       },
       "original": {
@@ -79,11 +79,11 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1764988672,
-        "narHash": "sha256-FIJtt3Zil89/hLy9i7f0R2xXcJDPc3CeqiiCLfsFV0Y=",
+        "lastModified": 1789196581,
+        "narHash": "sha256-yJr1Bt4fKkKIpPYbsKGqJ0VFdoDnURgRwuffmBQ2WzY=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "086fd19a68e80fcc8a298e9df4674982e4c498a6",
+        "rev": "228ecefb6329d5a531b77b46b581a2f0c26ee056",
         "type": "github"
       },
       "original": {
@@ -94,11 +94,11 @@
     },
     "services-flake": {
       "locked": {
-        "lastModified": 1778980174,
-        "narHash": "sha256-BFnPAQsDtHhntjUUVhluwZB+QvA0fZXXtruIoxHCepI=",
+        "lastModified": 1789140491,
+        "narHash": "sha256-KCg99ZsbbCM+g4a9OLirUAZWq6erSN47Pevyo72i56M=",
         "owner": "juspay",
         "repo": "services-flake",
-        "rev": "b1965cb0b36ec958c958c037f157d52efd809e5a",
+        "rev": "9c0fa3515d74a3be695949465d231b4736057ac6",
         "type": "github"
       },
       "original": {

@@ -1,5 +1,8 @@
 # Contributing
 
+The flake follows the supported `nixos-26.05` branch to keep the development
+environment available on Linux and both Intel and Apple Silicon macOS.
+
 Use the Nix development shell before running project commands:
 
 ```sh

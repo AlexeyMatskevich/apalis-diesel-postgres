@@ -2,7 +2,7 @@
   description = "apalis-diesel-postgres development environment";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
     process-compose-flake.url = "github:Platonic-Systems/process-compose-flake";
@@ -64,21 +64,12 @@
           ngtcp2 = pkgs.ngtcp2.override { inherit openssl; };
         };
 
-        # Keep the PostgreSQL minor current without changing the rest of the
-        # pinned development toolchain. The source is the official release tag.
-        postgres = (pkgs.postgresql_18.override {
+        # Use the current PostgreSQL 18 release from the pinned package set.
+        postgres = pkgs.postgresql_18.override {
           inherit openssl;
           libkrb5 = postgresKrb5;
           curl = postgresCurl;
-        }).overrideAttrs (_: {
-          version = "18.6";
-          src = pkgs.fetchFromGitHub {
-            owner = "postgres";
-            repo = "postgres";
-            rev = "refs/tags/REL_18_6";
-            hash = "sha256-ySffxlG7jlNyzx++BmIN+WuaQ9TMAJt/qER9wIjd6B8=";
-          };
-        });
+        };
 
         # Local PostgreSQL connection details, shared by the dev shell and the
         # process-compose service below.
