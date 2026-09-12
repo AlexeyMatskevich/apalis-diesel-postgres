@@ -1,18 +1,18 @@
 # Installation and upgrades
 
-## Upgrading from 0.4.1 to Unreleased
+## Upgrading from 0.4.1 to 0.5.0
 
-Use this path when moving from the `v0.4.1` tag to the changes under
-`Unreleased` in [CHANGELOG](../CHANGELOG.md#unreleased). It covers both the Rust
-application and its existing database. The target changes are not yet a new
-release: `Cargo.toml` still says `0.4.1`. A registry dependency on `0.4.1`, or the
-`v0.4.1` Git tag, does not include them. For pre-release validation, use a path
-dependency on the updated checkout; select the actual new version when released.
+Use this path when moving from `0.4.1` to `0.5.0`. It covers both the Rust
+application and its existing database; see the [0.5.0 changelog](../CHANGELOG.md#050)
+for the full change list. Update the application's dependency requirement to
+`apalis-diesel-postgres = "0.5"`: a `"0.4"` requirement does not select this release.
+When validating an unpublished release candidate, use a path dependency on the
+prepared checkout instead of expecting it to be available from the registry.
 
 ### 1. Prepare and build the application
 
 Keep Rust 1.88 or later and the existing Apalis RC pins. The minimum dependency
-requirements are now Diesel 2.3.10 and, for ntex, ntex-rt 3.15. Update the
+requirements are now Diesel 2.3.13 and, for ntex, ntex-rt 3.17.2. Update the
 application's lockfile as needed and test its selected runtime. Default Tokio,
 explicit ntex-only, and the requirement to select a runtime are unchanged.
 For ntex-only dependencies, retain `default-features = false, features = ["ntex"]`.
@@ -65,6 +65,15 @@ cloning the same storage is not a restart procedure.
 Check enqueue inputs against the new 1 MiB encoded task-payload limit and the
 stricter scheduling validation. Enqueue idempotency does not deduplicate an
 external effect performed by a handler; keep that effect independently idempotent.
+
+The transactional enqueue contract is unchanged. `push_with_conn` and
+`push_task_with_conn` still use the caller's connection: business data and jobs
+commit or roll back together when enclosed in the same transaction. The new
+`push_batch_with_conn` and `push_tasks_with_conn` APIs retain this contract and
+use one SAVEPOINT per batch. A rejected batch inserts no jobs and leaves the
+outer transaction usable; successful enqueue becomes durable only when that
+outer transaction commits. The new payload and schedule validation can reject
+inputs that earlier versions accepted.
 
 ### 2. Rehearse the cutover on a restored database
 

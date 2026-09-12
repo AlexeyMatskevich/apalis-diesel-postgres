@@ -22,9 +22,9 @@ orphan re-enqueue, admin queries, and `MakeShared` for many-queue setups.
 ## Status
 
 Targets the Apalis 1.0 release candidate: `apalis-core 1.0.0-rc.9`,
-`apalis-sql 1.0.0-rc.9`, `apalis-codec 0.1.0-rc.9`, `diesel >=2.3.10`.
+`apalis-sql 1.0.0-rc.9`, `apalis-codec 0.1.0-rc.9`, `diesel >=2.3.13`.
 Uses the Apalis SQL tables (`apalis.jobs`, `apalis.workers`). The
-[0.4.1 to Unreleased upgrade guide](docs/upgrading.md#upgrading-from-041-to-unreleased)
+[0.4.1 to 0.5.0 upgrade guide](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/v0.5.0/docs/upgrading.md#upgrading-from-041-to-050)
 covers Rust API changes, schema migration, deployment order and rollback limits.
 
 MSRV: Rust 1.88.
@@ -37,8 +37,8 @@ PostgreSQL 14–17 have not been validated by the current CI matrix.
 
 ```toml
 [dependencies]
-apalis-diesel-postgres = { version = "0.4", features = ["tokio"] }
-diesel = { version = "2.3.10", features = ["postgres", "r2d2", "chrono", "serde_json"] }
+apalis-diesel-postgres = { version = "0.5", features = ["tokio"] }
+diesel = { version = "2.3.13", features = ["postgres", "r2d2", "chrono", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 ```
 

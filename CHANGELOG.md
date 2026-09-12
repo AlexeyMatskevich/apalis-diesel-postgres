@@ -7,6 +7,8 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.5.0]
+
 ### Added
 
 - `Error::SinkFailed` identifies a buffered enqueue pipeline whose previous
@@ -169,7 +171,7 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Documentation
 
-- The [0.4.1 to Unreleased upgrade guide](docs/upgrading.md#upgrading-from-041-to-unreleased)
+- The [0.4.1 to 0.5.0 upgrade guide](docs/upgrading.md#upgrading-from-041-to-050)
   lists application API changes, database cutover steps, validation and rollback
   limits for installations based on the `v0.4.1` release.
 - `lock_task` and `lock_task_in_queue` document `ClaimOutcomeUnknown`, its original
@@ -358,7 +360,8 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 See the git history for changes before this changelog was introduced.
 
-[Unreleased]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AlexeyMatskevich/apalis-diesel-postgres/compare/v0.2.0...v0.3.0
