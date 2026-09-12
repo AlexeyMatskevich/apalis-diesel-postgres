@@ -84,9 +84,8 @@ pub(super) fn claimed_task_row(row: JobRow) -> Result<PgTask<CompactType>, Error
 
 /// Chunk an id stream into batches and resolve each batch into tasks via
 /// `queue_by_id`. Shared between the notify and shared-listener fetchers,
-/// which previously inlined the same `ready_chunks(...).then(queue_by_id)`
-/// shape — keeping it in one place ensures any change to batching/back-
-/// pressure semantics applies to both backends.
+/// preserving both a listener error and any IDs received before it. An error
+/// ends a batch, but does not discard its successful prefix or later input.
 pub(crate) fn batch_ids_into_tasks<S>(
     pool: PgPool,
     queue: String,
@@ -98,28 +97,37 @@ pub(crate) fn batch_ids_into_tasks<S>(
 where
     S: futures::Stream<Item = Result<crate::PgTaskId, Error>> + Send + 'static,
 {
-    use futures::{StreamExt, future::ready, stream};
+    use futures::{StreamExt, TryStreamExt, stream};
 
-    let chunk = chunk_size.max(1);
-    ids.ready_chunks(chunk)
-        .then(move |events| {
+    ids.try_ready_chunks(chunk_size.max(1))
+        .flat_map(move |chunk| {
+            let (ids, failure) = match chunk {
+                Ok(ids) => (ids, None),
+                Err(futures::stream::TryReadyChunksError(ids, error)) => (ids, Some(error)),
+            };
             let pool = pool.clone();
             let queue = queue.clone();
             let worker_id = worker_id.clone();
             let lease_token = lease_token.clone();
-            async move {
-                let ids = events
-                    .into_iter()
-                    .map(|event| event.map(|task_id| task_id.to_string()))
-                    .collect::<Result<Vec<_>, Error>>()?;
-                fetch::queue_by_id(pool, queue, ids, worker_id, lease_token)
-                    .await
-                    .map(|tasks| tasks.into_iter().map(Some).collect::<Vec<_>>())
-            }
-        })
-        .flat_map(|tasks| match tasks {
-            Ok(tasks) => stream::iter(tasks.into_iter().map(Ok)).boxed(),
-            Err(error) => stream::once(ready(Err(error))).boxed(),
+            let failures = stream::iter(failure.into_iter().map(Err));
+            let tasks = stream::once(async move {
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                fetch::queue_by_id(
+                    pool,
+                    queue,
+                    ids.into_iter().map(|id| id.to_string()).collect(),
+                    worker_id,
+                    lease_token,
+                )
+                .await
+            })
+            .flat_map(|tasks| match tasks {
+                Ok(tasks) => stream::iter(tasks.into_iter().map(|task| Ok(Some(task)))).boxed(),
+                Err(error) => stream::iter([Err(error)]).boxed(),
+            });
+            failures.chain(tasks)
         })
 }
 #[cfg(test)]
@@ -194,11 +202,31 @@ mod tests {
         }
     }
 
-    fn row_error(error: &Error) -> AssertionResult {
+    fn id_row_error(error: &Error) -> AssertionResult {
         match error {
-            Error::Row(_) => Ok(()),
+            Error::Row(cause)
+                if cause
+                    .downcast_ref::<apalis_core::task::task_id::TaskIdError<ulid::DecodeError>>()
+                    .is_some() =>
+            {
+                Ok(())
+            }
             other => Err(AssertionError::new(vec![format!(
-                "expected Error::Row, got {other:?}"
+                "expected ULID parse cause, got {other:?}"
+            )])),
+        }
+    }
+    fn status_row_error(error: &Error) -> AssertionResult {
+        match error {
+            Error::Row(cause)
+                if cause
+                    .downcast_ref::<apalis_core::task::status::StatusError>()
+                    .is_some() =>
+            {
+                Ok(())
+            }
+            other => Err(AssertionError::new(vec![format!(
+                "expected status parse cause, got {other:?}"
             )])),
         }
     }
@@ -212,68 +240,31 @@ mod tests {
         }
     }
 
-    fn task_result_done_with_payload(
-        result: &apalis_core::backend::TaskResult<String, Ulid>,
-    ) -> AssertionResult {
-        if result.status != Status::Done {
-            return Err(AssertionError::new(vec![format!(
-                "expected Status::Done, got {:?}",
-                result.status
-            )]));
-        }
-        match &result.result {
-            Ok(value) if value == "processed" => Ok(()),
-            Ok(other) => Err(AssertionError::new(vec![format!(
-                "expected payload \"processed\", got {other:?}"
-            )])),
-            Err(message) => Err(AssertionError::new(vec![format!(
-                "expected Ok payload, got Err({message:?})"
-            )])),
-        }
-    }
-
-    fn task_result_failed_with_message(
-        result: &apalis_core::backend::TaskResult<String, Ulid>,
-    ) -> AssertionResult {
-        if result.status != Status::Failed {
-            return Err(AssertionError::new(vec![format!(
-                "expected Status::Failed, got {:?}",
-                result.status
-            )]));
-        }
-        match &result.result {
-            Err(message) if message == "boom" => Ok(()),
-            Err(other) => Err(AssertionError::new(vec![format!(
-                "expected Err message \"boom\", got {other:?}"
-            )])),
-            Ok(value) => Err(AssertionError::new(vec![format!(
-                "expected Err payload, got Ok({value:?})"
-            )])),
-        }
-    }
-
-    fn task_result_killed_with_message(
-        result: &apalis_core::backend::TaskResult<String, Ulid>,
-    ) -> AssertionResult {
-        if result.status != Status::Killed {
-            return Err(AssertionError::new(vec![format!(
-                "expected Status::Killed, got {:?}",
-                result.status
-            )]));
-        }
-        match &result.result {
-            Err(message) if message == "boom" => Ok(()),
-            Err(other) => Err(AssertionError::new(vec![format!(
-                "expected Err message \"boom\", got {other:?}"
-            )])),
-            Ok(value) => Err(AssertionError::new(vec![format!(
-                "expected Err payload, got Ok({value:?})"
-            )])),
+    fn exact_task_result(
+        expected_status: Status,
+        success: bool,
+    ) -> impl Fn(&apalis_core::backend::TaskResult<String, Ulid>) -> AssertionResult {
+        move |result| {
+            let expected_result = if success {
+                Ok("processed".to_owned())
+            } else {
+                Err("boom".to_owned())
+            };
+            if result.task_id.to_string() == "01HABCDEFGHJKMNPQRSTVWXYZ0"
+                && result.status == expected_status
+                && result.result == expected_result
+            {
+                Ok(())
+            } else {
+                Err(AssertionError::new(vec![format!(
+                    "expected exact ID, {expected_status:?}, {expected_result:?}; got {result:?}"
+                )]))
+            }
         }
     }
 
     lets_expect! {
-        expect(clamp_usize(value)) {
+        expect(clamp_usize(value)) as bounded_batch_size {
             let value = 5_usize;
 
             to returns_the_value_as_i32 { equal(5_i32) }
@@ -294,7 +285,7 @@ mod tests {
             }
         }
 
-        expect(clamp_u64(value)) {
+        expect(clamp_u64(value)) as bounded_numeric_value {
             let value = 5_u64;
 
             to returns_the_value_as_i32 { equal(5_i32) }
@@ -315,7 +306,7 @@ mod tests {
             }
         }
 
-        expect(convert_u32(value)) {
+        expect(convert_u32(value)) as database_integer_argument {
             let value = 5_u32;
 
             to returns_ok_with_the_value { be_ok_and equal(5_i32) }
@@ -333,7 +324,7 @@ mod tests {
             }
         }
 
-        expect(offset_for(page, page_size)) {
+        expect(offset_for(page, page_size)) as task_page_offset {
             let page = 1_u32;
             let page_size: Option<u32> = Some(20);
 
@@ -385,133 +376,274 @@ mod tests {
             }
         }
 
-        expect(task_result_for(id, status, result)) {
-            let id: Option<&'static str> = Some("01HABCDEFGHJKMNPQRSTVWXYZ0");
-            let status: Option<&'static str> = Some("Done");
-            let result: Option<serde_json::Value> = Some(json!({"Ok": "processed"}));
-
-            to returns_the_decoded_task_result { be_ok_and task_result_done_with_payload }
-
-            when row_has_id_status_and_err_payload {
-                let result: Option<serde_json::Value> = Some(json!({"Err": "boom"}));
-                let status: Option<&'static str> = Some("Failed");
-                to returns_the_decoded_failure_result {
-                    be_ok_and task_result_failed_with_message
+        expect(task_result_for(id, status, result)) as required_result_fields {
+            let id: Option<&'static str> = Some("invalid");
+            let status: Option<&'static str> = Some("Unknown");
+            let result: Option<serde_json::Value> = Some(json!({"unexpected": true}));
+            when id_is_present {
+                when status_is_present {
+                    when result_is_present {
+                        to reports_the_first_validation_error { be_err_and id_row_error }
+                    }
+                    when result_is_absent {
+                        let result: Option<serde_json::Value> = None;
+                        to reports_the_first_validation_error { be_err_and missing_field("last_result") }
+                    }
+                }
+                when status_is_absent {
+                    let status: Option<&'static str> = None;
+                    when result_is_present {
+                        to reports_the_first_validation_error { be_err_and missing_field("status") }
+                    }
+                    when result_is_absent {
+                        let result: Option<serde_json::Value> = None;
+                        to reports_the_first_validation_error { be_err_and missing_field("status") }
+                    }
                 }
             }
-
-            when row_has_killed_status_and_err_payload {
-                let result: Option<serde_json::Value> = Some(json!({"Err": "boom"}));
-                let status: Option<&'static str> = Some("Killed");
-                to returns_the_decoded_killed_result {
-                    be_ok_and task_result_killed_with_message
-                }
-            }
-
-            when id_is_missing {
+            when id_is_absent {
                 let id: Option<&'static str> = None;
-                to rejects_with_missing_id { be_err_and missing_field("id") }
+                when status_is_present {
+                    when result_is_present {
+                        to reports_the_first_validation_error { be_err_and missing_field("id") }
+                    }
+                    when result_is_absent {
+                        let result: Option<serde_json::Value> = None;
+                        to reports_the_first_validation_error { be_err_and missing_field("id") }
+                    }
+                }
+                when status_is_absent {
+                    let status: Option<&'static str> = None;
+                    when result_is_present {
+                        to reports_the_first_validation_error { be_err_and missing_field("id") }
+                    }
+                    when result_is_absent {
+                        let result: Option<serde_json::Value> = None;
+                        to reports_the_first_validation_error { be_err_and missing_field("id") }
+                    }
+                }
             }
-
-            when status_is_missing {
-                let status: Option<&'static str> = None;
-                to rejects_with_missing_status { be_err_and missing_field("status") }
-            }
-
-            when last_result_is_missing {
-                let result: Option<serde_json::Value> = None;
-                to rejects_with_missing_last_result { be_err_and missing_field("last_result") }
-            }
-
-            when id_is_not_a_valid_ulid {
+        }
+        expect(task_result_for(id, status, result)) as complete_task_result {
+            let id: Option<&'static str> = Some("01HABCDEFGHJKMNPQRSTVWXYZ0");
+            let status: Option<&'static str> = Some("Unknown");
+            let result: Option<serde_json::Value> = Some(json!({"unexpected": true}));
+            when the_identifier_is_malformed {
                 let id: Option<&'static str> = Some("not-a-ulid");
-                to rejects_with_a_row_error { be_err_and row_error }
+                to rejects_the_identifier_before_other_invalid_values { be_err_and id_row_error }
             }
-
-            when status_is_not_a_known_status {
-                let status: Option<&'static str> = Some("Unknown");
-                to rejects_with_a_row_error { be_err_and row_error }
-            }
-
-            when payload_cannot_be_deserialised_into_the_result_type {
-                let result: Option<serde_json::Value> = Some(json!({"unexpected": true}));
-                to rejects_with_a_json_error { be_err_and json_error }
+            when the_identifier_is_valid {
+                when the_status_is_unknown {
+                    to rejects_the_status_before_the_payload { be_err_and status_row_error }
+                }
+                when the_task_is_pending {
+                    let status: Option<&'static str> = Some("Pending");
+                    when the_result_is_successful {
+                        let result = Some(json!({"Ok": "processed"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Pending, true) }
+                    }
+                    when the_result_is_a_failure {
+                        let result = Some(json!({"Err": "boom"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Pending, false) }
+                    }
+                    when the_payload_is_malformed {
+                        to rejects_the_payload { be_err_and json_error }
+                    }
+                }
+                when the_task_is_queued {
+                    let status: Option<&'static str> = Some("Queued");
+                    when the_result_is_successful {
+                        let result = Some(json!({"Ok": "processed"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Queued, true) }
+                    }
+                    when the_result_is_a_failure {
+                        let result = Some(json!({"Err": "boom"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Queued, false) }
+                    }
+                    when the_payload_is_malformed {
+                        to rejects_the_payload { be_err_and json_error }
+                    }
+                }
+                when the_task_is_running {
+                    let status: Option<&'static str> = Some("Running");
+                    when the_result_is_successful {
+                        let result = Some(json!({"Ok": "processed"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Running, true) }
+                    }
+                    when the_result_is_a_failure {
+                        let result = Some(json!({"Err": "boom"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Running, false) }
+                    }
+                    when the_payload_is_malformed {
+                        to rejects_the_payload { be_err_and json_error }
+                    }
+                }
+                when the_task_is_done {
+                    let status: Option<&'static str> = Some("Done");
+                    when the_result_is_successful {
+                        let result = Some(json!({"Ok": "processed"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Done, true) }
+                    }
+                    when the_result_is_a_failure {
+                        let result = Some(json!({"Err": "boom"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Done, false) }
+                    }
+                    when the_payload_is_malformed {
+                        to rejects_the_payload { be_err_and json_error }
+                    }
+                }
+                when the_task_is_failed {
+                    let status: Option<&'static str> = Some("Failed");
+                    when the_result_is_successful {
+                        let result = Some(json!({"Ok": "processed"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Failed, true) }
+                    }
+                    when the_result_is_a_failure {
+                        let result = Some(json!({"Err": "boom"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Failed, false) }
+                    }
+                    when the_payload_is_malformed {
+                        to rejects_the_payload { be_err_and json_error }
+                    }
+                }
+                when the_task_is_killed {
+                    let status: Option<&'static str> = Some("Killed");
+                    when the_result_is_successful {
+                        let result = Some(json!({"Ok": "processed"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Killed, true) }
+                    }
+                    when the_result_is_a_failure {
+                        let result = Some(json!({"Err": "boom"}));
+                        to preserves_the_complete_result { be_ok_and exact_task_result(Status::Killed, false) }
+                    }
+                    when the_payload_is_malformed {
+                        to rejects_the_payload { be_err_and json_error }
+                    }
+                }
             }
         }
     }
 
-    /// Build a pool that never opens a connection (`min_idle(0)`), so
-    /// `batch_ids_into_tasks` can be driven for branches that short-circuit
-    /// before `queue_by_id` ever touches the database.
-    fn lazy_pool() -> PgPool {
-        crate::unreachable::unreachable_pool()
+    #[derive(Clone, Copy)]
+    enum Hints {
+        Empty,
+        Mixed,
+        Errors,
     }
 
-    // an `Err` element anywhere in the id stream must fail-fast the
-    // whole chunk — the collect into `Result<Vec<_>, Error>` short-circuits on
-    // the first error, so `queue_by_id` is never invoked and the output stream
-    // yields exactly one `Err` (not a skip-and-continue). Because the error
-    // aborts the chunk before any DB access, the lazy pool is never touched.
-    #[test]
-    fn batch_ids_into_tasks_propagates_a_stream_error_as_a_single_err() {
+    type HintResult = Result<Option<PgTask<CompactType>>, Error>;
+
+    fn rejected_hint_chunks(
+        shape: Hints,
+        capacity: usize,
+        error_position: usize,
+    ) -> Vec<HintResult> {
         use futures::{StreamExt, executor::block_on, stream};
-
-        let good = crate::PgTaskId::new(Ulid::new());
-        let ids = stream::iter(vec![
-            Ok(good),
-            Err(Error::InvalidArgument("decode failed".to_owned())),
-            Ok(crate::PgTaskId::new(Ulid::new())),
-        ]);
-
-        let out: Vec<Result<Option<PgTask<CompactType>>, Error>> = block_on(
-            batch_ids_into_tasks(
-                lazy_pool(),
-                "queue".to_owned(),
-                "worker".to_owned(),
-                8,
-                ids,
-                None,
-            )
-            .collect(),
-        );
-
-        // The entire chunk collapses to a single Err carrying the decode error;
-        // the surrounding Ok ids are dropped, not emitted as tasks.
-        assert_eq!(out.len(), 1, "expected exactly one Err, got {out:?}");
-        match &out[0] {
-            Err(Error::InvalidArgument(message)) => {
-                assert_eq!(message, "decode failed")
-            }
-            other => panic!("expected InvalidArgument(\"decode failed\"), got {other:?}"),
+        let hints = (0..if matches!(shape, Hints::Empty) { 0 } else { 3 })
+            .map(|index| {
+                if matches!(shape, Hints::Errors) || index == error_position {
+                    Err(Error::InvalidArgument(format!("notification {index}")))
+                } else {
+                    Ok(crate::PgTaskId::new(Ulid::new()))
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut output = batch_ids_into_tasks(
+            crate::unreachable::unreachable_pool(),
+            "queue".to_owned(),
+            "worker".to_owned(),
+            capacity,
+            stream::iter(hints),
+            None,
+        )
+        .boxed();
+        if matches!(shape, Hints::Mixed) {
+            // The retained hints need SQL; inspect only the preceding listener
+            // error here. Database regressions assert the complete task stream.
+            block_on(output.next()).into_iter().collect()
+        } else {
+            block_on(output.collect())
         }
     }
 
-    // `chunk_size == 0` must be guarded by `chunk_size.max(1)` so
-    // `ready_chunks(0)` cannot panic (`ready_chunks` asserts capacity > 0). With
-    // an empty id stream no chunk is ever produced, so the stream completes
-    // empty instead of panicking, and `queue_by_id` is never reached.
-    #[test]
-    fn batch_ids_into_tasks_with_zero_chunk_size_does_not_panic() {
-        use futures::{StreamExt, executor::block_on, stream};
+    fn exact_hint_errors(positions: Vec<usize>) -> impl Fn(&Vec<HintResult>) -> AssertionResult {
+        move |results| {
+            let expected = positions
+                .iter()
+                .map(|i| format!("notification {i}"))
+                .collect::<Vec<_>>();
+            let actual = results
+                .iter()
+                .map(|result| match result {
+                    Err(Error::InvalidArgument(message)) => Some(message.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            if actual.as_ref() == Some(&expected) {
+                Ok(())
+            } else {
+                Err(AssertionError::new(vec![format!(
+                    "expected {expected:?}, got {results:?}"
+                )]))
+            }
+        }
+    }
 
-        let ids = stream::iter(Vec::<Result<crate::PgTaskId, Error>>::new());
-
-        let out: Vec<Result<Option<PgTask<CompactType>>, Error>> = block_on(
-            batch_ids_into_tasks(
-                lazy_pool(),
-                "queue".to_owned(),
-                "worker".to_owned(),
-                0,
-                ids,
-                None,
-            )
-            .collect(),
-        );
-
-        // Guard held: no panic from `ready_chunks(0)`, empty input yields no
-        // output batches.
-        assert!(out.is_empty(), "expected no output, got {out:?}");
+    lets_expect! {
+        expect(rejected_hint_chunks(Hints::Empty, capacity, 0)) as empty_notification_stream {
+            let capacity = 0;
+            to ends_without_a_batch { exact_hint_errors(vec![]) }
+            when capacity_is_one {
+                let capacity = 1;
+                to ends_without_a_batch { exact_hint_errors(vec![]) }
+            }
+            when capacity_is_larger {
+                let capacity = 8;
+                to ends_without_a_batch { exact_hint_errors(vec![]) }
+            }
+        }
+        expect(rejected_hint_chunks(Hints::Mixed, capacity, error_position)) as rejected_notification_batch {
+            let capacity = 3;
+            let error_position = 0;
+            to reports_the_error_before_claiming_retained_hints { exact_hint_errors(vec![0]) }
+            when the_middle_hint_is_invalid {
+                let error_position = 1;
+                to reports_the_error_before_claiming_retained_hints { exact_hint_errors(vec![1]) }
+            }
+            when the_last_hint_is_invalid {
+                let error_position = 2;
+                to reports_the_error_before_claiming_retained_hints { exact_hint_errors(vec![2]) }
+            }
+            when capacity_exceeds_the_batch {
+                let capacity = 8;
+                to reports_the_error_before_claiming_retained_hints { exact_hint_errors(vec![0]) }
+                when the_middle_hint_is_invalid {
+                    let error_position = 1;
+                    to reports_the_error_before_claiming_retained_hints { exact_hint_errors(vec![1]) }
+                }
+                when the_last_hint_is_invalid {
+                    let error_position = 2;
+                    to reports_the_error_before_claiming_retained_hints { exact_hint_errors(vec![2]) }
+                }
+            }
+        }
+        expect(rejected_hint_chunks(Hints::Errors, capacity, 0)) as invalid_notification_stream {
+            let capacity = 0;
+            to returns_each_single_hint_error { exact_hint_errors(vec![0,1,2]) }
+            when capacity_is_one {
+                let capacity = 1;
+                to returns_each_single_hint_error { exact_hint_errors(vec![0,1,2]) }
+            }
+            when capacity_exceeds_the_stream {
+                let capacity = 8;
+                to returns_every_hint_error { exact_hint_errors(vec![0,1,2]) }
+            }
+        }
     }
 }
 
 pub(crate) mod migrations;
+
+#[cfg(all(test, feature = "tokio"))]
+#[path = "../query_specs/notification_regressions.rs"]
+mod notification_regressions;

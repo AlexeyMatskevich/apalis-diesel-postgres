@@ -27,6 +27,8 @@
 
 #![cfg(feature = "tokio")]
 
+#[path = "support/notify.rs"]
+mod notify_support;
 mod support;
 
 use std::time::Duration;
@@ -73,7 +75,7 @@ async fn test_pool_multi() -> Result<Option<PgPool>, String> {
     // These scenarios need ≥2 simultaneous connections (one pinned to the LISTEN
     // observer thread, one for the writer); the shared per-binary pool is sized
     // well above that.
-    support::shared_pool().await
+    notify_support::isolated_listener_pool().await
 }
 
 async fn with_conn<F, T>(pool: PgPool, work: F) -> Result<T, String>
@@ -363,8 +365,7 @@ async fn run_on_conflict_no_notify() -> Result<Outcome<TriggerRun>, String> {
         .map(|_| ())
     })
     .await?;
-    // Give the seed's NOTIFY time to flush out of any session buffer.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // LISTEN starts after this commit, so the seed cannot appear in the capture.
 
     let queue_for_writer = queue.clone();
     let conflict_id = existing_id;
@@ -437,13 +438,18 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
     .await?;
 
     // Spin up the storage stream (it LISTENs).
-    let config = Config::new(&queue).set_buffer_size(8);
+    let config = Config::new(&queue).set_buffer_size(8).with_poll_interval(
+        apalis_core::backend::poll_strategy::StrategyBuilder::new()
+            .apply(apalis_core::backend::poll_strategy::StreamStrategy::new(
+                futures::stream::pending::<()>(),
+            ))
+            .build(),
+    );
     let storage = PostgresStorage::<String>::new_with_notify(&pool, &config);
     let worker = WorkerContext::new::<()>(&format!("notify-legacy-worker-{queue}"));
     let mut stream = storage.clone().poll(&worker);
 
-    // Let the listener thread install LISTEN before we fire the NOTIFY.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    notify_support::wait_for_listeners(&pool, 1).await?;
 
     // Flip run_at into the past so the row is fetchable when the listener
     // sees the id, then publish a legacy-shaped NOTIFY payload.
@@ -639,15 +645,17 @@ fn legacy_payload_delivered_target_row()
 // --------------------------------------------------------------------------
 
 lets_expect! { #tokio_test
-    expect(run_single_row_insert().await) {
+    expect(run_single_row_insert().await) as single_insert_notification {
         when a_single_eligible_row_is_inserted_via_the_statement_level_trigger {
-            to emits_exactly_one_notify_payload { produced_exactly_one_payload() }
-            to uses_the_post_migration_ids_array_shape { payload_uses_ids_array_shape() }
-            to carries_the_single_inserted_id { payload_carries_a_single_id() }
+            to emits_one_array_payload_with_the_exact_inserted_id {
+                produced_exactly_one_payload(),
+                payload_uses_ids_array_shape(),
+                payload_carries_a_single_id()
+            }
         }
     }
 
-    expect(run_future_dated_insert().await) {
+    expect(run_future_dated_insert().await) as scheduled_insert_notification {
         when the_inserted_row_is_scheduled_for_a_future_run_at {
             // Trigger filters `WHERE run_at <= cutoff`, so a future-dated
             // row is intentionally invisible until the polling fetcher or a
@@ -656,19 +664,17 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_batch_insert_chunks().await) {
+    expect(run_batch_insert_chunks().await) as batched_insert_notifications {
         when a_single_statement_inserts_more_rows_than_the_chunk_cap {
             // 150 rows → chunk size 100 → two NOTIFY payloads (100 + 50).
             to chunks_the_payloads_at_one_hundred_ids_each {
-                payloads_are_chunked_at_one_hundred(&[100, 50])
-            }
-            to emits_more_than_one_payload_for_the_batch {
+                payloads_are_chunked_at_one_hundred(&[100, 50]),
                 produced_at_least_two_payloads()
             }
         }
     }
 
-    expect(run_on_conflict_no_notify().await) {
+    expect(run_on_conflict_no_notify().await) as deduplicated_insert_notifications {
         when an_insert_collides_on_the_primary_key_and_does_nothing {
             // Transition table excludes skipped rows, COUNT(*) = 0 fires the
             // trigger's early-return — no NOTIFY for a no-op INSERT.
@@ -676,13 +682,13 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_legacy_payload_decoded().await) {
+    expect(run_legacy_payload_decoded().await) as legacy_notification_delivery {
         when a_hand_crafted_legacy_job_type_id_payload_is_published {
             // Exercises the back-compat branch of `InsertEvent::into_ids`:
             // `ids` is empty, `id` is Some(_), so the listener forwards the
             // single legacy id. The row was made fetchable by an UPDATE that
             // bypasses the AFTER INSERT trigger so no real NOTIFY races us.
-            to is_decoded_and_surfaces_the_referenced_task_id {
+            to delivers_the_referenced_task {
                 legacy_payload_delivered_target_row()
             }
         }

@@ -71,30 +71,26 @@ fn classify_delivery<T>(result: Result<(), mpsc::TrySendError<T>>) -> DeliveryOu
     }
 }
 
-pub(crate) fn notify_task_ids(
-    pool: PgPool,
-    queue: String,
-    capacity: usize,
-) -> impl Stream<Item = Result<PgTaskId, Error>> + Send {
+pub(crate) fn notify_task_ids(pool: PgPool, queue: String, capacity: usize) -> NotifyTaskIds {
     let (mut sender, receiver) = mpsc::channel(clamp_notify_capacity(capacity));
     let cancel = Arc::new(AtomicBool::new(false));
     let thread_cancel = cancel.clone();
-    let mut spawn_error_sender = sender.clone();
-    let thread_pool = pool.clone();
+    let errors = Arc::new(crate::notify_event::NotificationErrors::default());
+    let listener_errors = errors.clone();
     if let Err(error) = std::thread::Builder::new()
         .name("apalis-postgres-notify".to_owned())
         .spawn(move || {
-            let mut conn = match thread_pool.get() {
+            let mut conn = match pool.get() {
                 Ok(conn) => conn,
                 Err(error) => {
-                    let _ = sender.try_send(Err(Error::from(error)));
+                    listener_errors.publish(Error::from(error));
                     return;
                 }
             };
             if let Err(error) = sql_query("LISTEN \"apalis::job::insert\"").execute(&mut conn) {
-                let _ = sender.try_send(Err(Error::database(
+                listener_errors.publish(Error::database(
                     "starting PostgreSQL LISTEN notification listener",
-                )(error)));
+                )(error));
                 return;
             }
             // Ensure the LISTEN subscription is removed before the pooled
@@ -112,9 +108,9 @@ pub(crate) fn notify_task_ids(
                     let notification = match notification {
                         Ok(notification) => notification,
                         Err(error) => {
-                            let _ = sender.try_send(Err(Error::database(
+                            listener_errors.publish(Error::database(
                                 "receiving PostgreSQL notification",
-                            )(error)));
+                            )(error));
                             break 'listen;
                         }
                     };
@@ -127,7 +123,7 @@ pub(crate) fn notify_task_ids(
                         continue;
                     }
                     for id in ids {
-                        match classify_delivery(sender.try_send(Ok(id))) {
+                        match classify_delivery(sender.try_send(id)) {
                             DeliveryOutcome::Delivered => {}
                             DeliveryOutcome::ReceiverGone => break 'listen,
                             // Channel full: drop the wakeup. The job is durable
@@ -144,57 +140,82 @@ pub(crate) fn notify_task_ids(
                 // available without unsafe FFI. Until that is added, sleep
                 // long enough to keep wakeup CPU usage negligible while
                 // remaining well below the polling fetcher's tick. The
-                // companion `Drop` impl issues a `pg_notify` so that, after
-                // this sleep elapses, the next `notifications_iter` call
-                // returns immediately and the cancel flag is observed without
-                // an additional poll interval of latency.
+                // cancel flag is checked after the interval. Diesel's
+                // notifications_iter is nonblocking, so Drop needs no SQL wakeup.
                 std::thread::sleep(NOTIFY_LISTENER_POLL_INTERVAL);
             }
             unlisten(&mut conn);
         })
     {
-        let _ = spawn_error_sender.try_send(Err(Error::NotifyListener(error.to_string())));
+        errors.publish(Error::NotifyListener(error.to_string()));
     }
     NotifyTaskIds {
         receiver,
         cancel,
-        pool,
+        errors,
     }
 }
 
 pub(crate) struct NotifyTaskIds {
-    receiver: mpsc::Receiver<Result<PgTaskId, Error>>,
+    receiver: mpsc::Receiver<PgTaskId>,
     cancel: Arc<AtomicBool>,
-    pool: PgPool,
+    errors: Arc<crate::notify_event::NotificationErrors>,
 }
 
 impl Stream for NotifyTaskIds {
     type Item = Result<PgTaskId, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(cx)
+        if let Some(error) = self.errors.take(cx) {
+            return Poll::Ready(Some(Err(error)));
+        }
+        let next = Pin::new(&mut self.receiver).poll_next(cx);
+        // Failure publication precedes sender drop. Recheck before reporting
+        // EOF in case the listener failed between the first check and this poll.
+        if matches!(next, Poll::Ready(None))
+            && let Some(error) = self.errors.take(cx)
+        {
+            return Poll::Ready(Some(Err(error)));
+        }
+        next.map(|item| item.map(Ok))
     }
 }
 
 impl Drop for NotifyTaskIds {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
-        // Best-effort wakeup: detach the blocking NOTIFY onto a dedicated
-        // thread so we never block the dropping async task (which may be
-        // running on an async executor). The listener thread is parked inside
-        // libpq's `notifications_iter`; we cannot interrupt it directly, but
-        // sending a NOTIFY forces the iterator to return so the cancel flag is
-        // re-checked. The empty payload fails `serde_json::from_str` so no
-        // listener consumes it as a real wakeup.
-        let pool = self.pool.clone();
-        let _ = std::thread::Builder::new()
-            .name("apalis-postgres-notify-drop".to_owned())
-            .spawn(move || {
-                if let Ok(mut conn) = pool.get() {
-                    let _ =
-                        sql_query("SELECT pg_notify('apalis::job::insert', '')").execute(&mut conn);
-                }
-            });
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn state(source: &NotifyTaskIds) -> (usize, bool) {
+        (
+            source.receiver.size_hint().0,
+            crate::notify_event::test_support::has_pending_error(&source.errors),
+        )
+    }
+
+    pub(crate) fn saturated(ids: &[PgTaskId]) -> (NotifyTaskIds, Vec<PgTaskId>) {
+        let (mut sender, receiver) = mpsc::channel(1);
+        let mut accepted = Vec::new();
+        for &id in ids {
+            match classify_delivery(sender.try_send(id)) {
+                DeliveryOutcome::Delivered => accepted.push(id),
+                DeliveryOutcome::ChannelFull => {}
+                DeliveryOutcome::ReceiverGone => panic!("fresh receiver disconnected"),
+            }
+        }
+        (
+            NotifyTaskIds {
+                receiver,
+                cancel: Arc::new(AtomicBool::new(false)),
+                errors: Arc::new(crate::notify_event::NotificationErrors::default()),
+            },
+            accepted,
+        )
     }
 }
 
@@ -203,6 +224,51 @@ mod tests {
     use lets_expect::*;
 
     use super::*;
+    use crate::notify_event::test_support::{
+        HintObservation, hint_channel, observe_hints, preserves_hints_and_failure,
+    };
+
+    fn error_observation(full: bool, failures: usize) -> HintObservation {
+        let (_sender, receiver, expected) = hint_channel(full);
+        let errors = Arc::new(crate::notify_event::NotificationErrors::default());
+        let stream = NotifyTaskIds {
+            receiver,
+            errors: errors.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        for index in 0..failures {
+            errors.publish(Error::NotifyListener(format!("failure-{index}")));
+        }
+        observe_hints(stream, expected)
+    }
+
+    lets_expect! {
+        expect(error_observation(full, failures)) as single_listener_failure {
+            let full = false;
+            let failures = 0_usize;
+            to has_no_failure_when_the_listener_is_healthy { preserves_hints_and_failure(None) }
+            when the_hint_buffer_is_full {
+                let full = true;
+                to preserves_the_queued_hints { preserves_hints_and_failure(None) }
+                when the_listener_fails {
+                    let failures = 1_usize;
+                    to delivers_the_error_and_preserves_every_hint { preserves_hints_and_failure(Some("failure-0")) }
+                }
+                when the_listener_fails_again_before_observation {
+                    let failures = 2_usize;
+                    to preserves_the_first_failure_without_growing_the_error_queue { preserves_hints_and_failure(Some("failure-0")) }
+                }
+            }
+            when the_listener_fails {
+                let failures = 1_usize;
+                to delivers_the_error_before_waiting_for_hints { preserves_hints_and_failure(Some("failure-0")) }
+            }
+            when the_listener_fails_again_before_observation {
+                let failures = 2_usize;
+                to coalesces_the_unobserved_failures { preserves_hints_and_failure(Some("failure-0")) }
+            }
+        }
+    }
 
     fn classify_a_delivered_send() -> DeliveryOutcome {
         let (mut sender, _receiver) = mpsc::channel::<i32>(1);
@@ -228,7 +294,7 @@ mod tests {
     }
 
     lets_expect! {
-        expect(clamp_capacity(capacity)) {
+        expect(clamp_capacity(capacity)) as notification_capacity {
             let capacity = 8_usize;
 
             // Default state: a caller value comfortably inside the valid range.
@@ -253,13 +319,13 @@ mod tests {
             }
         }
 
-        expect(classify_a_delivered_send()) {
+        expect(classify_a_delivered_send()) as delivered_notification {
             when the_channel_accepts_the_id {
                 to reports_the_id_as_delivered { equal(DeliveryOutcome::Delivered) }
             }
         }
 
-        expect(classify_a_full_channel()) {
+        expect(classify_a_full_channel()) as full_notification_channel {
             when the_channel_is_full_but_still_connected {
                 to drops_the_wakeup_without_stopping_the_listener {
                     equal(DeliveryOutcome::ChannelFull)
@@ -267,7 +333,7 @@ mod tests {
             }
         }
 
-        expect(classify_a_dropped_receiver()) {
+        expect(classify_a_dropped_receiver()) as closed_notification_channel {
             when the_receiver_has_been_dropped {
                 to signals_the_listener_to_stop { equal(DeliveryOutcome::ReceiverGone) }
             }

@@ -198,9 +198,9 @@ impl PgFetcherSource for PgNotify {
 /// Real batching is provided upstream by the statement-level NOTIFY trigger
 /// (migration 20260521000001), which emits one event per (queue, INSERT
 /// statement) carrying all inserted ids in `ids`. By the time those ids land
-/// in the mpsc channel they are already contiguous, so `ready_chunks` (inside
+/// in the mpsc channel they are already contiguous, so `try_ready_chunks` (inside
 /// `batch_ids_into_tasks`) folds them into one batch in the common bursty
-/// case.
+/// case while retaining accepted IDs on either side of an error.
 pub(crate) fn notify_backed_compact_stream<Ids>(
     storage_name: &'static str,
     ids: Ids,

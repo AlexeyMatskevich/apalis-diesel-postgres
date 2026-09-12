@@ -10,12 +10,12 @@ use std::{
 };
 
 /// `SharedRegistry` now stores **multiple senders per queue** instead of a
-/// single `Arc<Mutex<Receiver>>` shared by clones. Each consumer
-/// (`make_shared_with_config` call or `SharedFetcher::clone`) gets its own
+/// single `Arc<Mutex<Receiver>>` shared by clones. Each consumer created by
+/// `make_shared_with_config` gets its own
 /// mpsc channel; the listener broadcasts to every sender bound to the matching
 /// `job_type`. This removes the `Arc<Mutex<Receiver>>` contention smell and
 /// lets fetcher polls run without mutex acquisition.
-type RegistrySender = Sender<Result<PgTaskId, Error>>;
+type RegistrySender = Sender<PgTaskId>;
 
 use apalis_codec::json::JsonCodec;
 use apalis_core::{backend::shared::MakeShared, worker::context::WorkerContext};
@@ -36,7 +36,11 @@ use crate::{
 /// that `SharedRegistration::drop` can prune only its own sender from the
 /// queue's Vec instead of wiping the whole entry (which would silently sever
 /// every other consumer on the same queue).
-type RegistryEntry = (Ulid, RegistrySender);
+type RegistryEntry = (
+    Ulid,
+    RegistrySender,
+    Arc<crate::notify_event::NotificationErrors>,
+);
 type RegistryMap = HashMap<String, Vec<RegistryEntry>>;
 type SharedRegistry = Arc<Mutex<RegistryMap>>;
 
@@ -227,7 +231,7 @@ fn exit_listener(registry: &SharedRegistry, listener_alive: &AtomicBool, error: 
 fn deliver_to_queue(registry: &mut RegistryMap, queue: &str, ids: &[PgTaskId]) {
     if let Some(senders) = registry.get_mut(queue) {
         for &id in ids {
-            senders.retain_mut(|(_, sender)| match sender.try_send(Ok(id)) {
+            senders.retain_mut(|(_, sender, _)| match sender.try_send(id) {
                 Ok(()) => true,
                 Err(error) if error.is_disconnected() => false,
                 // Channel full: drop this wakeup but keep the sender registered
@@ -275,11 +279,12 @@ fn broadcast_notify_error(registry: &SharedRegistry, message: String) {
 
 fn broadcast_notify_error_locked(registry: &mut RegistryMap, message: String) {
     registry.retain(|_, senders| {
-        senders.retain_mut(|(_, sender)| {
-            match sender.try_send(Err(Error::NotifyListener(message.clone()))) {
-                Ok(()) => true,
-                Err(error) => !error.is_disconnected(),
+        senders.retain_mut(|(_, sender, errors)| {
+            if sender.is_closed() {
+                return false;
             }
+            errors.publish(Error::NotifyListener(message.clone()));
+            true
         });
         !senders.is_empty()
     });
@@ -319,6 +324,7 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
     ) -> Result<Self::Backend, Self::MakeError> {
         let (sender, receiver) =
             mpsc::channel(crate::queries::clamp_notify_capacity(config.buffer_size()));
+        let errors = Arc::new(crate::notify_event::NotificationErrors::default());
         let mut registry = self
             .registry
             .lock()
@@ -341,7 +347,7 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
         registry
             .entry(queue)
             .or_default()
-            .push((registration_id, sender));
+            .push((registration_id, sender, errors.clone()));
         let should_spawn_listener = claim_listener_spawn(&self.listener_alive);
         drop(registry);
 
@@ -353,7 +359,6 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
             id: registration_id,
             queue: config.queue().to_string(),
             registry: self.registry.clone(),
-            pool: self.pool.clone(),
         });
 
         Ok(PostgresStorage {
@@ -363,6 +368,7 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
             config,
             fetcher: SharedFetcher {
                 receiver,
+                errors,
                 _registration: registration,
             },
             lease_token: crate::queries::worker::mint_lease_token().into(),
@@ -380,7 +386,6 @@ struct SharedRegistration {
     id: Ulid,
     queue: String,
     registry: SharedRegistry,
-    pool: PgPool,
 }
 
 impl std::fmt::Debug for SharedRegistration {
@@ -393,39 +398,16 @@ impl std::fmt::Debug for SharedRegistration {
 
 impl Drop for SharedRegistration {
     fn drop(&mut self) {
-        let became_empty = match self.registry.lock() {
-            Ok(mut registry) => {
-                // Prune only this registration's sender from the queue's
-                // Vec. If the Vec becomes empty (we were the last consumer
-                // on this queue), drop the queue entry too.
-                if let Some(senders) = registry.get_mut(&self.queue) {
-                    senders.retain(|(id, _)| *id != self.id);
-                    if senders.is_empty() {
-                        registry.remove(&self.queue);
-                    }
+        if let Ok(mut registry) = self.registry.lock() {
+            // Prune only this registration's sender from the queue's
+            // Vec. If the Vec becomes empty (we were the last consumer
+            // on this queue), drop the queue entry too.
+            if let Some(senders) = registry.get_mut(&self.queue) {
+                senders.retain(|(id, _, _)| *id != self.id);
+                if senders.is_empty() {
+                    registry.remove(&self.queue);
                 }
-                registry.is_empty()
             }
-            Err(_) => false,
-        };
-        // When the registry becomes empty the shared listener thread will exit
-        // on its next loop iteration, but it is parked inside
-        // `notifications_iter`. Send a best-effort NOTIFY so the iterator
-        // returns and the empty-registry check runs immediately. The empty
-        // payload fails `serde_json::from_str::<InsertEvent>`, so any other
-        // listener simply ignores it.
-        if became_empty {
-            // Detach the blocking NOTIFY so the dropping task — which may be
-            // running on an async executor — never blocks on libpq.
-            let pool = self.pool.clone();
-            let _ = std::thread::Builder::new()
-                .name("apalis-postgres-shared-drop".to_owned())
-                .spawn(move || {
-                    if let Ok(mut conn) = pool.get() {
-                        let _ = diesel::sql_query("SELECT pg_notify('apalis::job::insert', '')")
-                            .execute(&mut conn);
-                    }
-                });
         }
     }
 }
@@ -441,7 +423,8 @@ impl Drop for SharedRegistration {
 /// [`SharedPostgresStorage::make_shared_with_config`] to spawn additional
 /// consumers explicitly.
 pub struct SharedFetcher {
-    receiver: Receiver<Result<PgTaskId, Error>>,
+    receiver: Receiver<PgTaskId>,
+    errors: Arc<crate::notify_event::NotificationErrors>,
     _registration: Arc<SharedRegistration>,
 }
 
@@ -455,7 +438,13 @@ impl Stream for SharedFetcher {
     type Item = Result<PgTaskId, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().receiver).poll_next(cx)
+        let this = self.get_mut();
+        if let Some(error) = this.errors.take(cx) {
+            return Poll::Ready(Some(Err(error)));
+        }
+        Pin::new(&mut this.receiver)
+            .poll_next(cx)
+            .map(|item| item.map(Ok))
     }
 }
 
@@ -482,12 +471,67 @@ impl crate::fetcher::PgFetcherSource for SharedFetcher {
     }
 }
 
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn state(source: &SharedFetcher) -> (usize, bool) {
+        (
+            source.receiver.size_hint().0,
+            crate::notify_event::test_support::has_pending_error(&source.errors),
+        )
+    }
+
+    pub(crate) fn saturated(ids: &[PgTaskId]) -> (SharedFetcher, Vec<PgTaskId>) {
+        let (mut sender, receiver) = mpsc::channel(1);
+        let mut accepted = Vec::new();
+        for &id in ids {
+            match sender.try_send(id) {
+                Ok(()) => accepted.push(id),
+                Err(error) if error.is_full() => {}
+                Err(error) => panic!("fresh receiver disconnected: {error}"),
+            }
+        }
+        let errors = Arc::new(crate::notify_event::NotificationErrors::default());
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+        let id = Ulid::new();
+        let queue = "bounded-hint-fixture".to_owned();
+        registry
+            .lock()
+            .unwrap()
+            .insert(queue.clone(), vec![(id, sender, errors.clone())]);
+        (
+            SharedFetcher {
+                receiver,
+                errors,
+                _registration: Arc::new(SharedRegistration {
+                    id,
+                    queue,
+                    registry,
+                }),
+            },
+            accepted,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use apalis_core::backend::{Backend, BackendExt, shared::MakeShared};
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
+    use crate::notify_event::test_support::{
+        HintObservation, hint_channel, observe_hints, preserves_hints_and_failure,
+    };
+    use crate::unreachable::unreachable_pool;
+    fn entry(id: Ulid, sender: RegistrySender) -> RegistryEntry {
+        (
+            id,
+            sender,
+            Arc::new(crate::notify_event::NotificationErrors::default()),
+        )
+    }
 
     struct SharedObservation {
         queue: String,
@@ -495,17 +539,13 @@ mod tests {
         debug: String,
     }
 
-    fn unchecked_pool() -> PgPool {
-        crate::unreachable::unreachable_pool()
-    }
-
     fn shared_debug() -> String {
-        let shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
+        let shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         format!("{shared:?}")
     }
 
     fn make_default_shared() -> Result<SharedObservation, SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared(&mut shared)?;
         Ok(SharedObservation {
             queue: storage.config.queue().to_string(),
@@ -515,7 +555,7 @@ mod tests {
     }
 
     fn make_configured_shared() -> Result<SharedObservation, SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let config = Config::new("shared-unit").set_buffer_size(3);
         let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
             &mut shared,
@@ -529,7 +569,7 @@ mod tests {
     }
 
     fn shared_trait_surfaces() -> Result<(String, String), SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let config = Config::new("shared-traits");
         let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
             &mut shared,
@@ -548,14 +588,13 @@ mod tests {
         registry
             .lock()
             .expect("fresh shared registry is not poisoned")
-            .insert("shared-registration".to_owned(), vec![(id, sender)]);
+            .insert("shared-registration".to_owned(), vec![entry(id, sender)]);
 
         let debug = {
             let registration = SharedRegistration {
                 id,
                 queue: "shared-registration".to_owned(),
                 registry: registry.clone(),
-                pool: unchecked_pool(),
             };
             format!("{registration:?}")
         };
@@ -580,10 +619,10 @@ mod tests {
                 .lock()
                 .expect("fresh shared registry is not poisoned");
             let (sender, _r) = mpsc::channel(1);
-            reg.insert(target_queue.to_owned(), vec![(target_id, sender)]);
+            reg.insert(target_queue.to_owned(), vec![entry(target_id, sender)]);
             for sibling in sibling_queues {
                 let (sender, _r) = mpsc::channel(1);
-                reg.insert((*sibling).to_owned(), vec![(Ulid::new(), sender)]);
+                reg.insert((*sibling).to_owned(), vec![entry(Ulid::new(), sender)]);
             }
         }
 
@@ -592,7 +631,6 @@ mod tests {
                 id: target_id,
                 queue: target_queue.to_owned(),
                 registry: registry.clone(),
-                pool: unchecked_pool(),
             };
             drop(registration);
         }
@@ -627,10 +665,10 @@ mod tests {
                 .lock()
                 .expect("fresh shared registry is not poisoned");
             let (sender, _r) = mpsc::channel(1);
-            reg.insert("shared-target".to_owned(), vec![(target_id, sender)]);
+            reg.insert("shared-target".to_owned(), vec![entry(target_id, sender)]);
             for sibling in ["shared-other-a", "shared-other-b"] {
                 let (sender, _r) = mpsc::channel(1);
-                reg.insert(sibling.to_owned(), vec![(Ulid::new(), sender)]);
+                reg.insert(sibling.to_owned(), vec![entry(Ulid::new(), sender)]);
             }
         }
 
@@ -638,7 +676,6 @@ mod tests {
             id: target_id,
             queue: "shared-target".to_owned(),
             registry: registry.clone(),
-            pool: unchecked_pool(),
         });
 
         let reg = registry
@@ -666,14 +703,16 @@ mod tests {
             .expect("fresh registry is not poisoned")
             .insert(
                 queue.clone(),
-                vec![(first_id, first_sender), (second_id, second_sender)],
+                vec![
+                    entry(first_id, first_sender),
+                    entry(second_id, second_sender),
+                ],
             );
 
         drop(SharedRegistration {
             id: first_id,
             queue: queue.clone(),
             registry: registry.clone(),
-            pool: unchecked_pool(),
         });
 
         let guard = registry.lock().expect("registry is not poisoned");
@@ -694,7 +733,7 @@ mod tests {
         registry
             .lock()
             .expect("fresh registry is not poisoned")
-            .insert(queue.clone(), vec![(id, sender)]);
+            .insert(queue.clone(), vec![entry(id, sender)]);
 
         let poison_target = registry.clone();
         let join = std::thread::spawn(move || {
@@ -709,7 +748,6 @@ mod tests {
             id,
             queue: queue.clone(),
             registry: registry.clone(),
-            pool: unchecked_pool(),
         });
 
         // Recover past the poison to confirm the sender was left in place.
@@ -725,7 +763,7 @@ mod tests {
     /// succeeds: the broadcast redesign allows multiple consumers per queue, so
     /// the second `make_shared_with_config` must also return `Ok`.
     fn double_make_shared_same_queue() -> Result<(), SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let config = Config::new("double-make-shared");
         let _first = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
             &mut shared,
@@ -748,12 +786,12 @@ mod tests {
     fn broadcast_notify_error_observation() -> (usize, bool) {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (alive_sender, _alive_receiver) = mpsc::channel(1);
-        let (dead_sender, dead_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (dead_sender, dead_receiver) = mpsc::channel::<PgTaskId>(1);
         drop(dead_receiver);
         {
             let mut reg = registry.lock().expect("fresh registry is not poisoned");
-            reg.insert("alive".to_owned(), vec![(Ulid::new(), alive_sender)]);
-            reg.insert("dead".to_owned(), vec![(Ulid::new(), dead_sender)]);
+            reg.insert("alive".to_owned(), vec![entry(Ulid::new(), alive_sender)]);
+            reg.insert("dead".to_owned(), vec![entry(Ulid::new(), dead_sender)]);
         }
 
         broadcast_notify_error(&registry, "synthetic listener failure".to_owned());
@@ -773,11 +811,11 @@ mod tests {
     /// length after delivery — 0 once the dead sender and its queue are gone.
     fn deliver_prunes_disconnected_sender() -> usize {
         let mut registry: RegistryMap = HashMap::new();
-        let (dead_sender, dead_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (dead_sender, dead_receiver) = mpsc::channel::<PgTaskId>(1);
         drop(dead_receiver);
         registry.insert(
             "shared-deliver-dead".to_owned(),
-            vec![(Ulid::new(), dead_sender)],
+            vec![entry(Ulid::new(), dead_sender)],
         );
         deliver_to_queue(&mut registry, "shared-deliver-dead", &[new_task_id()]);
         registry.len()
@@ -791,10 +829,10 @@ mod tests {
     /// Returns the number of senders still registered on the queue.
     fn deliver_keeps_full_sender() -> usize {
         let mut registry: RegistryMap = HashMap::new();
-        let (full_sender, _full_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (full_sender, _full_receiver) = mpsc::channel::<PgTaskId>(1);
         registry.insert(
             "shared-deliver-full".to_owned(),
-            vec![(Ulid::new(), full_sender)],
+            vec![entry(Ulid::new(), full_sender)],
         );
         let ids = [new_task_id(), new_task_id(), new_task_id(), new_task_id()];
         deliver_to_queue(&mut registry, "shared-deliver-full", &ids);
@@ -813,16 +851,20 @@ mod tests {
     /// only one (e.g. the last) sender would surface here as a `false`.
     fn deliver_broadcasts_id_to_every_live_sender() -> (bool, bool) {
         let mut registry: RegistryMap = HashMap::new();
-        let (first_sender, mut first_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
-        let (second_sender, mut second_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (first_sender, mut first_receiver) = mpsc::channel::<PgTaskId>(1);
+        let (second_sender, mut second_receiver) = mpsc::channel::<PgTaskId>(1);
         registry.insert(
             "shared-deliver-fanout".to_owned(),
-            vec![(Ulid::new(), first_sender), (Ulid::new(), second_sender)],
+            vec![
+                entry(Ulid::new(), first_sender),
+                entry(Ulid::new(), second_sender),
+            ],
         );
         let id = new_task_id();
         deliver_to_queue(&mut registry, "shared-deliver-fanout", &[id]);
 
-        let got_id = |receiver: &mut Receiver<Result<PgTaskId, Error>>| matches!(receiver.try_recv(), Ok(Ok(got)) if got == id);
+        let got_id =
+            |receiver: &mut Receiver<PgTaskId>| matches!(receiver.try_recv(), Ok(got) if got == id);
         (got_id(&mut first_receiver), got_id(&mut second_receiver))
     }
 
@@ -834,8 +876,8 @@ mod tests {
     /// absent_queue_was_created)`.
     fn deliver_to_absent_queue_leaves_others_intact() -> (usize, bool) {
         let mut registry: RegistryMap = HashMap::new();
-        let (sender, _receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
-        registry.insert("shared-other".to_owned(), vec![(Ulid::new(), sender)]);
+        let (sender, _receiver) = mpsc::channel::<PgTaskId>(1);
+        registry.insert("shared-other".to_owned(), vec![entry(Ulid::new(), sender)]);
         deliver_to_queue(&mut registry, "shared-absent", &[new_task_id()]);
         let unrelated_len = registry.get("shared-other").map(Vec::len).unwrap_or(0);
         let absent_created = registry.contains_key("shared-absent");
@@ -851,16 +893,16 @@ mod tests {
     /// `deliver_to_queue`.
     fn broadcast_notify_error_keeps_full_sender() -> usize {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (mut full_sender, _full_receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (mut full_sender, _full_receiver) = mpsc::channel::<PgTaskId>(1);
         // Saturate the single-slot channel so the broadcast's `try_send` hits
         // the `Full` (kept) path rather than the empty `Ok` path.
-        while full_sender.try_send(Ok(new_task_id())).is_ok() {}
+        while full_sender.try_send(new_task_id()).is_ok() {}
         registry
             .lock()
             .expect("fresh registry is not poisoned")
             .insert(
                 "shared-error-full".to_owned(),
-                vec![(Ulid::new(), full_sender)],
+                vec![entry(Ulid::new(), full_sender)],
             );
         broadcast_notify_error(&registry, "synthetic listener failure".to_owned());
         let reg = registry.lock().expect("registry is not poisoned");
@@ -873,34 +915,100 @@ mod tests {
 
     fn registry_with_one_consumer() -> RegistryMap {
         let mut registry: RegistryMap = HashMap::new();
-        let (sender, _receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (sender, _receiver) = mpsc::channel::<PgTaskId>(1);
         registry.insert(
             "shared-still-active".to_owned(),
-            vec![(Ulid::new(), sender)],
+            vec![entry(Ulid::new(), sender)],
         );
         registry
     }
 
-    /// `exit_listener` must both flip `listener_alive` to false and broadcast the
-    /// failure to every registered sender. Returns `(alive_after, error_delivered)`
-    /// — `(false, true)` when both effects happen; the live receiver is kept so the
-    /// broadcast lands.
+    /// Observe this subscriber's error stream together with every queued hint.
+    fn error_observation(full: bool, failures: usize) -> HintObservation {
+        let (sender, receiver, expected) = hint_channel(full);
+        let errors = Arc::new(crate::notify_event::NotificationErrors::default());
+        let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let id = Ulid::new();
+        registry
+            .lock()
+            .unwrap()
+            .insert("error-capacity".into(), vec![(id, sender, errors.clone())]);
+        let registration = Arc::new(SharedRegistration {
+            id,
+            queue: "error-capacity".into(),
+            registry: registry.clone(),
+        });
+        let stream = SharedFetcher {
+            receiver,
+            errors,
+            _registration: registration,
+        };
+        for index in 0..failures {
+            broadcast_notify_error(&registry, format!("failure-{index}"));
+        }
+        observe_hints(stream, expected)
+    }
+
+    lets_expect! {
+        expect(error_observation(full, failures)) as shared_listener_failure {
+            let full = false;
+            let failures = 0_usize;
+            to has_no_failure_when_the_listener_is_healthy { preserves_hints_and_failure(None) }
+            when the_hint_buffer_is_full {
+                let full = true;
+                to preserves_the_queued_hints { preserves_hints_and_failure(None) }
+                when the_listener_fails {
+                    let failures = 1_usize;
+                    to delivers_the_error_and_preserves_every_hint { preserves_hints_and_failure(Some("failure-0")) }
+                }
+                when the_listener_fails_again_before_observation {
+                    let failures = 2_usize;
+                    to preserves_the_first_failure_without_growing_the_error_queue { preserves_hints_and_failure(Some("failure-0")) }
+                }
+            }
+            when the_listener_fails {
+                let failures = 1_usize;
+                to delivers_the_error_before_waiting_for_hints { preserves_hints_and_failure(Some("failure-0")) }
+            }
+            when the_listener_fails_again_before_observation {
+                let failures = 2_usize;
+                to coalesces_the_unobserved_failures { preserves_hints_and_failure(Some("failure-0")) }
+            }
+        }
+    }
+
     fn exit_listener_observation() -> (bool, bool) {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (sender, mut receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (sender, receiver) = mpsc::channel::<PgTaskId>(1);
+        let errors = Arc::new(crate::notify_event::NotificationErrors::default());
         registry
             .lock()
             .expect("fresh registry is not poisoned")
-            .insert("shared-exit".to_owned(), vec![(Ulid::new(), sender)]);
+            .insert(
+                "shared-exit".to_owned(),
+                vec![(Ulid::new(), sender, errors.clone())],
+            );
         let listener_alive = AtomicBool::new(true);
         exit_listener(
             &registry,
             &listener_alive,
             "synthetic listener spawn failure".to_owned(),
         );
-        let alive_after = listener_alive.load(Ordering::Acquire);
-        let error_delivered = matches!(receiver.try_recv(), Ok(Err(_)));
-        (alive_after, error_delivered)
+        let mut fetcher = SharedFetcher {
+            receiver,
+            errors,
+            _registration: Arc::new(SharedRegistration {
+                id: Ulid::new(),
+                queue: "shared-exit".into(),
+                registry: registry.clone(),
+            }),
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let delivered = matches!(
+            Pin::new(&mut fetcher).poll_next(&mut cx),
+            Poll::Ready(Some(Err(Error::NotifyListener(_))))
+        );
+        (listener_alive.load(Ordering::Acquire), delivered)
     }
 
     /// Poison the registry mutex (panic while holding the lock, like
@@ -914,13 +1022,13 @@ mod tests {
     /// at all proves `exit_listener` did not panic on the poison.
     fn exit_listener_with_poisoned_registry() -> bool {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (sender, _receiver) = mpsc::channel::<Result<PgTaskId, Error>>(1);
+        let (sender, _receiver) = mpsc::channel::<PgTaskId>(1);
         registry
             .lock()
             .expect("fresh registry is not poisoned")
             .insert(
                 "shared-exit-poisoned".to_owned(),
-                vec![(Ulid::new(), sender)],
+                vec![entry(Ulid::new(), sender)],
             );
 
         let poison_target = registry.clone();
@@ -1021,7 +1129,7 @@ mod tests {
     /// the only documented way `make_shared_with_config` can return
     /// `SharedPostgresError::RegistryLocked` (shared.rs:170-173).
     fn make_shared_with_poisoned_registry() -> Result<(), SharedPostgresError> {
-        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unchecked_pool());
+        let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let registry = shared.registry.clone();
         let join = std::thread::spawn(move || {
             let _guard = registry
@@ -1047,47 +1155,47 @@ mod tests {
     }
 
     lets_expect! {
-        expect(shared_debug()) {
+        expect(shared_debug()) as shared_storage_description {
             to describes_the_shared_factory { debug_mentions_type("SharedPostgresStorage") }
         }
 
-        expect(make_default_shared()) {
+        expect(make_default_shared()) as default_shared_storage {
             when no_config_is_supplied {
                 to uses_the_task_type_as_the_namespace { be_ok_and uses_default_queue }
             }
         }
 
-        expect(make_configured_shared()) {
+        expect(make_configured_shared()) as configured_shared_storage {
             when config_is_supplied {
                 to exposes_the_queue_and_fetcher { be_ok_and uses_configured_queue }
             }
         }
 
-        expect(shared_trait_surfaces()) {
+        expect(shared_trait_surfaces()) as shared_backend_components {
             when backend_traits_are_requested {
                 to builds_middleware_and_compact_stream { be_ok_and constructs_backend_traits }
             }
         }
 
-        expect(registration_debug_and_drop()) {
+        expect(registration_debug_and_drop()) as subscription_description_and_lifetime {
             when registration_is_dropped {
                 to removes_the_namespace_from_the_registry { removes_registration }
             }
         }
 
-        expect(drop_when_registry_empties()) {
+        expect(drop_when_registry_empties()) as last_subscription_removal {
             when dropping_the_last_registration_empties_the_registry {
                 to leaves_no_remaining_registrations { equal(0) }
             }
         }
 
-        expect(drop_when_registry_has_siblings()) {
+        expect(drop_when_registry_has_siblings()) as one_queue_subscription_removal {
             when dropping_one_of_several_registrations {
                 to keeps_sibling_registrations_intact { equal(2) }
             }
         }
 
-        expect(drop_siblings_keeps_their_identities()) {
+        expect(drop_siblings_keeps_their_identities()) as independent_queue_subscriptions {
             when dropping_one_of_several_registrations_with_siblings_present {
                 to removes_only_the_dropped_queue_and_keeps_both_named_siblings {
                     equal((2_usize, true))
@@ -1095,21 +1203,21 @@ mod tests {
             }
         }
 
-        expect(drop_one_of_two_keeps_sibling_sender()) {
+        expect(drop_one_of_two_keeps_sibling_sender()) as shared_queue_subscription_removal {
             when dropping_one_of_two_consumers_on_the_same_queue {
                 to leaves_the_other_senders_sender_in_place { equal(1) }
             }
         }
 
-        expect(drop_with_poisoned_registry()) {
+        expect(drop_with_poisoned_registry()) as subscription_removal_after_registry_failure {
             when the_registry_mutex_is_poisoned {
-                to leaves_the_registration_in_place_without_waking_the_listener {
+                to leaves_the_registration_in_place {
                     equal(1)
                 }
             }
         }
 
-        expect(double_make_shared_same_queue()) {
+        expect(double_make_shared_same_queue()) as multiple_subscriptions_to_one_queue {
             when the_same_queue_is_registered_twice {
                 // Q6-rest broadcast redesign: multiple consumers per queue
                 // are now allowed (a second registration used to be rejected).
@@ -1118,37 +1226,37 @@ mod tests {
             }
         }
 
-        expect(broadcast_notify_error_observation()) {
+        expect(broadcast_notify_error_observation()) as listener_failure_delivery {
             when listener_broadcasts_an_error_to_a_mixed_registry {
                 to keeps_the_live_queue_and_drops_the_disconnected_one { equal((1_usize, true)) }
             }
         }
 
-        expect(broadcast_notify_error_keeps_full_sender()) {
+        expect(broadcast_notify_error_keeps_full_sender()) as listener_failure_with_full_subscription {
             when a_senders_channel_is_full_but_still_connected {
                 to keeps_the_back_pressured_sender_registered { equal(1) }
             }
         }
 
-        expect(deliver_prunes_disconnected_sender()) {
+        expect(deliver_prunes_disconnected_sender()) as disconnected_subscription {
             when a_queues_only_sender_has_a_dropped_receiver {
                 to prunes_the_disconnected_sender_and_removes_the_empty_queue { equal(0) }
             }
         }
 
-        expect(deliver_keeps_full_sender()) {
+        expect(deliver_keeps_full_sender()) as full_subscription {
             when a_queues_sender_channel_is_full_but_still_connected {
                 to keeps_the_back_pressured_sender_registered { equal(1) }
             }
         }
 
-        expect(deliver_broadcasts_id_to_every_live_sender()) {
+        expect(deliver_broadcasts_id_to_every_live_sender()) as notification_broadcast {
             when a_queue_has_multiple_live_consumers {
                 to broadcasts_the_wakeup_id_to_every_sender { equal((true, true)) }
             }
         }
 
-        expect(deliver_to_absent_queue_leaves_others_intact()) {
+        expect(deliver_to_absent_queue_leaves_others_intact()) as notification_for_an_unsubscribed_queue {
             when a_notification_targets_a_queue_with_no_registered_consumers {
                 to leaves_other_queues_untouched_and_creates_no_entry {
                     equal((1_usize, false))
@@ -1156,7 +1264,7 @@ mod tests {
             }
         }
 
-        expect(listener_should_exit(&registry)) {
+        expect(listener_should_exit(&registry)) as shared_listener_lifetime {
             let registry = empty_registry();
 
             when no_consumers_remain_registered {
@@ -1169,21 +1277,21 @@ mod tests {
             }
         }
 
-        expect(exit_listener_observation()) {
+        expect(exit_listener_observation()) as failed_listener_lifetime {
             when the_listener_exits_after_a_spawn_or_connection_failure {
                 to clears_the_alive_flag_and_broadcasts_the_error { equal((false, true)) }
             }
         }
 
-        expect(exit_listener_with_poisoned_registry()) {
+        expect(exit_listener_with_poisoned_registry()) as failed_listener_after_registry_failure {
             when the_listener_exits_while_the_registry_mutex_is_poisoned {
-                to still_clears_the_alive_flag_so_a_replacement_can_spawn { be_false }
+                to clears_the_listener_alive_flag { be_false }
             }
         }
 
-        expect(listener_spawn_claims()) {
-            when two_registrations_race_to_claim_the_listener_spawn {
-                to spawns_on_the_first_registration_only { equal((true, false)) }
+        expect(listener_spawn_claims()) as single_listener_start {
+            when two_registrations_claim_the_listener_spawn_in_sequence {
+                to grants_the_first_registration_the_spawn_permit { equal((true, false)) }
             }
         }
 
@@ -1192,7 +1300,7 @@ mod tests {
         // exists. Each fetcher owns its receiver directly after the broadcast
         // redesign.
 
-        expect(make_shared_with_poisoned_registry()) {
+        expect(make_shared_with_poisoned_registry()) as subscription_after_registry_failure {
             when the_registry_mutex_is_poisoned_by_a_panic_in_another_thread {
                 // Sibling to "the_same_queue_is_registered_twice" — covers
                 // the other failure mode of make_shared_with_config: the

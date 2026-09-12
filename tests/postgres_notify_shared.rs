@@ -1,5 +1,7 @@
 #![cfg(feature = "tokio")]
 
+#[path = "support/notify.rs"]
+mod notify_support;
 mod support;
 
 use support::Outcome;
@@ -41,7 +43,7 @@ struct SharedDuplicateRun {
 }
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
-    support::shared_pool().await
+    notify_support::isolated_listener_pool().await
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -114,7 +116,7 @@ async fn run_notify_delivery() -> Result<Outcome<DeliveryRun>, String> {
     let worker = WorkerContext::new::<()>(&format!("notify-worker-{queue}"));
     let mut stream = storage.clone().poll(&worker);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    notify_support::wait_for_listeners(&pool, 1).await?;
     storage
         .push("notify-payload".to_owned())
         .await
@@ -145,7 +147,7 @@ async fn run_notify_isolation() -> Result<Outcome<IsolationRun>, String> {
     let mut stream = storage.clone().poll(&worker);
     let mut other_stream = other_storage.clone().poll(&other_worker);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    notify_support::wait_for_listeners(&pool, 2).await?;
     storage
         .push("notify-payload".to_owned())
         .await
@@ -198,7 +200,7 @@ async fn run_shared_delivery_and_duplicate() -> Result<Outcome<SharedDuplicateRu
     let worker = WorkerContext::new::<()>(&format!("shared-worker-{queue}"));
     let mut stream = poll_handle.poll(&worker);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    notify_support::wait_for_listeners(&pool, 1).await?;
     storage
         .push("shared-payload".to_owned())
         .await
@@ -253,7 +255,7 @@ async fn run_shared_isolation() -> Result<Outcome<IsolationRun>, String> {
     let mut stream = poll_handle.poll(&worker);
     let mut other_stream = other_poll_handle.poll(&other_worker);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    notify_support::wait_for_listeners(&pool, 1).await?;
     storage
         .push("shared-payload".to_owned())
         .await
@@ -331,6 +333,7 @@ async fn run_shared_malformed_payload_survival() -> Result<Outcome<MalformedPayl
     // without this barrier a too-early malformed NOTIFY could be dropped before
     // the listener subscribes, silently skipping the swallow-malformed branch
     // under test (the previous fixed sleep only made that race unlikely).
+    notify_support::wait_for_listeners(&pool, 1).await?;
     storage
         .push("warmup".to_owned())
         .await
@@ -453,14 +456,9 @@ fn shared_second_registration_accepted()
 // --------------------------------------------------------------------------
 // shared listener returns its pooled connection without a LISTEN subscription
 //
-// Regression for the round-11 audit fix: every exit path of the shared
-// listener thread now funnels through a single boundary that executes
-// `UNLISTEN` before the pooled connection drops back into r2d2. Without it,
-// the next pool user inherits the subscription and notifications accumulate
-// in libpq's receive buffer with no consumer. Only the normal (empty
-// registry) exit is driven here: the error exits (connection failure,
-// poisoned registry) cannot be triggered deterministically from an
-// integration test, and all paths share the same single cleanup boundary.
+// An empty shared registry must stop the listener and execute `UNLISTEN`
+// before returning its pooled connection. The next pool user must inherit
+// no subscriptions. This scenario checks the normal empty-registry exit.
 // --------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -586,7 +584,7 @@ fn valid_payload_delivered_after_malformed(
 }
 
 lets_expect! { #tokio_test
-    expect(run_listener_recycles_a_clean_connection().await) {
+    expect(run_listener_recycles_a_clean_connection().await) as shared_listener_connection_release {
         when the_last_registration_drops_and_the_listener_exits {
             to returns_the_connection_without_a_listen_subscription {
                 recycled_connection_has_no_subscriptions()
@@ -594,7 +592,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_notify_delivery().await) {
+    expect(run_notify_delivery().await) as notification_delivery {
         when notify_storage_observes_a_pushed_job {
             to delivers_the_payload_to_the_waiting_worker {
                 delivered_payload_equals("notify-payload")
@@ -602,47 +600,143 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_notify_isolation().await) {
+    expect(run_notify_isolation().await) as notification_queue_isolation {
         when two_notify_queues_share_a_pool_and_only_one_receives_the_push {
             to delivers_the_payload_to_the_target_queue {
-                isolation_delivered_to_target("notify-payload")
-            }
-            to does_not_leak_the_job_to_the_other_queue {
+                isolation_delivered_to_target("notify-payload"),
                 other_queue_was_isolated()
             }
         }
     }
 
-    expect(run_shared_delivery_and_duplicate().await) {
+    expect(run_shared_delivery_and_duplicate().await) as shared_consumer_registration {
         when shared_storage_serves_one_queue_and_a_second_consumer_registers_on_it {
             to delivers_the_pushed_payload_to_the_second_consumer {
-                shared_delivery_payload_matches("shared-payload")
-            }
-            to accepts_the_second_registration_for_the_same_queue {
+                shared_delivery_payload_matches("shared-payload"),
                 shared_second_registration_accepted()
             }
         }
     }
 
-    expect(run_shared_isolation().await) {
+    expect(run_shared_isolation().await) as shared_queue_isolation {
         when shared_storage_runs_two_distinct_queues_on_one_pool {
             to delivers_the_payload_to_the_target_queue {
-                isolation_delivered_to_target("shared-payload")
-            }
-            to keeps_the_other_queue_quiet {
+                isolation_delivered_to_target("shared-payload"),
                 other_queue_was_isolated()
             }
         }
     }
 
-    expect(run_shared_malformed_payload_survival().await) {
+    expect(run_shared_malformed_payload_survival().await) as shared_listener_after_malformed_payload {
         when malformed_notify_payload_is_received_while_a_consumer_is_live {
             to delivers_no_task_for_the_malformed_payload {
-                malformed_payload_delivered_no_task()
-            }
-            to keeps_the_listener_alive_to_deliver_the_next_valid_payload {
+                malformed_payload_delivered_no_task(),
                 valid_payload_delivered_after_malformed("after-malformed")
             }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct DisconnectedListener {
+    error_observed: bool,
+    payload: String,
+    all_idle: bool,
+}
+
+/// The listener connection is task-owned through its unique application_name.
+/// A dropped listener is observable, and its durable polling branch remains live.
+async fn run_listener_disconnect(
+    shared_mode: bool,
+) -> Result<Outcome<DisconnectedListener>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("listener-disconnect-{}", Ulid::new());
+    let config = Config::new(&queue);
+    let worker = WorkerContext::new::<()>(&queue);
+    let mut publisher = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&pool);
+    let mut stream: apalis_core::backend::TaskStream<
+        PgTask<String>,
+        apalis_diesel_postgres::Error,
+    > = if shared_mode {
+        <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(&mut shared, config)
+            .map_err(|error| error.to_string())?
+            .poll(&worker)
+    } else {
+        PostgresStorage::<String>::new_with_notify(&pool, &config).poll(&worker)
+    };
+    stream
+        .next()
+        .await
+        .ok_or("missing registration outcome")?
+        .map_err(|error| error.to_string())?;
+    notify_support::wait_for_listeners(&pool, 1).await?;
+    let control_pool = pool.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = control_pool.get().map_err(|error| error.to_string())?;
+        let count = sql_query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name=current_setting('application_name') AND query='LISTEN \"apalis::job::insert\"'")
+            .execute(&mut conn).map_err(|error| error.to_string())?;
+        if count == 1 { Ok(()) } else { Err(format!("expected one task listener to terminate, got {count}")) }
+    }).await.map_err(|error| error.to_string())??;
+    let error_observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match stream.next().await {
+                Some(Err(_)) => break true,
+                Some(Ok(_)) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    publisher
+        .push("fallback-after-disconnect".into())
+        .await
+        .map_err(|error| error.to_string())?;
+    let payload = next_task(&mut stream).await?.args;
+    drop(stream);
+    drop(shared);
+    wait_until(
+        "listener connection released",
+        Duration::from_secs(5),
+        || {
+            let state = pool.state();
+            state.connections == state.idle_connections
+        },
+    )
+    .await?;
+    let state = pool.state();
+    let all_idle = state.connections == state.idle_connections;
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(DisconnectedListener {
+        error_observed,
+        payload,
+        all_idle,
+    }))
+}
+
+fn listener_failure_recovers()
+-> impl Fn(&Result<Outcome<DisconnectedListener>, String>) -> AssertionResult {
+    check::<DisconnectedListener, _>("listener disconnect recovery", |run| {
+        if run.error_observed && run.payload == "fallback-after-disconnect" && run.all_idle {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected error, durable payload, idle pool; got {run:?}"
+            ))
+        }
+    })
+}
+
+lets_expect! { #tokio_test
+    expect(run_listener_disconnect(shared_mode).await) as listener_disconnect_recovery {
+        let shared_mode = false;
+        to reports_the_failure_and_delivers_via_polling_before_releasing_the_connection { listener_failure_recovers() }
+        when consumers_share_one_listener {
+            let shared_mode = true;
+            to reports_the_failure_and_delivers_via_polling_before_releasing_the_connection { listener_failure_recovers() }
         }
     }
 }
