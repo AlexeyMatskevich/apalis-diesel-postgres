@@ -22,17 +22,23 @@ orphan re-enqueue, admin queries, and `MakeShared` for many-queue setups.
 ## Status
 
 Targets the Apalis 1.0 release candidate: `apalis-core 1.0.0-rc.9`,
-`apalis-sql 1.0.0-rc.9`, `apalis-codec 0.1.0-rc.9`, `diesel 2.3`. Schema
-compatible with Apalis SQL storage (`apalis.jobs`, `apalis.workers`).
+`apalis-sql 1.0.0-rc.9`, `apalis-codec 0.1.0-rc.9`, `diesel >=2.3.10`.
+Uses the Apalis SQL tables (`apalis.jobs`, `apalis.workers`). The
+[0.4.1 to Unreleased upgrade guide](docs/upgrading.md#upgrading-from-041-to-unreleased)
+covers Rust API changes, schema migration, deployment order and rollback limits.
 
 MSRV: Rust 1.88.
+
+The SQL used by this backend requires PostgreSQL 14 or later. CI currently tests
+PostgreSQL 18. PostgreSQL 12/13 are incompatible with the metrics queries;
+PostgreSQL 14–17 have not been validated by the current CI matrix.
 
 ## Installation
 
 ```toml
 [dependencies]
 apalis-diesel-postgres = { version = "0.4", features = ["tokio"] }
-diesel = { version = "2.3", features = ["postgres", "r2d2", "chrono", "serde_json"] }
+diesel = { version = "2.3.10", features = ["postgres", "r2d2", "chrono", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
@@ -307,8 +313,9 @@ storage.push_task_with_conn(conn, task)
 ## Connection pool isolation
 
 **Do not share the apalis pool with your HTTP request handlers or other
-unrelated workloads.** Apalis holds long-lived connections (fetcher
-polling/`LISTEN`, lifecycle keep-alive, listener thread). If the application
+unrelated workloads.** Each listener holds one connection for its lifetime;
+fetch, acknowledgement and heartbeat borrow connections for their individual
+operations. If the application
 exhausts the pool under load, the fetcher and heartbeat stall; lifecycle
 marks the worker dead and re-enqueues its in-flight tasks, which produces
 more load on the same pool — a cascading failure that is hard to recover
@@ -377,8 +384,134 @@ fn build(pool: PgPool) {
 
 `new_with_notify` and `SharedPostgresStorage` use `LISTEN
 "apalis::job::insert"` to wake workers on insert. Polling stays as a
-fallback. Each notify-mode storage pins one extra pooled connection while
-the listener is alive — size the apalis pool accordingly.
+fallback. Each notify-mode worker stream owns a listener that pins one extra
+pooled connection. Shared storage shares one listener connection among its
+subscribers. Size the apalis pool for these connections.
+
+## Polling strategies and worker recovery
+
+`PostgresStorage::new(pool)` recreates the default polling strategy for every
+consumer. The upstream `Config` stores one-shot strategy streams: cloning an
+arbitrary config does not clone those streams. When reusing custom configuration
+across workers, supply a factory so each consumer gets its own strategy:
+
+```rust
+use std::time::Duration;
+use apalis_core::backend::poll_strategy::IntervalStrategy;
+use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
+
+fn storage(pool: &PgPool) -> PostgresStorage<String> {
+    PostgresStorage::new_with_config(pool, &Config::new("emails"))
+        .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(100)))
+}
+```
+
+This also applies to notification and shared storage built from a `Config`.
+An exhausted strategy produces `PollStrategyExhausted` and ends its polling
+branch. It cannot authorize further polling. A finite custom strategy must
+explicitly define how polling continues; creating fresh configuration or using
+the factory is the upgrade path for previously shared one-shot strategies.
+
+If automatic acknowledgement loses its result through a database or
+serialization error, the affected worker registration is retired locally.
+A claim whose transaction produced tasks but whose commit cannot be confirmed
+returns `ClaimOutcomeUnknown` and also retires the registration. This includes
+connection loss and a panic in user instrumentation after commit; the original
+error remains available as its source. A typed server rejection whose outcome
+is known (such as a serialization or constraint failure) instead returns the
+ordinary database error and does not retire the local registration. A manual
+stream consumer can continue after that error; Apalis treats stream errors as
+fatal. Errors before a claim and empty fetches also do not retire the local
+registration. Low-level token-free callers
+must resolve `ClaimOutcomeUnknown` before renewing that worker's heartbeat.
+Dropping a polling stream after its first poll also retires that registration.
+The retired worker stops claiming new tasks and refreshing its heartbeat;
+other worker names sharing the storage remain independent. This is a fail-stop
+policy: with Apalis `Worker::run` or a monitored worker, the resulting stream
+error drops that worker's pending service futures, including other handlers and
+acknowledgements already in progress. There is no automatic graceful drain after
+an acknowledgement failure. An independently retained acknowledgement may still
+complete; submitted blocking SQL may also finish after its waiter is dropped.
+Dropping a stream that has never been polled leaves the registration active.
+To restart, construct fresh storage with a fresh `Config` or a poll strategy
+factory. Cloning retired storage preserves its retired local registration;
+reusing a consumed `Config` strategy can immediately exhaust polling. A fresh
+storage token cannot take over a still-fresh registration with the same name:
+restart may need to wait for the stale deadline. After the last committed
+heartbeat expires, another worker can recover unfinished tasks.
+Recovery counts a lost attempt and respects the retry budget. Taking over the
+same worker name recovers all of that registration's claims before renewal;
+this can be a large transaction after a large in-flight batch.
+Storage clones retain one local liveness record per distinct worker name until
+all clones are dropped. Bound the set of worker names for long-lived storage.
+
+Canceling a temporary `stream.next()` wait leaves the stream and its buffered
+tasks intact. Canceling an enqueue/fetch/ack waiter after its blocking operation
+has been submitted does not cancel the SQL or commit. Stop the worker gracefully
+when possible, and treat an interrupted enqueue result as potentially committed.
+Manual acknowledgers must retain their completion obligation or stop their
+worker heartbeat if acknowledgement cannot be completed.
+
+Enqueue deduplication is scoped to `(queue, idempotency_key)` while the row
+exists. It does not prevent repeated delivery or repeated external handler
+effects after a crash, retirement or unknown acknowledgement outcome. Handlers
+need their own idempotency for those effects. No exactly-once execution is
+provided.
+
+## Buffered enqueue completion
+
+`Sink::start_send` and `SinkExt::feed` accept tasks into the local buffer. A
+successful `flush` or `close` confirms that all accepted tasks have been written,
+including tasks buffered while an earlier batch was still in flight. Dropping a
+temporary flush waiter leaves that work in the sink; another flush can finish it.
+
+A failed batch returns its original error once. That sink then returns
+`Error::SinkFailed` from readiness, flush and close. Changing its codec preserves
+the failed state; cloning storage creates a fresh, empty sink. Keep submitted task
+IDs and idempotency keys so that an uncertain database outcome can be reconciled
+before resubmitting through a fresh sink. The backend does not automatically replay
+a failed batch. `SinkBufferFull` before a task is accepted is a recoverable
+capacity error and does not fail the pipeline.
+
+## Operational boundaries
+
+Use trusted PostgreSQL roles for schema changes and direct table access. Lease
+tokens fence cooperating worker instances; callers with the pool or table write
+privileges can bypass the public worker protocol. Configure libpq TLS explicitly
+for the deployment, including certificate and hostname verification where
+required. The crate does not override connection-string TLS policy.
+
+On macOS with MIT Kerberos 1.22.1, process exit can race with background r2d2
+connection establishment and trigger a native assertion.
+Dropping storage or a pool does not join an in-flight connection attempt.
+This native shutdown issue remains unresolved. A successful Cargo exit code
+alone does not establish that native shutdown was clean.
+For deployments using neither GSS authentication nor GSS encryption,
+`PGGSSENCMODE=disable` avoids the affected credential-probing path. This is an
+explicit deployment mitigation; the crate leaves GSS policy to the caller.
+GSS-enabled macOS deployments need a verified native shutdown remedy.
+
+Payload, metadata, key and queue limits apply per value. A batch iterator and a
+successful handler result have no aggregate memory limit; bound them at the
+application boundary. Codecs and result serialization run synchronously and
+must be appropriate for the executor. Database and handler error details can
+contain application data; apply the application's logging policy.
+
+Notifications are hints; a disconnected listener or lost hint requires a
+continuing polling strategy. A listener error remains observable even when its
+bounded ID buffer is full. PostgreSQL's server-side notification queue is a
+separate resource: exhaustion can reject a transaction's commit. Monitor it
+alongside pool saturation, heartbeat age, task backlog and database maintenance.
+Completed rows remain until application retention removes them; plan vacuum,
+retention and snapshot refresh for the actual workload. OFFSET pages have a
+total order on unchanged data, but do not provide a shared snapshot across
+concurrent writes. SKIP LOCKED does not promise fairness under sustained load.
+
+Even when no jobs are ready, polling checks worker ownership and runs a claim
+transaction. Pool validation can add a connection check, and PostgreSQL row
+locking can generate WAL. Account for this idle database load when choosing
+polling intervals and worker counts; measure it with the deployment's pool and
+database settings.
 
 ## Examples
 
@@ -401,7 +534,7 @@ worker logs point at the failed lifecycle step:
   and pool capacity.
 - Lock failures for non-lockable jobs: `task not found while locking task`,
   with the task id and queue. Usually means the job is delayed, completed,
-  already locked, or in another queue.
+  already locked, out of retry attempts, or in another queue.
 - Acknowledgement races: `stale acknowledgement` when the stored lock no
   longer matches the worker/attempt/lock timestamp being ack'd.
 - Heartbeat failures for missing worker rows: `worker not registered`,
@@ -421,9 +554,10 @@ worker logs point at the failed lifecycle step:
   duplicates that have no stored row yet) and resubmit. Match the variant (not
   the message text) to treat a duplicate as benign. One duplicate rolls back the *whole* batch, not just the colliding
   row; a surrounding transaction stays alive. The `push_*_with_conn` outbox
-  methods return this directly; the `Sink` / `TaskSink` enqueue APIs wrap it
-  (like every push error) as
-  `TaskSinkError::PushError(Error::IdempotencyConflict { .. })`.
+  methods and the `Sink` implementation return `Error` directly. The
+  `TaskSink` API wraps a push failure as
+  `TaskSinkError::PushError(Error::IdempotencyConflict { .. })`. After a buffered
+  Sink flush fails, use a fresh sink for any reconciled retry as described above.
 
 ## Public types
 

@@ -8,47 +8,76 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Disable libpq GSSAPI encryption negotiation. Without this the krb5/GSS
-  # finalizers race on process teardown on the CI runners and corrupt the heap:
-  # test runs abort with `malloc(): unaligned tcache chunk detected` / SIGABRT
-  # *after* every test has passed, and the corruption can also surface as
-  # non-deterministic wrong query results mid-run. The tests never exercise
-  # GSSAPI, so disabling it is safe and removes the flake at the source.
+  # This matrix uses password authentication without GSSAPI. Keep negotiation
+  # disabled: native krb5 shutdown failures were observed with it enabled.
+  # GSSAPI authentication/encryption needs a separate configured environment.
   PGGSSENCMODE: disable
 
 jobs:
   static:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", "stable"]
 
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: 1.88.0
+        toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
     - name: Check formatting
       run: cargo fmt --all -- --check
-    # `tokio` and `ntex` are mutually exclusive runtime features, so we
-    # cannot combine them via `--all-features` or `--no-default-features`.
+    - name: Check database verification script
+      run: python3 scripts/test-check-kerberos-isolation.py
     - name: Check tokio feature
       run: cargo check --locked --features tokio
     - name: Check ntex feature
       run: cargo check --locked --no-default-features --features ntex
+    - name: Check both runtimes
+      run: cargo check --locked --all-features
+    - name: Reject a build without a runtime
+      run: |
+        if cargo check --locked --no-default-features > "$RUNNER_TEMP/no-runtime.log" 2>&1; then
+          cat "$RUNNER_TEMP/no-runtime.log"
+          exit 1
+        fi
+        cat "$RUNNER_TEMP/no-runtime.log"
+        grep -F 'requires a runtime feature' "$RUNNER_TEMP/no-runtime.log"
     - name: Clippy (tokio)
       run: cargo clippy --locked --all-targets --features tokio -- -D warnings
     - name: Clippy (ntex)
       run: cargo clippy --locked --all-targets --no-default-features --features ntex -- -D warnings
+    - name: Clippy (both runtimes)
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
     - name: Unit tests with tokio feature
       run: env -u DATABASE_URL cargo test --locked --features tokio --lib --verbose
     - name: Unit tests with ntex feature
       run: env -u DATABASE_URL cargo test --locked --no-default-features --features ntex --lib --verbose
+    - name: Unit tests with both runtimes
+      run: env -u DATABASE_URL cargo test --locked --all-features --lib --verbose
     - name: Doctests
-      run: cargo test --locked --doc --features tokio --verbose
+      run: cargo test --locked --doc --all-features --verbose
     - name: Docs
-      run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --features tokio --no-deps
+      run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+    - name: Verify the consumer package
+      run: cargo package --locked
 
   postgres:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", "stable"]
+        runtime: [tokio, ntex, both]
+        include:
+        - runtime: tokio
+          args: "--features tokio"
+        - runtime: ntex
+          args: "--no-default-features --features ntex"
+        - runtime: both
+          args: "--all-features"
 
     services:
       postgres:
@@ -73,15 +102,34 @@ jobs:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: 1.88.0
+        toolchain: ${{ matrix.rust }}
     # `--tests` runs the lib unittests plus every integration test binary in
     # `tests/` (and gates any future ones automatically) instead of a
     # hand-maintained `--test` list that silently went stale: postgres_specs,
     # postgres_outbox, postgres_migration_concurrency,
-    # postgres_worker_integration and the four spec_queries_* binaries were
-    # compile-checked but never executed in CI.
+    # postgres_worker_integration and all spec_queries_* binaries. Production
+    # SQL specifications moved into the lib are included by --tests as well.
     - name: PostgreSQL integration tests
       run: >-
-        cargo test --locked --features tokio --verbose
+        cargo test --locked ${{ matrix.args }} --verbose
         --tests
         -- --test-threads=1
+    - name: Check database fixture isolation under parallel execution
+      if: matrix.runtime == 'both' && matrix.rust == 'stable'
+      run: cargo test --locked --all-features --tests -- --test-threads=8
+    # The matrix above relies on PGGSSENCMODE from the environment. This run
+    # drops it and checks that no test loads Kerberos on its own, e.g. through
+    # a fixture that builds its own connection string.
+    - name: Check that tests take GSS settings only from DATABASE_URL
+      if: matrix.runtime == 'both' && matrix.rust == 'stable'
+      run: scripts/check-kerberos-isolation.sh
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Install the advisory checker
+      run: cargo install cargo-audit --version 0.22.2 --locked
+    - name: Check dependency advisories
+      run: cargo audit --deny warnings

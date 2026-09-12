@@ -9,6 +9,12 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Added
 
+- `Error::SinkFailed` identifies a buffered enqueue pipeline whose previous
+  flush failed. Its first failure still returns the original typed error.
+- `with_poll_strategy_factory` constructs an independent polling strategy for each
+  worker stream. `ClaimOutcomeUnknown`, `WorkerRetired`, and
+  `PollStrategyExhausted` distinguish recovery and restart obligations; `Error`
+  remains non-exhaustive.
 - Batch outbox enqueue on a caller-supplied connection: `push_batch_with_conn`
   and `push_tasks_with_conn` insert many tasks in one round trip inside the
   caller's own transaction, mirroring the single-task `push_with_conn` /
@@ -17,11 +23,23 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed (breaking)
 
+- Migration `20260912000001_require_active_owner` requires a non-null owner for
+  `Queued` and `Running` jobs and repairs existing active rows without owners.
+  `apalis.get_jobs(NULL, ...)` now fails with SQLSTATE `22004`. Run `setup` and
+  follow the maintenance guidance in [the upgrade guide](docs/upgrading.md).
+- The automatic branch of `PgMiddleware`'s `Layer<S>::Service` now wraps
+  acknowledgement inside the lock service: `AcknowledgeService<LockTaskService<S>,
+  PgAck>` becomes `LockTaskService<AcknowledgeService<S, PgAck>>`. Ownership is
+  established before acknowledgement snapshots the task context. Update explicit
+  nested service annotations, or let the worker builder infer the type and use
+  `<PgMiddleware as tower::Layer<S>>::Service` in generic code. The manual branch
+  remains `LockTaskService<S>`.
 - `lock_task` and `lock_task_in_queue` now take `&PgTaskId` instead of `&Ulid`,
   so callers pass the storage's own task-id type rather than a raw ULID.
-- Storage constructors and builders now borrow the pool (`&PgPool`) instead of
-  taking it by value, so one pool can seed several storages without a `.clone()`
-  at every call site.
+- `PgAck` and `PgMiddleware` constructors, including `with_lease_token`, and
+  `SharedPostgresStorage::new` now borrow the pool (`&PgPool`) instead of taking
+  it by value. Ordinary `PostgresStorage` constructors already borrowed the pool
+  in 0.4.1.
 - `Error::AlreadyRegistered` is now a struct variant that also carries the queue
   it collided on — `AlreadyRegistered { worker_id, queue }` — so the error
   identifies which queue's registration was already held, not just the worker.
@@ -31,6 +49,22 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed
 
+- Worker registration evaluates the locked row and current time in one query,
+  reducing database reads while preserving takeover fencing and evaluation
+  after any row-lock wait.
+- Migrations use a private journal in `apalis_diesel_postgres`, validated schema
+  adoption, and one transaction for the complete pending series. Existing custom
+  Diesel runners must follow the [upgrade guide](docs/upgrading.md); public
+  application journals and external composite worker foreign keys are preserved.
+- Losing an automatic acknowledgement or an uncertain claim commit retires the
+  local worker registration, stopping further claims and heartbeat renewal so
+  unfinished work can become recoverable. Under Apalis `Worker::run` and Monitor,
+  this fail-stop also cancels sibling service futures; it does not drain them.
+  Restart with fresh storage and fresh configuration or a strategy factory, and
+  allow for the old registration's stale deadline. Storage clones do not reset
+  retirement or replenish a consumed polling strategy.
+- A completed polling strategy now reports `PollStrategyExhausted`; no implicit
+  interval grants further claims after the configured policy has ended.
 - The encoded task payload is capped at 1 MiB (`MAX_JOB_PAYLOAD_LEN`): a larger
   payload is rejected up front with `Error::InvalidArgument` instead of being
   written to the row unbounded.
@@ -38,6 +72,26 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- A successful Sink flush now covers both its active batch and tasks accepted
+  into the buffer during that batch. A failed flush can no longer be followed by
+  a false successful flush or close; subsequent calls report `SinkFailed`.
+  Retyping preserves this state, while a storage clone starts an empty pipeline.
+- Notification batching retains valid task IDs adjacent to a listener error and
+  still delivers the error. The bounded notification channel carries task IDs;
+  listener failures retain their separate delivery path.
+- Administrative row conversion no longer fabricates SQL claim metadata. A
+  manually acknowledged task obtained by an administrative read uses the caller's
+  explicit attempt counter; real claims retain their immutable attempt snapshot.
+- Known server rejections of claim COMMIT, including serialization and constraint
+  failures, retain the ordinary database error. A manual stream consumer can
+  continue without retiring the local registration; Apalis still treats stream
+  errors as fatal, and dropping the polled stream retires its registration.
+  Uncertain connection outcomes and panics still require claim recovery.
+- Automatic acknowledgement uses the attempt history returned by the SQL claim.
+  Direct `PgMiddleware` calls now consume one attempt and reach the retry limit
+  without requiring Apalis's Tracker or a manually incremented task counter.
+  Fallback claims also refresh stale input counters; normal workers continue to
+  consume one attempt per execution.
 - `database_hint`'s structured foreign-key match required both
   `constraint_name` and `table_name == Some("jobs")` to fire; some drivers
   report the constraint but leave `table_name` unset, so the "register the
@@ -77,18 +131,33 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   stale row in a single `UPDATE`, so a large backlog produced an unbounded
   transaction. Each sweep now reclaims at most 1000 rows and drains the
   remainder on subsequent sweeps.
-- `setup()` released the migration advisory lock exactly once, but PostgreSQL
-  session advisory locks are reentrant: a pooled connection that already held a
-  leaked copy (from a prior `setup()` whose release failed while its session
-  stayed alive) would return to the pool still holding the lock, letting the
-  next `setup()` re-enter it without blocking and defeating the serialization.
-  `setup()` now drains every hold the backend has on the lock — unlocking while
-  `pg_locks` still reports it held, which also avoids the "lock is not held"
-  server warning an unlock-until-`false` loop would emit — and confirms the
-  connection owns zero copies before returning.
+- `setup()` holds a transaction-scoped advisory lock across recognition, all
+  migrations, and verification. Commit, rollback, and disposal of a panicking
+  connection release its own lock without draining unrelated session locks.
+- A complete schema installed by the former public Diesel harness can be adopted
+  without a private journal. Adoption records only the fixed eleven known
+  versions, then runs later migrations; malformed catalogs still fail, and
+  foreign journal rows and timestamps remain unchanged. Repeated setup no longer
+  requires database-wide `CREATE` when its private schema already exists.
+- Worker startup runs orphan maintenance before committing its own registration,
+  so a known maintenance failure does not leave a new identity that blocks retry.
+  Worker guards use `FOR KEY SHARE`, avoiding their conflict with heartbeat
+  updates while supported takeover and deletion remain fenced. Forward migration
+  `20260912000000_worker_key_share` updates the SQL `get_jobs` path too.
+- Listing uses a deterministic ID tie-breaker. Forward migration
+  `20260910000001_listing_id_tie_breaker` extends both listing indexes so a limited
+  page need not sort an entire timestamp tie group when those indexes are used.
+- Aggregate metric values retain their numeric precision through SQL text
+  conversion; the public `Statistic.value` field is still `String`.
+- Unrepresentable enqueue timestamps are rejected with `InvalidArgument` instead
+  of silently becoming the epoch. A rejected outbox batch still preserves the
+  caller's surrounding transaction through its SAVEPOINT.
 
 ### Performance
 
+- Reusing an existing local worker lease avoids allocating another owned name;
+  the registry still retains its mutex and one record per worker name until all
+  storage clones are dropped.
 - The decode stage carries the worker id as `Arc<str>` and the ack path forwards
   the per-process lease token as `Arc<str>`, replacing a `String` allocation on
   every decoded row and every acknowledgement with a refcount bump.
@@ -97,6 +166,21 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Documentation
 
+- The [0.4.1 to Unreleased upgrade guide](docs/upgrading.md#upgrading-from-041-to-unreleased)
+  lists application API changes, database cutover steps, validation and rollback
+  limits for installations based on the `v0.4.1` release.
+- `lock_task` and `lock_task_in_queue` document `ClaimOutcomeUnknown`, its original
+  error source, and the caller's obligation to stop heartbeat renewal or resolve
+  the uncertain claim before restarting.
+- PostgreSQL 14+ is the previously undocumented minimum SQL prerequisite. CI
+  tests PostgreSQL 18; PostgreSQL 14–17 have not been validated by that matrix,
+  and PostgreSQL 12/13 are incompatible with the metrics queries.
+- The operational guidance describes the database cost of empty polling:
+  ownership checks, claim transactions, optional pool validation and WAL from
+  row locking still matter when choosing polling intervals and worker counts.
+- The macOS native GSS shutdown limitation remains explicit. Non-GSS test fixtures
+  and CI checks isolate their connection policy; they do not constitute a native
+  Kerberos shutdown fix.
 - `list_tasks` and `list_all_tasks` now document the `OFFSET` pagination cost:
   the query still scans and discards the skipped rows, so deep pages grow
   linearly more expensive.
