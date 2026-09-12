@@ -109,7 +109,7 @@ async fn scenario_commit(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 1: commit");
-    let order_id = Ulid::new().to_string();
+    let order_id = format!("{queue}:{}", Ulid::new());
 
     let task_id = tokio::task::spawn_blocking({
         let storage = storage.clone();
@@ -145,7 +145,7 @@ async fn scenario_rollback(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 2: rollback");
-    let order_id = Ulid::new().to_string();
+    let order_id = format!("{queue}:{}", Ulid::new());
 
     // The closure simulates a downstream check that fails AFTER the apalis
     // enqueue — e.g. a domain validation. Returning `Err` from the closure
@@ -194,7 +194,7 @@ async fn scenario_idempotency_conflict(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 3: idempotency conflict");
-    let order_id = Ulid::new().to_string();
+    let order_id = format!("{queue}:{}", Ulid::new());
     let idempotency_key = format!("order:{order_id}");
 
     // Seed: first push with the idempotency_key, in its own transaction.
@@ -295,7 +295,11 @@ async fn cleanup(backend_pool: &PgPool, apalis_pool: &PgPool, queue: &str) -> Re
     tokio::task::spawn_blocking(
         move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut conn = backend_pool.get()?;
-            sql_query(format!("DELETE FROM {BUSINESS_TABLE}")).execute(&mut conn)?;
+            sql_query(format!(
+                "DELETE FROM {BUSINESS_TABLE} WHERE starts_with(id, $1)"
+            ))
+            .bind::<Text, _>(format!("{queue}:"))
+            .execute(&mut conn)?;
             let mut conn = apalis_pool.get()?;
             sql_query("DELETE FROM apalis.jobs WHERE job_type = $1")
                 .bind::<Text, _>(&queue)
@@ -318,8 +322,9 @@ async fn print_counts(pool: &PgPool, queue: String) -> Result<(), BoxError> {
                     .get_result::<CountRow>(&mut conn)?
                     .n;
             let orders = sql_query(format!(
-                "SELECT COUNT(*)::bigint AS n FROM {BUSINESS_TABLE}"
+                "SELECT COUNT(*)::bigint AS n FROM {BUSINESS_TABLE} WHERE starts_with(id, $1)"
             ))
+            .bind::<Text, _>(format!("{queue}:"))
             .get_result::<CountRow>(&mut conn)?
             .n;
             Ok((jobs, orders))
@@ -327,6 +332,6 @@ async fn print_counts(pool: &PgPool, queue: String) -> Result<(), BoxError> {
     )
     .await??;
     println!("  apalis.jobs rows for this queue: {jobs}");
-    println!("  {BUSINESS_TABLE} rows total:       {orders}");
+    println!("  {BUSINESS_TABLE} rows for this run: {orders}");
     Ok(())
 }

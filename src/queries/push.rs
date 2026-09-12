@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use apalis_sql::{DateTime, DateTimeExt};
+use apalis_sql::DateTime;
 use diesel::{
     Connection, PgConnection, RunQueryDsl, sql_query,
     sql_types::{Array, Binary, Integer, Nullable, Text, Timestamptz},
@@ -228,7 +228,13 @@ fn prepare_batch(
                 task.parts.run_at
             ))
         })?;
-        run_ats.push(<DateTime as DateTimeExt>::from_unix_timestamp(run_at_secs));
+        let run_at = DateTime::from_timestamp(run_at_secs, 0).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "run_at {} exceeds the supported timestamp range",
+                task.parts.run_at
+            ))
+        })?;
+        run_ats.push(run_at);
         priorities.push(task.parts.ctx.priority());
         // Serialize metadata once into the text representation we hand to
         // Postgres (cast to jsonb in the SELECT below). Previously this
@@ -381,16 +387,29 @@ mod tests {
         }
     }
 
-    fn accepts_one_task(result: &Result<Option<PreparedBatch>, Error>) -> AssertionResult {
-        match result {
-            Ok(Some(batch)) if batch.task_count == 1 => Ok(()),
-            Ok(Some(batch)) => Err(AssertionError::new(vec![format!(
-                "expected a prepared batch of one task, got {}",
-                batch.task_count
+    fn accepts_one_task(
+        expected_len: usize,
+    ) -> impl Fn(&Result<Option<PreparedBatch>, Error>) -> AssertionResult {
+        move |result| match result {
+            Ok(Some(batch))
+                if batch.task_count == 1
+                    && batch.binds.jobs.len() == 1
+                    && batch.binds.jobs[0].len() == expected_len
+                    && batch.binds.jobs[0].iter().all(|byte| *byte == 0)
+                    && batch.binds.ids.len() == 1
+                    && Ulid::from_string(&batch.binds.ids[0]).is_ok()
+                    && batch.binds.max_attempts.len() == 1
+                    && batch.binds.run_ats.len() == 1
+                    && batch.binds.priorities.len() == 1
+                    && batch.binds.metadata.len() == 1
+                    && batch.binds.idempotency_keys == [None]
+                    && !batch.any_idempotency_key =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(AssertionError::new(vec![format!(
+                "expected one aligned task with a generated id and exact {expected_len}-byte zero payload"
             )])),
-            Ok(None) => Err(AssertionError::new(vec![
-                "expected a prepared batch, got an empty batch".to_owned(),
-            ])),
             Err(error) => Err(AssertionError::new(vec![format!(
                 "expected a prepared batch, got error: {error:?}"
             )])),
@@ -414,21 +433,21 @@ mod tests {
     }
 
     lets_expect! {
-        expect(prepare_batch_for_payload(len)) {
+        expect(prepare_batch_for_payload(len)) as payload_validation {
             let len = 128;
 
             when the_payload_is_empty {
                 let len = 0;
-                to accepts_the_zero_length_payload { accepts_one_task }
+                to accepts_the_zero_length_payload { accepts_one_task(len) }
             }
 
             when the_payload_is_well_below_the_cap {
-                to accepts_the_task { accepts_one_task }
+                to accepts_the_task { accepts_one_task(len) }
             }
 
             when the_payload_is_exactly_at_the_cap {
                 let len = MAX_JOB_PAYLOAD_LEN;
-                to accepts_the_boundary_task { accepts_one_task }
+                to accepts_the_boundary_task { accepts_one_task(len) }
             }
 
             when the_payload_is_one_byte_over_the_cap {
@@ -439,9 +458,64 @@ mod tests {
     }
 
     lets_expect! {
-        expect(prepare_empty_batch()) {
+        expect(prepare_empty_batch()) as empty_batch {
             when the_batch_is_empty {
                 to produces_no_batch { skips_the_empty_batch }
+            }
+        }
+    }
+    fn prepared_schedule(run_at: u64) -> Result<Vec<i64>, Error> {
+        let mut task = PgTask::<CompactType>::new(Vec::new());
+        task.parts.run_at = run_at;
+        prepare_batch(&Config::new("schedule"), vec![task]).map(|batch| {
+            batch
+                .into_iter()
+                .flat_map(|batch| batch.binds.run_ats)
+                .map(|run_at| run_at.timestamp())
+                .collect()
+        })
+    }
+
+    fn preserves_schedule(expected: i64) -> impl Fn(&Result<Vec<i64>, Error>) -> AssertionResult {
+        move |result| match result {
+            Ok(values) if values == &[expected] => Ok(()),
+            other => Err(AssertionError::new(vec![format!(
+                "expected exact timestamp {expected}, got {other:?}"
+            )])),
+        }
+    }
+
+    fn rejects_schedule(result: &Result<Vec<i64>, Error>) -> AssertionResult {
+        match result {
+            Err(Error::InvalidArgument(message)) if message.contains("run_at") => Ok(()),
+            other => Err(AssertionError::new(vec![format!(
+                "expected run_at InvalidArgument, got {other:?}"
+            )])),
+        }
+    }
+
+    lets_expect! {
+        expect(prepared_schedule(seconds)) as scheduled_enqueue_validation {
+            when(seconds = 0) as the_schedule_is_the_unix_epoch {
+                to preserves_the_exact_timestamp { preserves_schedule(0) }
+            }
+            when(seconds = 1_800_000_000) as the_schedule_is_within_the_supported_range {
+                to preserves_the_exact_timestamp { preserves_schedule(1_800_000_000) }
+            }
+            when(seconds = 8_210_266_876_799) as the_schedule_is_the_last_representable_second {
+                to preserves_the_exact_timestamp { preserves_schedule(8_210_266_876_799) }
+            }
+            when(seconds = 8_210_266_876_800) as the_schedule_is_one_second_above_the_timestamp_limit {
+                to rejects_the_unrepresentable_schedule { rejects_schedule }
+            }
+            when(seconds = i64::MAX as u64) as the_schedule_fits_i64_but_exceeds_the_timestamp_range {
+                to rejects_the_unrepresentable_schedule { rejects_schedule }
+            }
+            when(seconds = i64::MAX as u64 + 1) as the_schedule_exceeds_i64 {
+                to rejects_the_unrepresentable_schedule { rejects_schedule }
+            }
+            when(seconds = u64::MAX) as the_schedule_is_the_largest_input_value {
+                to rejects_the_unrepresentable_schedule { rejects_schedule }
             }
         }
     }
