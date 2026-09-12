@@ -1,3 +1,31 @@
+-- Repair only ownership that the legacy id-only FK allowed across queues.
+-- Active lost executions consume an attempt; terminal history is never revived.
+ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS fk_worker_lock_by;
+ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_lock_by_fkey;
+
+UPDATE apalis.jobs AS jobs
+SET attempts = CASE WHEN status IN ('Queued', 'Running')
+                    THEN CASE WHEN attempts < max_attempts THEN attempts + 1 ELSE max_attempts END
+                    ELSE attempts END,
+    status = CASE WHEN status IN ('Queued', 'Running')
+                  THEN CASE WHEN attempts < max_attempts - 1 THEN 'Pending' ELSE 'Killed' END
+                  ELSE status END,
+    last_result = CASE WHEN status IN ('Queued', 'Running')
+                       THEN jsonb_build_object('Err', 'Worker ownership was lost during schema upgrade')
+                       ELSE last_result END,
+    done_at = CASE WHEN status IN ('Queued', 'Running')
+                   THEN CASE WHEN attempts < max_attempts - 1 THEN NULL ELSE statement_timestamp() END
+                   ELSE done_at END,
+    lock_by = NULL,
+    lock_at = NULL
+WHERE (status IN ('Queued', 'Running') OR lock_by IS NOT NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM apalis.workers AS workers
+      WHERE workers.id = jobs.lock_by AND workers.worker_type = jobs.job_type
+  );
+
+ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_lock_by_worker_type_fkey;
+
 DROP INDEX IF EXISTS apalis.workers_id_idx;
 DROP INDEX IF EXISTS apalis.unique_worker_id;
 DROP INDEX IF EXISTS apalis.workers_worker_type_idx;
@@ -14,35 +42,33 @@ DROP INDEX IF EXISTS apalis.idx_jobs_idempotency_key;
 -- with a different predicate is still present.
 DROP INDEX IF EXISTS apalis.jobs_locked_by_queue_idx;
 
-ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_lock_by_fkey;
-ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_lock_by_worker_type_fkey;
-
-UPDATE apalis.jobs AS jobs
-SET status = 'Pending',
-    lock_by = NULL,
-    lock_at = NULL
-WHERE lock_by IS NOT NULL
-    AND NOT EXISTS (
-        SELECT 1
-        FROM apalis.workers AS workers
-        WHERE workers.id = jobs.lock_by
-            AND workers.worker_type = jobs.job_type
-    );
-
 UPDATE apalis.jobs
 SET lock_at = date_trunc('second', lock_at)
 WHERE lock_at IS NOT NULL;
 
-ALTER TABLE apalis.workers DROP CONSTRAINT IF EXISTS workers_pkey CASCADE;
-ALTER TABLE apalis.workers
-    ADD CONSTRAINT workers_pkey PRIMARY KEY (id, worker_type);
+-- A correct composite key can have application-owned dependants. Keep it.
+-- For an incompatible key, PostgreSQL RESTRICT rejects external dependants
+-- atomically; never drop an application's foreign keys with CASCADE.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint c
+        WHERE c.conrelid = 'apalis.workers'::regclass AND c.contype = 'p'
+          AND c.conkey = ARRAY[
+              (SELECT attnum FROM pg_attribute WHERE attrelid = c.conrelid AND attname = 'id'),
+              (SELECT attnum FROM pg_attribute WHERE attrelid = c.conrelid AND attname = 'worker_type')]
+    ) THEN
+        ALTER TABLE apalis.workers DROP CONSTRAINT IF EXISTS workers_pkey;
+        ALTER TABLE apalis.workers ADD CONSTRAINT workers_pkey PRIMARY KEY (id, worker_type);
+    END IF;
+END $$;
 
 DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'jobs_status_check'
-            AND connamespace = 'apalis'::regnamespace
+            AND conrelid = 'apalis.jobs'::regclass
     ) THEN
         ALTER TABLE apalis.jobs
             ADD CONSTRAINT jobs_status_check
@@ -52,7 +78,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'jobs_attempts_check'
-            AND connamespace = 'apalis'::regnamespace
+            AND conrelid = 'apalis.jobs'::regclass
     ) THEN
         ALTER TABLE apalis.jobs
             ADD CONSTRAINT jobs_attempts_check CHECK (attempts >= 0);
@@ -61,7 +87,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'jobs_max_attempts_check'
-            AND connamespace = 'apalis'::regnamespace
+            AND conrelid = 'apalis.jobs'::regclass
     ) THEN
         ALTER TABLE apalis.jobs
             ADD CONSTRAINT jobs_max_attempts_check CHECK (max_attempts > 0);
@@ -70,7 +96,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'jobs_attempts_lte_max_attempts_check'
-            AND connamespace = 'apalis'::regnamespace
+            AND conrelid = 'apalis.jobs'::regclass
     ) THEN
         ALTER TABLE apalis.jobs
             ADD CONSTRAINT jobs_attempts_lte_max_attempts_check
@@ -80,7 +106,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'jobs_priority_check'
-            AND connamespace = 'apalis'::regnamespace
+            AND conrelid = 'apalis.jobs'::regclass
     ) THEN
         ALTER TABLE apalis.jobs
             ADD CONSTRAINT jobs_priority_check CHECK (priority IS NULL OR priority >= 0);
@@ -112,8 +138,7 @@ CREATE INDEX IF NOT EXISTS jobs_list_all_idx
 -- job_type)` and filters `status IN ('Running', 'Queued')`. A `WHERE lock_by
 -- IS NOT NULL` partial index lets PostgreSQL skip rows without a lock owner,
 -- but it still has to re-check every locked row's status. Adding the status
--- predicate to the partial index makes the orphan-recovery scan strictly
--- index-only.
+-- predicate reduces the candidates that orphan recovery must inspect.
 CREATE INDEX IF NOT EXISTS jobs_locked_by_queue_idx
     ON apalis.jobs(job_type, lock_by)
     WHERE lock_by IS NOT NULL
@@ -135,12 +160,18 @@ CREATE OR REPLACE FUNCTION apalis.get_jobs(
     v_job_count INTEGER DEFAULT 5
 ) RETURNS SETOF apalis.jobs AS $$
 BEGIN
+    -- Match native claim/recovery ordering even for this trusted, token-free API.
+    -- The FK's implicit worker KEY SHARE would otherwise happen after job locks.
+    PERFORM 1 FROM apalis.workers AS worker
+    WHERE worker.id = worker_id AND worker.worker_type = v_job_type
+    FOR SHARE;
+
     RETURN QUERY
     WITH next_jobs AS (
         SELECT id
         FROM apalis.jobs
-        WHERE (status = 'Pending' OR (status = 'Failed' AND attempts < max_attempts))
-            AND run_at <= now()
+        WHERE (status IN ('Pending', 'Failed') AND attempts < max_attempts)
+            AND run_at <= statement_timestamp()
             AND job_type = v_job_type
         ORDER BY priority DESC, run_at ASC
         LIMIT v_job_count
@@ -149,9 +180,12 @@ BEGIN
     UPDATE apalis.jobs
     SET status = 'Queued',
         lock_by = worker_id,
-        lock_at = date_trunc('second', now())
+        lock_at = date_trunc('second', statement_timestamp()),
+        done_at = NULL
     FROM next_jobs
     WHERE apalis.jobs.id = next_jobs.id
     RETURNING apalis.jobs.*;
 END;
-$$ LANGUAGE plpgsql VOLATILE;
+$$ LANGUAGE plpgsql VOLATILE
+   SECURITY INVOKER
+   SET search_path = pg_catalog, apalis, pg_temp;

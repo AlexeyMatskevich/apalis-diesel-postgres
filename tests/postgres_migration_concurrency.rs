@@ -1,964 +1,1168 @@
-//! Regression spec for concurrent `setup()`.
-//!
-//! `apalis_diesel_postgres::setup` runs the embedded migrations. Several
-//! application replicas booting against a *fresh* database at once each call
-//! `setup()` concurrently; without the session-level advisory lock added to
-//! `src/queries/migrations.rs`, all-but-one racer crashes — migration `0`'s
-//! non-idempotent `CREATE SCHEMA`/`CREATE FUNCTION`/`CREATE TRIGGER` DDL and the
-//! `__diesel_schema_migrations` version insert collide on PostgreSQL catalog
-//! unique indexes, surfacing as `Error::Migration` (`duplicate key ...`).
-//!
-//! This spec creates a throwaway database, fires N concurrent `setup()` calls
-//! against it from cold, and asserts every one succeeds. It is isolated from the
-//! shared test database so it never disturbs the other integration suites.
-//!
-//! Gating: skips when `DATABASE_URL` is unset (like the other suites) and also
-//! when the connecting role lacks `CREATEDB` (the throwaway database cannot be
-//! provisioned). Set `APALIS_DIESEL_POSTGRES_REQUIRE_DATABASE=1` to turn the
-//! missing-`DATABASE_URL` skip into a hard failure.
-
+//! Actual setup/verify contracts against one task-owned database per leaf.
+//! The test role must create/drop databases and create, assume, and drop its own
+//! roles (use a superuser only in a disposable test cluster). Infrastructure
+//! failure is a test failure. Only explicit optional mode may omit DATABASE_URL.
 #![cfg(feature = "tokio")]
-
 mod support;
 
-use apalis_diesel_postgres::{build_pool_with, setup};
-use diesel::{Connection, PgConnection, RunQueryDsl, sql_query};
-use lets_expect::{AssertionError, AssertionResult, *};
-use ulid::Ulid;
-
-/// Number of replicas racing `setup()` against the cold database.
-const RACERS: usize = 8;
+use apalis_diesel_postgres::{Error, MIGRATIONS, PgPool, build_pool_with, setup, verify_schema};
+use diesel::{
+    Connection, PgConnection, QueryableByName, RunQueryDsl,
+    connection::{InstrumentationEvent, SimpleConnection},
+    r2d2::CustomizeConnection,
+    sql_query,
+};
+use diesel_migrations::MigrationHarness;
+use lets_expect::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use support::{Outcome, observe, with_conn, with_isolated_database};
 
 #[derive(Debug)]
-enum Outcome {
-    Skipped,
-    Completed(Vec<Result<(), String>>),
+struct Observations(Vec<(String, bool)>);
+impl Observations {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+    fn check(&mut self, name: &str, passed: bool) {
+        self.0.push((name.into(), passed));
+    }
+}
+fn satisfies_contract() -> impl Fn(&Result<Outcome<Observations>, String>) -> AssertionResult {
+    observe("schema lifecycle", |run: &Observations| {
+        let failed: Vec<_> = run
+            .0
+            .iter()
+            .filter(|(_, passed)| !passed)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if run.0.is_empty() {
+            Err("scenario made no observations".into())
+        } else if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
+    })
+}
+fn pool(url: &str) -> Result<PgPool, String> {
+    build_pool_with(url, |b| b.max_size(1)).map_err(|e| e.to_string())
+}
+async fn sql(pool: &PgPool, text: impl Into<String>) -> Result<(), String> {
+    let text = text.into();
+    with_conn(pool.clone(), move |conn| {
+        conn.batch_execute(&text).map_err(|e| e.to_string())
+    })
+    .await
+}
+async fn count(pool: &PgPool, text: &str) -> Result<i64, String> {
+    #[derive(QueryableByName)]
+    struct N {
+        #[diesel(sql_type=diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let text = text.to_owned();
+    with_conn(pool.clone(), move |conn| {
+        sql_query(text)
+            .get_result::<N>(conn)
+            .map(|v| v.n)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+async fn locks(pool: &PgPool) -> Result<i64, String> {
+    count(pool, "SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype='advisory' AND classid=hashtext('apalis_diesel_postgres')::oid AND objid=hashtext('migrations')::oid AND objsubid=2 AND database=(SELECT oid FROM pg_database WHERE datname=current_database())").await
+}
+// Local panic completion does not acknowledge remote backend rollback. Taking
+// the same lock proves the next migration can proceed; timeout remains a failure.
+async fn require_migration_progress(pool: &PgPool) -> Result<(), String> {
+    with_conn(pool.clone(), |conn| {
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            conn.batch_execute("SET LOCAL lock_timeout = '5s'; SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('apalis_diesel_postgres'), pg_catalog.hashtext('migrations'))")
+        }).map_err(|error| error.to_string())
+    }).await
 }
 
-/// Swap the database name in a libpq URL, preserving scheme/host/port and any
-/// `?query` parameters. `postgres://h:5432/old?sslmode=disable` becomes
-/// `postgres://h:5432/<new>?sslmode=disable`.
-fn with_database_name(url: &str, database: &str) -> Result<String, String> {
-    let scheme_end = url.find("://").ok_or("database URL has no scheme")? + 3;
-    let rest = &url[scheme_end..];
-    let path_start = rest.find('/').ok_or("database URL has no path")?;
-    let authority = &rest[..path_start];
-    let after_path = &rest[path_start + 1..];
-    let query = after_path.find('?').map(|q| &after_path[q..]).unwrap_or("");
-    Ok(format!(
-        "{}{authority}/{database}{query}",
-        &url[..scheme_end]
+async fn absent_private_schema(pool: &PgPool) -> Result<bool, String> {
+    Ok(count(
+        pool,
+        "SELECT count(*)::bigint AS n FROM pg_namespace WHERE nspname='apalis_diesel_postgres'",
+    )
+    .await?
+        == 0)
+}
+
+#[derive(Clone, Copy)]
+enum Scenario {
+    Fresh,
+    ForeignHistory,
+    ForgedHistory,
+    Baseline,
+    Initial,
+    Legacy,
+    ExternalLegacy,
+    Unsupported,
+    DriftColumn,
+    DriftConstraint,
+    DriftIndex,
+    TemporaryJournal,
+    Concurrent,
+    Contended,
+    DowngradeCollision,
+    DowngradeUnique,
+}
+
+async fn migration_scenario(kind: Scenario) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move |url| async move {
+        let pool = pool(&url)?;
+        let mut out = Observations::new();
+        match kind {
+            Scenario::Fresh | Scenario::ForeignHistory | Scenario::TemporaryJournal => {
+                if matches!(kind, Scenario::ForeignHistory) {
+                    sql(&pool, "CREATE TABLE public.__diesel_schema_migrations(version varchar(50) PRIMARY KEY, run_on timestamp NOT NULL DEFAULT now()); INSERT INTO public.__diesel_schema_migrations(version) VALUES ('00000000000000')").await?;
+                }
+                if matches!(kind, Scenario::TemporaryJournal) {
+                    sql(&pool, "CREATE TEMP TABLE __diesel_schema_migrations(version varchar(50) PRIMARY KEY, run_on timestamp NOT NULL DEFAULT now()); INSERT INTO __diesel_schema_migrations(version) VALUES ('00000000000000')").await?;
+                }
+                out.check("uninitialized verification fails", matches!(verify_schema(&pool).await, Err(Error::Migration(_))));
+                setup(&pool).await.map_err(|e| e.to_string())?;
+                out.check("verification accepts the completed schema", verify_schema(&pool).await.is_ok());
+                out.check("all migrations are recorded privately", count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+                out.check("search_path is restored", count(&pool, "SELECT (current_setting('search_path') = '\"$user\", public')::integer::bigint AS n").await? == 1);
+                if matches!(kind, Scenario::ForeignHistory) {
+                    out.check("foreign history is unchanged", count(&pool, "SELECT count(*)::bigint AS n FROM public.__diesel_schema_migrations WHERE version='00000000000000'").await? == 1);
+                }
+                if matches!(kind, Scenario::TemporaryJournal) {
+                    out.check("temporary history is unchanged", count(&pool, "SELECT count(*)::bigint AS n FROM pg_temp.__diesel_schema_migrations WHERE version='00000000000000'").await? == 1);
+                }
+                out.check("setup is repeatable", setup(&pool).await.is_ok());
+            }
+            Scenario::ForgedHistory => {
+                sql(&pool, "CREATE SCHEMA apalis_diesel_postgres; CREATE TABLE apalis_diesel_postgres.__diesel_schema_migrations(version varchar(50) PRIMARY KEY, run_on timestamp NOT NULL DEFAULT now()); INSERT INTO apalis_diesel_postgres.__diesel_schema_migrations(version) VALUES ('00000000000000'),('20260520000000'),('20260521000000'),('20260521000001'),('20260521000002'),('20260521000003'),('20260521000004'),('20260521000005'),('20260521000006'),('20260910000000'),('20260910000001')").await?;
+                out.check("stamps without tables fail verification", matches!(verify_schema(&pool).await, Err(Error::Migration(_))));
+                out.check("setup rejects stamped schema damage", matches!(setup(&pool).await, Err(Error::Migration(_))));
+            }
+            Scenario::Baseline | Scenario::Initial => {
+                sql(&pool, if matches!(kind,Scenario::Baseline) { include_str!("fixtures/apalis-diesel-postgres-0.4.1.sql") }
+                           else { include_str!("fixtures/apalis-diesel-postgres-initial.sql") }).await?;
+                sql(&pool, "CREATE TABLE public.application_worker_ref(worker_id text, queue text, CONSTRAINT application_worker_fk FOREIGN KEY(worker_id,queue) REFERENCES apalis.workers(id,worker_type)); INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('same','queue-a','fixture'),('same','queue-b','fixture'); INSERT INTO public.application_worker_ref VALUES ('same','queue-a')").await?;
+                setup(&pool).await.map_err(|e| e.to_string())?;
+                out.check("baseline adopts and verifies", verify_schema(&pool).await.is_ok());
+                out.check("external composite FK survives adoption", count(&pool,"SELECT count(*)::bigint AS n FROM pg_constraint WHERE conrelid='public.application_worker_ref'::regclass AND conname='application_worker_fk'").await? == 1);
+                out.check("both queue registrations survive", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.workers WHERE id='same'").await? == 2);
+            }
+            Scenario::Legacy | Scenario::ExternalLegacy => {
+                sql(&pool, include_str!("fixtures/apalis-postgres-1.0.0-rc.8.sql")).await?;
+                if matches!(kind, Scenario::ExternalLegacy) {
+                    sql(&pool, "CREATE TABLE public.application_worker_ref(worker_id text REFERENCES apalis.workers(id)); INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('worker','other','fixture'); INSERT INTO public.application_worker_ref VALUES ('worker')").await?;
+                    out.check("incompatible external dependency refuses upgrade", matches!(setup(&pool).await, Err(Error::Migration(_))));
+                    out.check("failed upgrade leaves no private history", absent_private_schema(&pool).await?);
+                    out.check("external FK and row survive", count(&pool,"SELECT count(*)::bigint AS n FROM pg_constraint WHERE conrelid='public.application_worker_ref'::regclass AND contype='f'").await? == 1 && count(&pool,"SELECT count(*)::bigint AS n FROM public.application_worker_ref").await? == 1);
+                    // Only this fixture owns this dependency; removing it allows retry.
+                    sql(&pool,"DROP TABLE public.application_worker_ref").await?;
+                    setup(&pool).await.map_err(|e| e.to_string())?;
+                    out.check("retry succeeds after explicit dependency resolution", verify_schema(&pool).await.is_ok());
+                } else {
+                    sql(&pool, "INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('worker','other','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,lock_by,done_at,last_result) SELECT s,'target',decode('22','hex'),s,3,3,'worker','2020-01-01'::timestamptz,'\"retained\"'::jsonb FROM unnest(ARRAY['Pending','Queued','Running','Done','Failed','Killed']) s; INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,lock_by) VALUES ('has-budget','target',decode('22','hex'),'Running',0,3,'worker'),('no-owner','target',decode('22','hex'),'Running',0,3,NULL)").await?;
+                    sql(&pool,"INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('healthy','target','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,lock_by) VALUES ('healthy','target',decode('22','hex'),'Running',0,3,'healthy')").await?;
+                    setup(&pool).await.map_err(|e| e.to_string())?;
+                    out.check("valid legacy attribution is retained",count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id='healthy' AND status='Running' AND attempts=0 AND lock_by='healthy'").await? == 1);
+                    out.check("upstream schema verifies after upgrade", verify_schema(&pool).await.is_ok());
+                    out.check("terminal status and history survive", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id IN ('Done','Failed','Killed','Pending') AND status=id AND attempts=3 AND last_result='\"retained\"'::jsonb AND done_at='2020-01-01'::timestamptz AND lock_by IS NULL").await? == 4);
+                    out.check("exhausted active executions become terminal", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id IN ('Running','Queued') AND status='Killed' AND attempts=3 AND done_at IS NOT NULL AND last_result ? 'Err' AND lock_by IS NULL").await? == 2);
+                    out.check("lost active executions consume one attempt and recover", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id IN ('has-budget','no-owner') AND status='Pending' AND attempts=1 AND done_at IS NULL AND lock_by IS NULL").await? == 2);
+                    sql(&pool,"INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('new','target','fixture')").await?;
+                    out.check("only jobs with remaining budget can be claimed", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.get_jobs('new','target',100)").await? == 2);
+                }
+            }
+            Scenario::Unsupported => {
+                sql(&pool,"CREATE SCHEMA apalis; CREATE TABLE apalis.jobs(id integer PRIMARY KEY); INSERT INTO apalis.jobs VALUES(42)").await?;
+                out.check("unsupported partial schema fails explicitly", matches!(setup(&pool).await, Err(Error::Migration(_))));
+                out.check("unsupported data survives", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id=42").await? == 1);
+                out.check("failed setup rolls back journal creation", absent_private_schema(&pool).await?);
+            }
+            Scenario::DriftColumn | Scenario::DriftConstraint | Scenario::DriftIndex => {
+                setup(&pool).await.map_err(|e| e.to_string())?;
+                let change = match kind {
+                    Scenario::DriftColumn => "ALTER TABLE apalis.workers DROP COLUMN lease_token",
+                    Scenario::DriftConstraint => "ALTER TABLE apalis.jobs DROP CONSTRAINT jobs_attempts_check; ALTER TABLE apalis.jobs ADD CONSTRAINT jobs_attempts_check CHECK(attempts >= -1)",
+                    _ => "DROP INDEX apalis.idx_jobs_idempotency_key; CREATE INDEX idx_jobs_idempotency_key ON apalis.jobs(job_type,idempotency_key)",
+                };
+                sql(&pool,change).await?;
+                out.check("schema drift fails verification despite current history", matches!(verify_schema(&pool).await,Err(Error::Migration(_))));
+                out.check("setup does not bless drift", matches!(setup(&pool).await,Err(Error::Migration(_))));
+            }
+            Scenario::Concurrent | Scenario::Contended => {
+                let barrier = Arc::new(tokio::sync::Barrier::new(8));
+                let mut racers = Vec::new();
+                for _ in 0..8 {
+                    let pool = if matches!(kind,Scenario::Contended) { pool.clone() } else { self::pool(&url)? };
+                    let barrier = barrier.clone();
+                    racers.push(tokio::spawn(async move { barrier.wait().await; setup(&pool).await.map_err(|e|e.to_string()) }));
+                }
+                for racer in racers { racer.await.map_err(|e|e.to_string())??; }
+                out.check("all racers produce one valid schema",verify_schema(&pool).await.is_ok());
+                out.check("history contains one copy of every migration",count(&pool,"SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+            }
+            Scenario::DowngradeCollision | Scenario::DowngradeUnique => {
+                setup(&pool).await.map_err(|e|e.to_string())?;
+                sql(&pool, if matches!(kind,Scenario::DowngradeCollision) {
+                    "INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('same','a','fixture'),('same','b','fixture')"
+                } else { "INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('one','a','fixture'),('two','b','fixture')" }).await?;
+                let result = with_conn(pool.clone(), |conn| conn.transaction::<_,diesel::result::Error,_>(|conn| conn.batch_execute(include_str!("../migrations/20260521000000_harden_apalis_sql/down.sql"))).map_err(|e|e.to_string())).await;
+                out.check("downgrade result follows representable identity",result.is_err() == matches!(kind,Scenario::DowngradeCollision));
+                out.check("downgrade preserves every worker",count(&pool,"SELECT count(*)::bigint AS n FROM apalis.workers").await? == 2);
+                if matches!(kind,Scenario::DowngradeCollision) { out.check("rejected downgrade leaves current schema intact",verify_schema(&pool).await.is_ok()); }
+                else {
+                    sql(&pool,include_str!("../migrations/20260521000000_harden_apalis_sql/up.sql")).await?;
+                    sql(&pool,include_str!("../migrations/20260910000000_reconcile_schema_contract/up.sql")).await?;
+                    sql(&pool,include_str!("../migrations/20260910000001_listing_id_tie_breaker/up.sql")).await?;
+                    sql(&pool,include_str!("../migrations/20260912000000_worker_key_share/up.sql")).await?;
+                    sql(&pool,include_str!("../migrations/20260912000001_require_active_owner/up.sql")).await?;
+                    out.check("supported downgrade can be upgraded again",verify_schema(&pool).await.is_ok());
+                }
+            }
+        }
+        out.check("no migration advisory lock survives",locks(&pool).await? == 0);
+        Ok(out)
+    }).await
+}
+
+#[derive(Debug)]
+struct PanicOnce(Arc<AtomicBool>);
+impl CustomizeConnection<PgConnection, diesel::r2d2::Error> for PanicOnce {
+    fn on_acquire(&self, conn: &mut PgConnection) -> Result<(), diesel::r2d2::Error> {
+        let armed = self.0.clone();
+        conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+            if let InstrumentationEvent::StartQuery { query, .. } = event
+                && query.to_string().contains("Reconcile deployed schemas")
+                && armed.swap(false, Ordering::SeqCst)
+            {
+                panic!("injected panic inside actual setup after earlier migrations");
+            }
+        });
+        Ok(())
+    }
+}
+async fn panicking_setup() -> Result<Outcome<Observations>, String> {
+    with_isolated_database(|url| async move {
+        let armed = Arc::new(AtomicBool::new(true));
+        let flag = armed.clone();
+        let pool = build_pool_with(&url, |b| b.max_size(1).connection_customizer(Box::new(PanicOnce(flag)))).map_err(|e|e.to_string())?;
+        let result = setup(&pool).await;
+        let observer = self::pool(&url)?;
+        require_migration_progress(&observer).await?;
+        let mut out = Observations::new();
+        out.check("instrumentation actually reached a late migration",!armed.load(Ordering::SeqCst));
+        out.check("public setup reports blocking panic",matches!(result,Err(Error::Blocking(_))));
+        out.check("all earlier migrations rolled back",count(&observer,"SELECT count(*)::bigint AS n FROM pg_namespace WHERE nspname IN ('apalis','apalis_diesel_postgres')").await? == 0);
+        out.check("panicking setup releases its transaction lock",locks(&observer).await? == 0);
+        setup(&pool).await.map_err(|e|e.to_string())?;
+        out.check("same pool recovers for subsequent setup",verify_schema(&pool).await.is_ok());
+        Ok(out)
+    }).await
+}
+
+const LISTING_MIGRATION_VERSION: &str = "20260910000001";
+
+async fn previous_listing_generation(pool: &PgPool) -> Result<(), String> {
+    with_conn(pool.clone(), |conn| {
+        conn.transaction::<_, Error, _>(|conn| {
+            conn.batch_execute(
+                "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('apalis_diesel_postgres'), pg_catalog.hashtext('migrations')); \
+                 CREATE SCHEMA apalis_diesel_postgres; \
+                 SET LOCAL search_path = apalis_diesel_postgres, pg_catalog, pg_temp",
+            )
+            .map_err(|error| Error::Migration(Box::new(error)))?;
+            let mut migrations = conn.pending_migrations(MIGRATIONS).map_err(Error::Migration)?;
+            migrations.retain(|migration| {
+                migration.name().version().to_string().as_str() < LISTING_MIGRATION_VERSION
+            });
+            conn.run_migrations(&migrations).map_err(Error::Migration)?;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn catalog_text(pool: &PgPool, query: &str) -> Result<String, String> {
+    #[derive(QueryableByName)]
+    struct Value {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+    let query = query.to_owned();
+    with_conn(pool.clone(), move |conn| {
+        sql_query(query)
+            .get_result::<Value>(conn)
+            .map(|row| row.value)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+// Include every job/worker field and the original journal timestamps, so an
+// index-only migration cannot silently rewrite either application data or history.
+async fn listing_data_and_history(pool: &PgPool) -> Result<String, String> {
+    catalog_text(pool,
+        "SELECT jsonb_build_object( \
+          'jobs', (SELECT jsonb_agg(to_jsonb(j) ORDER BY id) FROM apalis.jobs j), \
+          'workers', (SELECT jsonb_agg(to_jsonb(w) ORDER BY id,worker_type) FROM apalis.workers w), \
+          'history', (SELECT jsonb_agg(to_jsonb(h) ORDER BY version) \
+                      FROM apalis_diesel_postgres.__diesel_schema_migrations h \
+                      WHERE version < '20260910000001'))::text AS value").await
+}
+
+#[derive(Clone, Copy)]
+enum ListingIndex {
+    Queue,
+    Global,
+}
+impl ListingIndex {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Queue => "jobs_list_by_queue_idx",
+            Self::Global => "jobs_list_all_idx",
+        }
+    }
+    fn definition(self, tie_breaker: &str) -> String {
+        let equality_prefix = match self {
+            Self::Queue => "job_type, status",
+            Self::Global => "status",
+        };
+        format!(
+            "CREATE INDEX {} ON apalis.jobs USING btree ({equality_prefix}, done_at DESC, run_at DESC{tie_breaker})",
+            self.name()
+        )
+    }
+}
+
+async fn listing_indexes_match(pool: &PgPool, tie_breaker: &str) -> Result<bool, String> {
+    let mut matched = true;
+    for index in [ListingIndex::Queue, ListingIndex::Global] {
+        let definition = catalog_text(
+            pool,
+            &format!(
+                "SELECT COALESCE(pg_get_indexdef(to_regclass('apalis.{}')), '<missing>') AS value",
+                index.name()
+            ),
+        )
+        .await?;
+        matched &= definition == index.definition(tie_breaker);
+    }
+    Ok(matched)
+}
+
+#[derive(Debug)]
+struct PanicAfterListingDdl(Arc<AtomicBool>);
+impl CustomizeConnection<PgConnection, diesel::r2d2::Error> for PanicAfterListingDdl {
+    fn on_acquire(&self, conn: &mut PgConnection) -> Result<(), diesel::r2d2::Error> {
+        let armed = self.0.clone();
+        conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+            if let InstrumentationEvent::FinishQuery {
+                query, error: None, ..
+            } = event
+                && query.to_string().contains("Extend listing indexes")
+                && armed.swap(false, Ordering::SeqCst)
+            {
+                // PostgreSQL has accepted both new index definitions, but the
+                // migration journal and outer setup transaction have not committed.
+                panic!("injected panic after successful listing index DDL");
+            }
+        });
+        Ok(())
+    }
+}
+
+async fn listing_index_upgrade(panics: bool) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move |url| async move {
+        let observer = pool(&url)?;
+        previous_listing_generation(&observer).await?;
+        sql(&observer,
+            "INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES \
+             ('retained-worker','queue-a','fixture'),('retained-worker','queue-b','fixture'); \
+             INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,done_at,last_result) VALUES \
+             ('pending','queue-a',decode('2222','hex'),'Pending',0,3,'2024-01-01',NULL,NULL), \
+             ('done','queue-a',decode('22646f6e6522','hex'),'Done',1,3,'2024-01-01','2024-01-02','{\"Ok\":\"retained\"}'), \
+             ('failed','queue-b',decode('226661696c656422','hex'),'Failed',2,3,'2024-01-01','2024-01-02','{\"Err\":\"retained\"}')").await?;
+        let before = listing_data_and_history(&observer).await?;
+        let mut out = Observations::new();
+        out.check("fixture has the previous ten migration records", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 10);
+        out.check("fixture has both previous listing indexes", listing_indexes_match(&observer, "").await?);
+        let armed = Arc::new(AtomicBool::new(panics));
+        let flag = armed.clone();
+        let migrator = build_pool_with(&url, |builder| builder.max_size(1).connection_customizer(Box::new(PanicAfterListingDdl(flag)))).map_err(|error| error.to_string())?;
+        let result = setup(&migrator).await;
+        if panics {
+            out.check("the successful DDL result actually triggers the panic", !armed.load(Ordering::SeqCst));
+            out.check("public setup reports the blocking panic", matches!(result, Err(Error::Blocking(_))));
+            // A fresh connection sees only durable state, independently of the
+            // panicked connection's local transaction/session state.
+            let after_panic = pool(&url)?;
+            require_migration_progress(&after_panic).await?;
+            out.check("rollback restores both previous index definitions", listing_indexes_match(&after_panic, "").await?);
+            out.check("rollback preserves every job, worker, and original journal row", listing_data_and_history(&after_panic).await? == before);
+            out.check("rollback adds no successful migration record", count(&after_panic, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 10);
+            out.check("rollback releases the migration advisory lock", locks(&after_panic).await? == 0);
+            setup(&migrator).await.map_err(|error| error.to_string())?;
+        } else {
+            out.check("setup upgrades the previous owned generation", result.is_ok());
+        }
+        out.check("upgrade installs both complete descending listing indexes", listing_indexes_match(&observer, ", id DESC").await?);
+        out.check("the upgraded schema verifies", verify_schema(&observer).await.is_ok());
+        out.check("upgrade preserves all original data and journal timestamps", listing_data_and_history(&observer).await? == before);
+        out.check("upgrade records exactly thirteen migrations", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+        let upgraded_history = catalog_text(&observer, "SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM apalis_diesel_postgres.__diesel_schema_migrations h").await?;
+        out.check("repeated setup succeeds on the same pool", setup(&migrator).await.is_ok());
+        out.check("repeated setup preserves the complete index contract", listing_indexes_match(&observer, ", id DESC").await?);
+        out.check("repeated setup preserves data and old journal rows", listing_data_and_history(&observer).await? == before);
+        out.check("repeated setup preserves the entire upgraded journal", catalog_text(&observer, "SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM apalis_diesel_postgres.__diesel_schema_migrations h").await? == upgraded_history);
+        if !panics {
+            with_conn(migrator.clone(), |conn| {
+                conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                    conn.batch_execute(include_str!("../migrations/20260910000001_listing_id_tie_breaker/down.sql"))?;
+                    conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version='20260910000001'")
+                }).map_err(|error| error.to_string())
+            }).await?;
+            out.check("down restores exactly both previous index definitions", listing_indexes_match(&observer, "").await?);
+            out.check("down preserves data and all previous journal records", listing_data_and_history(&observer).await? == before);
+            out.check("down removes only the listing migration record", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 12);
+            setup(&migrator).await.map_err(|error| error.to_string())?;
+            out.check("public setup upgrades the downgraded schema again", verify_schema(&observer).await.is_ok() && listing_indexes_match(&observer, ", id DESC").await?);
+            out.check("reupgrade preserves application data and old history", listing_data_and_history(&observer).await? == before);
+        }
+        out.check("no migration advisory lock survives the scenario", locks(&observer).await? == 0);
+        Ok(out)
+    }).await
+}
+
+#[derive(Clone, Copy)]
+enum IndexDrift {
+    MissingTieBreaker,
+    AscendingTieBreaker,
+    MissingIndex,
+}
+
+fn reports_index_contract(result: &Result<(), Error>, index: ListingIndex) -> bool {
+    matches!(result, Err(Error::Migration(error)) if error.to_string() == format!(
+        "schema does not satisfy the runtime contract: index {}", index.name()
     ))
 }
 
-fn maintenance_conn(url: &str) -> Result<PgConnection, String> {
-    PgConnection::establish(url).map_err(|error| error.to_string())
-}
-
-/// `true` when the current role may `CREATE DATABASE`.
-fn can_create_database(conn: &mut PgConnection) -> Result<bool, String> {
-    #[derive(diesel::QueryableByName)]
-    struct Flag {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        rolcreatedb: bool,
-    }
-    sql_query("SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user")
-        .load::<Flag>(conn)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .next()
-        .map(|row| row.rolcreatedb)
-        .ok_or_else(|| "current_user not found in pg_roles".to_owned())
-}
-
-/// A provisioned throwaway database, isolated from the shared test database so
-/// these specs never disturb the other suites. `url` connects to the throwaway
-/// database; `maintenance_url` connects to the original database and is used to
-/// `DROP` it during teardown.
-struct ColdDb {
-    name: String,
-    url: String,
-    maintenance_url: String,
-}
-
-/// Provision a cold throwaway database named `<prefix>_<ulid>`. DDL identifiers
-/// cannot be bound, so the generated Ulid is interpolated; its Crockford-base32
-/// charset is injection-safe. Returns `Ok(None)` when the environment cannot
-/// provide one — `DATABASE_URL` unset, the role lacks `CREATEDB`, the URL cannot
-/// be rewritten, or (a libpq `?dbname=` safety guard) the rewritten URL resolves
-/// back to the main database. The caller must
-/// `drop_temp_db(&db.maintenance_url, &db.name)` on every path.
-async fn provision_cold_db(prefix: &str) -> Result<Option<ColdDb>, String> {
-    let Some(maintenance_url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-
-    let name = format!("{prefix}_{}", Ulid::new().to_string().to_lowercase());
-    let provisioned = {
-        let create_url = maintenance_url.clone();
-        let name = name.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let mut conn = maintenance_conn(&create_url)?;
-            if !can_create_database(&mut conn)? {
-                return Ok(false);
-            }
-            sql_query(format!("CREATE DATABASE \"{name}\""))
-                .execute(&mut conn)
-                .map_err(|error| error.to_string())?;
-            Ok(true)
-        })
-        .await
-        .map_err(|error| error.to_string())??
-    };
-    if !provisioned {
-        return Ok(None);
-    }
-
-    let url = match with_database_name(&maintenance_url, &name) {
-        Ok(url) => url,
-        Err(_) => {
-            drop_temp_db(&maintenance_url, &name).await;
-            return Ok(None);
-        }
-    };
-
-    // SAFETY: confirm `url` resolves to the throwaway database before anyone
-    // runs setup() against it. A `DATABASE_URL` carrying a `?dbname=` query
-    // parameter (or other libpq form) can resolve back to the main database
-    // despite the swapped path; refuse to proceed if so.
-    let on_temp_db = {
-        let url = url.clone();
-        let expected = name.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let mut conn = maintenance_conn(&url)?;
-            #[derive(diesel::QueryableByName)]
-            struct Db {
-                #[diesel(sql_type = diesel::sql_types::Text)]
-                db: String,
-            }
-            let actual = sql_query("SELECT current_database()::text AS db")
-                .load::<Db>(&mut conn)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .next()
-                .map(|row| row.db)
-                .ok_or_else(|| "current_database() returned no row".to_owned())?;
-            Ok(actual == expected)
-        })
-        .await
-        .map_err(|e| e.to_string())??
-    };
-    if !on_temp_db {
-        drop_temp_db(&maintenance_url, &name).await;
-        return Ok(None);
-    }
-
-    Ok(Some(ColdDb {
-        name,
-        url,
-        maintenance_url,
-    }))
-}
-
-/// Mirror of the crate's `ACQUIRE_MIGRATION_LOCK` (`src/queries/migrations.rs`),
-/// kept in lock-step so the pre-leak in `run_setup_drains_a_leaked_lock` targets
-/// the exact key `setup()` uses.
-const ACQUIRE_MIGRATION_LOCK: &str =
-    "SELECT pg_advisory_lock(hashtext('apalis_diesel_postgres'), hashtext('migrations'))";
-/// Mirror of the crate's `RELEASE_MIGRATION_LOCK`, used to drain the advisory lock
-/// in `run_panic_unwinds_and_leaves_lock_clean` — the panic-safety reproduction —
-/// after the injected panic, exactly as `setup()`'s panic-handling body does
-/// before it re-raises.
-const RELEASE_MIGRATION_LOCK: &str =
-    "SELECT pg_advisory_unlock(hashtext('apalis_diesel_postgres'), hashtext('migrations'))";
-/// Mirror of the crate's `MIGRATION_LOCK_HELD`: report whether the *current
-/// backend* still holds the migration advisory lock. Scoped to `pg_backend_pid()`
-/// so it observes the connection under test, matching the drain loop in
-/// `release_migration_lock`, which polls presence before each unlock.
-const MIGRATION_LOCK_HELD_ON_CONN: &str = "\
-     SELECT count(*)::bigint AS n FROM pg_locks \
-      WHERE locktype = 'advisory' \
-        AND classid = hashtext('apalis_diesel_postgres')::oid \
-        AND objid = hashtext('migrations')::oid \
-        AND objsubid = 2 \
-        AND pid = pg_backend_pid() \
-        AND database = (SELECT oid FROM pg_database WHERE datname = current_database())";
-
-/// `true` when the backend behind `conn` still holds the migration advisory lock.
-/// Mirrors the crate's `migration_lock_held` presence check.
-fn migration_lock_held_on_conn(conn: &mut PgConnection) -> Result<bool, String> {
-    #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
-    sql_query(MIGRATION_LOCK_HELD_ON_CONN)
-        .load::<Count>(conn)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .next()
-        .map(|row| row.n > 0)
-        .ok_or_else(|| "advisory-lock presence query returned no row".to_owned())
-}
-
-/// Count copies of the migration advisory lock held in the *current* database,
-/// across all backends. Mirrors the crate's key derivation (a two-integer
-/// advisory lock on `hashtext('apalis_diesel_postgres')` / `hashtext('migrations')`
-/// surfaces as an `advisory` row with `objsubid = 2`). Scoping to that key and
-/// the current (throwaway) database — rather than counting every advisory lock
-/// in the cluster — keeps the assertion robust under concurrent test runners and
-/// unrelated advisory locks held elsewhere. There is no `pid` filter on purpose:
-/// the lock under test lives on the pool's backend, a different session than the
-/// one running this query.
-const MIGRATION_LOCK_HELD_IN_DB: &str = "\
-     SELECT count(*)::bigint AS n FROM pg_locks \
-      WHERE locktype = 'advisory' \
-        AND classid = hashtext('apalis_diesel_postgres')::oid \
-        AND objid = hashtext('migrations')::oid \
-        AND objsubid = 2 \
-        AND database = (SELECT oid FROM pg_database WHERE datname = current_database())";
-
-/// Count the migration advisory locks held in the throwaway database reachable
-/// through `url`, from a *separate* maintenance session, so a lock left on the
-/// setup pool's (still-open) connection is visible.
-async fn migration_locks_held_in_db(url: &str) -> Result<i64, String> {
-    let url = url.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<i64, String> {
-        #[derive(diesel::QueryableByName)]
-        struct Count {
-            #[diesel(sql_type = diesel::sql_types::BigInt)]
-            n: i64,
-        }
-        let mut conn = maintenance_conn(&url)?;
-        sql_query(MIGRATION_LOCK_HELD_IN_DB)
-            .load::<Count>(&mut conn)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .next()
-            .map(|row| row.n)
-            .ok_or_else(|| "pg_locks count returned no row".to_owned())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-async fn run_concurrent_setup() -> Result<Outcome, String> {
-    let Some(cold) = provision_cold_db("apalis_mig_race").await? else {
-        return Ok(Outcome::Skipped);
-    };
-
-    // Fire N concurrent `setup()` calls against the cold database. Keep each
-    // pool tiny so the regression test itself cannot exhaust connections.
-    let outcomes = futures::future::join_all((0..RACERS).map(|_| {
-        let temp_url = cold.url.clone();
-        async move {
-            let pool = build_pool_with(&temp_url, |builder| builder.max_size(2).min_idle(Some(0)))
-                .map_err(|error| error.to_string())?;
-            let result = setup(&pool).await.map_err(|error| error.to_string());
-            drop(pool); // close this racer's sessions before the database is dropped
-            result
-        }
-    }))
-    .await;
-
-    // Teardown runs on every path after CREATE so an error cannot leak the DB.
-    drop_temp_db(&cold.maintenance_url, &cold.name).await;
-    Ok(Outcome::Completed(outcomes))
-}
-
-/// Outcome of the contended-cleanup scenario: whether every racing `setup()`
-/// succeeded, and how many copies of the migration advisory lock remained held in
-/// the throwaway database once every racer returned but *before* the pool was
-/// dropped.
-#[derive(Debug)]
-enum ContendedOutcome {
-    Skipped,
-    Completed {
-        results: Vec<Result<(), String>>,
-        advisory_locks_held: i64,
-    },
-}
-
-/// Race N concurrent `setup()` calls that genuinely contend for the migration
-/// advisory lock at the *PostgreSQL* level — each racer on its own backend
-/// connection — then assert the lock is drained to zero on every one of those
-/// backends while they are all still checked out.
-///
-/// A single `max_size(1)` pool would serialize the racers inside r2d2 (they'd
-/// queue for the one connection and never overlap on the server), so they'd
-/// contend for the r2d2 slot, not the Postgres advisory lock. Instead this uses a
-/// pool sized for every racer at once (`max_size(RACERS)`) and *pre-warms* it to
-/// `RACERS` distinct live backends before any `setup()` runs. With every racer
-/// holding a separate backend, the advisory lock is the only thing serializing
-/// them: exactly one holds `pg_advisory_lock` while the rest block on the server,
-/// which is the real contention this scenario exists to exercise.
-///
-/// The advisory-lock count is taken from a separate maintenance session *before*
-/// the pool is dropped and while all `RACERS` connections are still idle in the
-/// pool, so a hold that any racer's release failed to drain would still be sitting
-/// on its backend and be counted. Asserting cleanup here — not just "all
-/// succeeded" — mirrors the single-caller and reentrant scenarios, which already
-/// check the lock is drained to zero.
-async fn run_contended_setup_releases_lock() -> Result<ContendedOutcome, String> {
-    let Some(cold) = provision_cold_db("apalis_mig_contend").await? else {
-        return Ok(ContendedOutcome::Skipped);
-    };
-
-    let outcome = async {
-        // Room for every racer to hold its own backend simultaneously, so they
-        // contend on the Postgres advisory lock rather than on an r2d2 slot.
-        let pool = build_pool_with(&cold.url, |builder| {
-            builder.max_size(RACERS as u32).min_idle(Some(0))
-        })
-        .map_err(|error| error.to_string())?;
-
-        // Pre-warm to RACERS distinct live backends: check out every connection at
-        // once and hold them all before returning them to the pool. r2d2 hands out
-        // a fresh backend for each concurrent checkout, so this guarantees the pool
-        // is backed by RACERS separate PostgreSQL sessions. Without this, r2d2 can
-        // satisfy sequential `setup()` calls by reusing one warmed connection and
-        // the racers would never actually overlap on the server.
-        {
-            let pool = pool.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let mut held = Vec::with_capacity(RACERS);
-                for _ in 0..RACERS {
-                    held.push(pool.get().map_err(|error| error.to_string())?);
-                }
-                drop(held); // all RACERS backends now live and returned to the pool
-                Ok(())
-            })
-            .await
-            .map_err(|error| error.to_string())??;
-        }
-
-        let results = futures::future::join_all((0..RACERS).map(|_| {
-            let pool = pool.clone();
-            async move { setup(&pool).await.map_err(|error| error.to_string()) }
-        }))
-        .await;
-        // Query while the pool (and its RACERS idle connections) is still open, so
-        // a lock any racer left on its backend under contention shows up.
-        let advisory_locks_held = migration_locks_held_in_db(&cold.url).await?;
-        drop(pool);
-        Ok::<ContendedOutcome, String>(ContendedOutcome::Completed {
-            results,
-            advisory_locks_held,
-        })
-    }
-    .await;
-
-    drop_temp_db(&cold.maintenance_url, &cold.name).await;
-    outcome
-}
-
-/// Best-effort drop of a throwaway database (`WITH (FORCE)` terminates lingering
-/// sessions). A leaked test database is harmless but undesirable.
-async fn drop_temp_db(maintenance_url: &str, db_name: &str) {
-    let maintenance_url = maintenance_url.to_owned();
-    let db_name = db_name.to_owned();
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(mut conn) = maintenance_conn(&maintenance_url) {
-            let _ = sql_query(format!(
-                "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-            ))
-            .execute(&mut conn);
-        }
-    })
-    .await;
-}
-
-fn all_setups_succeed() -> impl Fn(&Result<Outcome, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "concurrent setup scenario failed to run: {error}"
-        )])),
-        Ok(Outcome::Skipped) => Ok(()),
-        Ok(Outcome::Completed(outcomes)) => {
-            let failures: Vec<String> = outcomes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, r)| r.as_ref().err().map(|e| format!("racer {i}: {e}")))
-                .collect();
-            if failures.is_empty() {
-                Ok(())
-            } else {
-                Err(AssertionError::new(vec![format!(
-                    "expected all {} concurrent setup() calls to succeed, {} failed:\n{}",
-                    outcomes.len(),
-                    failures.len(),
-                    failures.join("\n")
-                )]))
-            }
-        }
-    }
-}
-
-/// Run `setup()` once against a cold throwaway database and report how many
-/// copies of the migration advisory lock remain held afterwards. The lock is
-/// session-scoped and released inside `setup()`; were the release skipped it
-/// would linger on the pooled (still-open) connection. Querying from a
-/// *separate* maintenance session while the pool is alive detects such a leak.
-/// Returns `None` when the environment cannot provision a database.
-async fn run_setup_releases_lock() -> Result<Option<i64>, String> {
-    let Some(cold) = provision_cold_db("apalis_mig_release").await? else {
-        return Ok(None);
-    };
-
-    let count = async {
-        let pool = build_pool_with(&cold.url, |builder| builder.max_size(2).min_idle(Some(0)))
-            .map_err(|error| error.to_string())?;
+async fn listing_index_verification(
+    index: ListingIndex,
+    drift: IndexDrift,
+) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move |url| async move {
+        let pool = pool(&url)?;
         setup(&pool).await.map_err(|error| error.to_string())?;
-        // Query while the setup pool (and its now-idle connection) is still open,
-        // so a lock left on that connection shows up.
-        let held = migration_locks_held_in_db(&cold.url).await?;
-        drop(pool);
-        Ok::<i64, String>(held)
-    }
-    .await;
-
-    drop_temp_db(&cold.maintenance_url, &cold.name).await;
-    count.map(Some)
-}
-
-/// Reproduce and guard against a *reentrant* advisory-lock leak. PostgreSQL
-/// session advisory locks are reentrant: if a connection handed to `setup()`
-/// already holds the migration lock — as it would after a prior `setup()` whose
-/// release failed while the session stayed alive — this run's acquire bumps the
-/// hold count to 2, and a single `pg_advisory_unlock` only brings it back to 1.
-/// The connection then returns to the pool still owning the lock, letting the
-/// next `setup()` re-enter without blocking and defeating the serialization.
-///
-/// Pin `setup()` to one connection with a `max_size(1)` pool, pre-acquire the
-/// migration lock on it (simulating the leak) and return it to the pool, then
-/// run `setup()`. A correct `setup()` drains every hold to zero; the pre-fix
-/// single release left one behind. Reports how many copies remain, queried from
-/// a separate session while the pool is alive. Returns `None` when the
-/// environment cannot provision a database.
-async fn run_setup_drains_a_leaked_lock() -> Result<Option<i64>, String> {
-    let Some(cold) = provision_cold_db("apalis_mig_leak").await? else {
-        return Ok(None);
-    };
-
-    let count = async {
-        let pool = build_pool_with(&cold.url, |builder| builder.max_size(1).min_idle(Some(0)))
-            .map_err(|error| error.to_string())?;
-
-        // Pre-leak: acquire the migration lock on the pool's single connection
-        // and return it to the pool with the session-level lock still held, so
-        // the following `setup()` checks out a connection that already owns it.
-        {
-            let pool = pool.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let mut conn = pool.get().map_err(|error| error.to_string())?;
-                sql_query(ACQUIRE_MIGRATION_LOCK)
-                    .execute(&mut conn)
-                    .map_err(|error| error.to_string())?;
-                Ok(()) // conn returns to the pool here, session lock still held
-            })
-            .await
-            .map_err(|error| error.to_string())??;
+        let mut change = format!("DROP INDEX apalis.{};", index.name());
+        match drift {
+            IndexDrift::MissingTieBreaker => change.push_str(&index.definition("")),
+            IndexDrift::AscendingTieBreaker => change.push_str(&index.definition(", id ASC")),
+            IndexDrift::MissingIndex => {}
         }
-
-        setup(&pool).await.map_err(|error| error.to_string())?;
-        let held = migration_locks_held_in_db(&cold.url).await?;
-        drop(pool);
-        Ok::<i64, String>(held)
-    }
-    .await;
-
-    drop_temp_db(&cold.maintenance_url, &cold.name).await;
-    count.map(Some)
+        sql(&pool, change).await?;
+        let mut out = Observations::new();
+        out.check("every migration remains recorded despite index drift", count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+        let verification = verify_schema(&pool).await;
+        out.check(&format!("verify identifies only the damaged listing index: {verification:?}"), reports_index_contract(&verification, index));
+        let repeated_setup = setup(&pool).await;
+        out.check(&format!("setup rejects the same structural damage: {repeated_setup:?}"), reports_index_contract(&repeated_setup, index));
+        out.check("rejected setup releases the migration advisory lock", locks(&pool).await? == 0);
+        Ok(out)
+    }).await
 }
 
-/// Outcome of a `setup()` run that is expected to fail inside the migration
-/// runner. `error` is the surfaced `setup()` error rendered as a string;
-/// `advisory_locks_held` is how many copies of the migration advisory lock remain
-/// held in the throwaway database afterwards, queried from a separate maintenance
-/// session while the setup pool is still alive.
-#[derive(Debug)]
-struct FailedSetup {
-    error: String,
-    advisory_locks_held: i64,
-}
-
-/// Force the `Ok(Err(error))` branch of `setup()` — a migration that *fails*
-/// (rather than panics) inside `run_pending_migrations` — and observe both what
-/// error surfaces and whether the advisory lock is still drained.
-///
-/// Pre-create `apalis.jobs` as a stub table missing the columns migration
-/// `00000000000000` indexes. The migration's `CREATE SCHEMA IF NOT EXISTS` /
-/// `CREATE TABLE IF NOT EXISTS` become no-ops, but `CREATE INDEX IF NOT EXISTS
-/// jobs_dequeue_idx ON apalis.jobs(job_type, ...)` then fails with a
-/// "column does not exist" error, so `run_pending_migrations` returns `Ok(Err(_))`.
-///
-/// `setup()` must surface that migration failure as `Error::Migration` — not a
-/// release/lock error — and must still drain the advisory lock to zero on this
-/// failure path (the unconditional `release_migration_lock` before the match).
-/// Returns `None` when the environment cannot provision a database.
-async fn run_setup_against_incompatible_schema() -> Result<Option<FailedSetup>, String> {
-    let Some(cold) = provision_cold_db("apalis_mig_fail").await? else {
-        return Ok(None);
-    };
-
-    let outcome = async {
-        // Seed a conflicting `apalis.jobs` table so migration 0's index DDL fails.
-        {
-            let url = cold.url.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let mut conn = maintenance_conn(&url)?;
-                sql_query("CREATE SCHEMA IF NOT EXISTS apalis")
-                    .execute(&mut conn)
-                    .map_err(|error| error.to_string())?;
-                sql_query("CREATE TABLE apalis.jobs (id TEXT NOT NULL PRIMARY KEY)")
-                    .execute(&mut conn)
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| error.to_string())??;
-        }
-
-        let pool = build_pool_with(&cold.url, |builder| builder.max_size(2).min_idle(Some(0)))
-            .map_err(|error| error.to_string())?;
-        let error = match setup(&pool).await {
-            Ok(()) => {
-                return Err("expected setup() to fail against the incompatible schema, \
-                    but it succeeded"
-                    .to_owned());
+// Hold the registration row while the real SQL function tries to claim. A
+// third backend can lock the job NOWAIT only if the function waits on the
+// worker before taking any job lock; no copied claim/recovery algorithm.
+async fn sql_claim_lock_order() -> Result<Outcome<Observations>, String> {
+    with_isolated_database(|url| async move {
+        let pool = pool(&url)?;
+        setup(&pool).await.map_err(|e|e.to_string())?;
+        sql(&pool,"INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES('worker','queue','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,done_at) VALUES('claim','queue',decode('2222','hex'),'Failed',1,3,'2020-01-01')").await?;
+        let blocker_url=url.clone();
+        let blocker=tokio::task::spawn_blocking(move || {
+            let mut conn=PgConnection::establish(&blocker_url).map_err(|e|e.to_string())?;
+            conn.batch_execute("BEGIN; SELECT id FROM apalis.workers WHERE id='worker' AND worker_type='queue' FOR UPDATE").map_err(|e|e.to_string())?;
+            Ok::<_,String>(conn)
+        }).await.map_err(|e|e.to_string())??;
+        let claimant=self::pool(&url)?;
+        sql(&claimant,"SET application_name='apalis_sql_claim_order'").await?;
+        let claim=tokio::spawn(async move { count(&claimant,"SELECT count(*)::bigint AS n FROM apalis.get_jobs('worker','queue',1)").await });
+        let waiting=tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                if count(&pool,"SELECT count(*)::bigint AS n FROM pg_stat_activity WHERE datname=current_database() AND application_name='apalis_sql_claim_order' AND wait_event_type='Lock'").await? == 1 { return Ok::<_,String>(()); }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            Err(error) => error.to_string(),
-        };
-        // Query while the setup pool (and its now-idle connection) is still open,
-        // so a lock left on that connection shows up.
-        let advisory_locks_held = migration_locks_held_in_db(&cold.url).await?;
-        drop(pool);
-        Ok::<FailedSetup, String>(FailedSetup {
-            error,
-            advisory_locks_held,
-        })
-    }
-    .await;
-
-    drop_temp_db(&cold.maintenance_url, &cold.name).await;
-    outcome.map(Some)
-}
-
-/// Outcome of the panic-safety scenario.
-///
-/// * `panic_propagated` — the injected panic unwound out of `spawn_blocking`
-///   (`JoinError::is_panic`) rather than being swallowed, matching `setup()`'s
-///   `resume_unwind`.
-/// * `locks_after_unwind` — copies of the migration advisory lock still held in
-///   the throwaway database *after* the panic unwound and the connection went back
-///   to the pool, observed from a **separate** maintenance session (the same
-///   external observation that detects a real `setup()` leak).
-/// * `subsequent_setup` — result of running the *real* production `setup()` on the
-///   same pool afterwards: it must succeed, proving the connection came back
-///   genuinely reusable and lock-clean, not merely reporting a local counter of 0.
-#[derive(Debug)]
-struct PanicSafety {
-    panic_propagated: bool,
-    locks_after_unwind: i64,
-    subsequent_setup: Result<(), String>,
-}
-
-/// Exercise the panic-safety contract of `setup()`'s migration body
-/// (`src/queries/migrations.rs:129-134`), which catches an unwind from the
-/// migration runner, drains the advisory lock, then `resume_unwind`s so r2d2 never
-/// returns a connection to the pool carrying a leaked session lock.
-///
-/// A genuine panic inside diesel's migration runner cannot be injected through the
-/// public `setup()` API (diesel surfaces SQL failures as `Err`, never `panic!`),
-/// so the acquire + panic + drain + resume ordering is driven directly on a pooled
-/// connection. The distinguishing move from a self-checking mirror: the outcome is
-/// **not** read from the copied drain loop's own counter (which would be a
-/// tautology). Instead —
-///
-/// 1. the panic is left to unwind the whole `spawn_blocking` closure, so the
-///    connection returns to the pool exactly as it would after `setup()`'s
-///    `resume_unwind`, and whether it *propagated* is read from `JoinError`; and
-/// 2. the lock count is then read from a **separate maintenance session** while
-///    the connection sits idle in the pool — the same external observation used by
-///    every other spec here to catch a real leak — and a fresh **real `setup()`**
-///    is run on the same pool, which must succeed.
-///
-/// A drain regression that left the lock held would show up as a non-zero
-/// cross-session count *and*, because the residual hold survives on the pooled
-/// connection, as observable state a maintenance session can see — neither of
-/// which a copied local counter could ever detect.
-///
-/// Returns `None` when the environment cannot provision a database.
-async fn run_panic_unwinds_and_leaves_lock_clean() -> Result<Option<PanicSafety>, String> {
-    let Some(cold) = provision_cold_db("apalis_mig_panic").await? else {
-        return Ok(None);
-    };
-
-    let outcome = async {
-        let pool = build_pool_with(&cold.url, |builder| builder.max_size(1).min_idle(Some(0)))
-            .map_err(|error| error.to_string())?;
-
-        // Drive acquire → panic → drain → resume on the pool's single connection,
-        // letting the panic unwind the whole closure so the connection returns to
-        // the pool the same way it would after setup()'s `resume_unwind`.
-        let panic_propagated = {
-            let pool = pool.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut conn = pool.get().expect("check out the pooled connection");
-                // Acquire the lock exactly as setup() does.
-                sql_query(ACQUIRE_MIGRATION_LOCK)
-                    .execute(&mut *conn)
-                    .expect("acquire the migration advisory lock");
-                // Panicking stand-in for run_pending_migrations, caught the same way
-                // setup() catches a runner panic.
-                let migrated: std::thread::Result<()> =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        panic!("migration runner blew up");
-                    }));
-                // Drain the lock on every path, exactly as setup() does before the
-                // match on `migrated`. Presence-checked so each unlock targets a
-                // held copy.
-                let mut drained = 0usize;
-                while migration_lock_held_on_conn(&mut conn)
-                    .expect("inspect the migration advisory lock")
-                {
-                    sql_query(RELEASE_MIGRATION_LOCK)
-                        .execute(&mut *conn)
-                        .expect("release the migration advisory lock");
-                    drained += 1;
-                    assert!(drained < 1024, "advisory lock could not be drained");
-                }
-                // Re-raise, exactly as setup() does: this unwinds the whole
-                // spawn_blocking closure and returns `conn` to the pool.
-                if let Err(panic) = migrated {
-                    std::panic::resume_unwind(panic);
-                }
-            })
-            .await
-            .is_err() // JoinError::is_panic — the panic propagated, not swallowed
-        };
-
-        // Observe from a SEPARATE maintenance session while the connection is idle
-        // in the pool: a leaked hold would still be sitting on that backend.
-        let locks_after_unwind = migration_locks_held_in_db(&cold.url).await?;
-
-        // The connection must be genuinely reusable: a real production setup()
-        // on the same pool has to succeed on the (now clean) backend.
-        let subsequent_setup = setup(&pool).await.map_err(|error| error.to_string());
-
-        drop(pool);
-        Ok::<PanicSafety, String>(PanicSafety {
-            panic_propagated,
-            locks_after_unwind,
-            subsequent_setup,
-        })
-    }
-    .await;
-
-    drop_temp_db(&cold.maintenance_url, &cold.name).await;
-    outcome.map(Some)
-}
-
-/// Guard the *inverse* of `release_migration_lock`'s `drained == 0` branch: a
-/// normal `setup()` — which acquires the lock and therefore holds exactly one
-/// copy at release time — must drain that copy and return `Ok`, never mistaking a
-/// properly-held lock for the "not held at release time" broken-invariant case.
-///
-/// The `drained == 0` arm itself (`src/queries/migrations.rs:100-107`) is only
-/// reachable when the backend holds zero copies at release time, which cannot
-/// happen through `setup()`: it always acquires the lock on the same connection in
-/// the same `with_conn` operation, so `release_migration_lock` is a private helper
-/// with no public entry point that reaches its zero-holds arm. Rather than copy
-/// that helper's drain loop and assert on the copy — a tautology that would keep
-/// passing even if the production helper regressed — this drives the *real*
-/// `setup()` and pins the production contract we can observe: the guard must not
-/// fire on a genuinely-held lock. A regression that inverted the comparison (e.g.
-/// `drained != 0` or `drained > 0`) would make this real `setup()` surface the
-/// "not held at release time" `Error::Migration` and fail the assertion.
-///
-/// To make the observation robust, `setup()` runs on a connection that *already*
-/// holds a residual copy of the lock (a `max_size(1)` pool pre-seeded exactly like
-/// [`run_setup_drains_a_leaked_lock`]), so `release_migration_lock` executes its
-/// loop with a real, non-zero hold count — the state under which the guard must
-/// stay silent — and drains every copy.
-///
-/// Returns `Some(error_message)` when `setup()` fails (so the assertion can
-/// inspect what surfaced), `Some(String::new())` on success, and `None` when the
-/// environment cannot provision a database.
-async fn run_setup_does_not_flag_a_held_lock() -> Result<Option<String>, String> {
-    let Some(cold) = provision_cold_db("apalis_mig_nolock").await? else {
-        return Ok(None);
-    };
-
-    let outcome = async {
-        let pool = build_pool_with(&cold.url, |builder| builder.max_size(1).min_idle(Some(0)))
-            .map_err(|error| error.to_string())?;
-
-        // Pre-seed a residual hold on the pool's single connection, so the real
-        // `release_migration_lock` inside `setup()` runs its drain loop against a
-        // genuinely-held lock (depth 2 after setup()'s own acquire) — the exact
-        // state in which the `drained == 0` guard must stay silent.
-        {
-            let pool = pool.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let mut conn = pool.get().map_err(|error| error.to_string())?;
-                sql_query(ACQUIRE_MIGRATION_LOCK)
-                    .execute(&mut conn)
-                    .map_err(|error| error.to_string())?;
-                Ok(()) // conn returns to the pool, session lock still held
-            })
-            .await
-            .map_err(|error| error.to_string())??;
-        }
-
-        // Real production path. Must return Ok and must NOT surface the
-        // "not held at release time" invariant error.
-        let outcome = match setup(&pool).await {
-            Ok(()) => String::new(),
-            Err(error) => error.to_string(),
-        };
-        drop(pool);
-        Ok::<String, String>(outcome)
-    }
-    .await;
-
-    drop_temp_db(&cold.maintenance_url, &cold.name).await;
-    outcome.map(Some)
-}
-
-fn setup_releases_the_advisory_lock() -> impl Fn(&Result<Option<i64>, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "setup-release scenario failed to run: {error}"
-        )])),
-        Ok(None) => Ok(()),
-        Ok(Some(0)) => Ok(()),
-        Ok(Some(held)) => Err(AssertionError::new(vec![format!(
-            "expected setup() to release its advisory lock, but {held} advisory lock(s) remain held"
-        )])),
-    }
-}
-
-fn setup_drains_the_leaked_lock() -> impl Fn(&Result<Option<i64>, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "leaked-lock scenario failed to run: {error}"
-        )])),
-        Ok(None) => Ok(()),
-        Ok(Some(0)) => Ok(()),
-        Ok(Some(held)) => Err(AssertionError::new(vec![format!(
-            "expected setup() to drain the pre-leaked migration lock to zero, but {held} copy/copies remain held"
-        )])),
-    }
-}
-
-/// A failed migration must surface as `Error::Migration` — i.e. carry the
-/// underlying DDL failure, not a "releasing/inspecting the migration advisory
-/// lock" (`Error::Database`) or "not held at release time" message. The
-/// `Display` prefix of `Error::Migration` is "failed to run embedded migrations".
-fn surfaces_the_migration_failure()
--> impl Fn(&Result<Option<FailedSetup>, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "incompatible-schema scenario failed to run: {error}"
-        )])),
-        Ok(None) => Ok(()),
-        Ok(Some(failed)) => {
-            let msg = &failed.error;
-            let is_migration_error = msg.contains("failed to run embedded migrations");
-            let is_lock_error = msg.contains("advisory lock");
-            if is_migration_error && !is_lock_error {
-                Ok(())
-            } else {
-                Err(AssertionError::new(vec![format!(
-                    "expected setup() to surface the migration failure as Error::Migration, \
-                     but got: {msg}"
-                )]))
-            }
-        }
-    }
-}
-
-/// Even when the migration *fails*, `setup()` must still drain the advisory lock
-/// to zero (the unconditional `release_migration_lock` before the match arm).
-fn failed_setup_still_releases_the_lock()
--> impl Fn(&Result<Option<FailedSetup>, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "incompatible-schema scenario failed to run: {error}"
-        )])),
-        Ok(None) => Ok(()),
-        Ok(Some(FailedSetup {
-            advisory_locks_held: 0,
-            ..
-        })) => Ok(()),
-        Ok(Some(failed)) => Err(AssertionError::new(vec![format!(
-            "expected setup() to drain the advisory lock even on a migration failure, \
-             but {} advisory lock(s) remain held",
-            failed.advisory_locks_held
-        )])),
-    }
-}
-
-/// A panic inside the migration runner must be re-raised, not swallowed.
-fn re_raises_the_panic() -> impl Fn(&Result<Option<PanicSafety>, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "panicking-migration scenario failed to run: {error}"
-        )])),
-        Ok(None) => Ok(()),
-        Ok(Some(PanicSafety {
-            panic_propagated: true,
-            ..
-        })) => Ok(()),
-        Ok(Some(_)) => Err(AssertionError::new(vec![
-            "expected the migration-runner panic to be re-raised, but it was swallowed".to_owned(),
-        ])),
-    }
-}
-
-/// After the panic unwinds, the connection must return to the pool lock-clean:
-/// a separate maintenance session sees zero held copies, and a fresh real
-/// `setup()` on the same pool succeeds.
-fn leaves_the_connection_lock_clean()
--> impl Fn(&Result<Option<PanicSafety>, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "panicking-migration scenario failed to run: {error}"
-        )])),
-        Ok(None) => Ok(()),
-        Ok(Some(safety)) => {
-            let mut failures = Vec::new();
-            if safety.locks_after_unwind != 0 {
-                failures.push(format!(
-                    "expected no advisory lock held after the panic unwound, \
-                     but a separate session saw {} copy/copies",
-                    safety.locks_after_unwind
-                ));
-            }
-            if let Err(error) = &safety.subsequent_setup {
-                failures.push(format!(
-                    "expected a fresh setup() on the same pool to succeed after the panic, \
-                     but it failed with: {error}"
-                ));
-            }
-            if failures.is_empty() {
-                Ok(())
-            } else {
-                Err(AssertionError::new(failures))
-            }
-        }
-    }
-}
-
-/// A normal `setup()` holding the lock at release time must drain it and return
-/// `Ok`, never mistaking a genuinely-held lock for the `drained == 0`
-/// "not held at release time" broken-invariant case.
-fn does_not_flag_a_held_lock() -> impl Fn(&Result<Option<String>, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "held-lock scenario failed to run: {error}"
-        )])),
-        Ok(None) => Ok(()),
-        Ok(Some(msg)) if msg.is_empty() => Ok(()),
-        Ok(Some(msg)) => Err(AssertionError::new(vec![format!(
-            "expected setup() to drain the held lock and succeed, but it failed with: {msg}"
-        )])),
-    }
-}
-
-fn contended_setups_all_succeed() -> impl Fn(&Result<ContendedOutcome, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "contended-cleanup scenario failed to run: {error}"
-        )])),
-        Ok(ContendedOutcome::Skipped) => Ok(()),
-        Ok(ContendedOutcome::Completed { results, .. }) => {
-            let failures: Vec<String> = results
-                .iter()
-                .enumerate()
-                .filter_map(|(i, r)| r.as_ref().err().map(|e| format!("racer {i}: {e}")))
-                .collect();
-            if failures.is_empty() {
-                Ok(())
-            } else {
-                Err(AssertionError::new(vec![format!(
-                    "expected all {} contended setup() calls to succeed, {} failed:\n{}",
-                    results.len(),
-                    failures.len(),
-                    failures.join("\n")
-                )]))
-            }
-        }
-    }
-}
-
-fn contended_setup_leaves_no_lock_held()
--> impl Fn(&Result<ContendedOutcome, String>) -> AssertionResult {
-    move |result| match result {
-        Err(error) => Err(AssertionError::new(vec![format!(
-            "contended-cleanup scenario failed to run: {error}"
-        )])),
-        Ok(ContendedOutcome::Skipped) => Ok(()),
-        Ok(ContendedOutcome::Completed {
-            advisory_locks_held: 0,
-            ..
-        }) => Ok(()),
-        Ok(ContendedOutcome::Completed {
-            advisory_locks_held,
-            ..
-        }) => Err(AssertionError::new(vec![format!(
-            "expected the shared connection to hold no advisory lock after contended setup(), \
-             but {advisory_locks_held} copy/copies remain held"
-        )])),
-    }
+        }).await;
+        let job_is_available=with_conn(pool.clone(),|conn| {
+            Ok(conn.transaction::<_,diesel::result::Error,_>(|conn| {
+                sql_query("SELECT id FROM apalis.jobs WHERE id='claim' FOR UPDATE NOWAIT").execute(conn)
+            }).is_ok())
+        }).await?;
+        tokio::task::spawn_blocking(move || { let mut blocker=blocker;blocker.batch_execute("ROLLBACK").map_err(|e|e.to_string()) }).await.map_err(|e|e.to_string())??;
+        let claimed=claim.await.map_err(|e|e.to_string())??;
+        let mut out=Observations::new();
+        out.check("claim was observed waiting for a registration lock",matches!(waiting,Ok(Ok(()))));
+        out.check("waiting claim has not locked any job",job_is_available);
+        out.check("claim proceeds after registration lock release",claimed==1);
+        out.check("fresh queued attempt clears prior completion",count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id='claim' AND status='Queued' AND attempts=1 AND done_at IS NULL").await?==1);
+        Ok(out)
+    }).await
 }
 
 lets_expect! { #tokio_test
-    expect(run_setup_releases_lock().await) {
-        when setup_completes_against_a_cold_database {
-            to leaves_no_advisory_lock_held { setup_releases_the_advisory_lock() }
+    expect(migration_scenario(kind).await) as schema_upgrade {
+        when(kind=Scenario::Fresh) as the_database_is_empty { to creates_and_verifies_the_owned_schema { satisfies_contract() } }
+        when(kind=Scenario::ForeignHistory) as an_application_owns_the_public_journal { to preserves_foreign_history_and_applies_every_migration { satisfies_contract() } }
+        when(kind=Scenario::TemporaryJournal) as a_temp_table_shadows_the_journal { to uses_only_the_private_journal { satisfies_contract() } }
+        when(kind=Scenario::ForgedHistory) as private_versions_exist_without_runtime_tables { to rejects_the_forged_state { satisfies_contract() } }
+        when(kind=Scenario::Baseline) as the_released_crate_schema_has_external_dependants { to adopts_the_complete_baseline_without_destructive_replay { satisfies_contract() } }
+        when(kind=Scenario::Initial) as the_initial_crate_schema_has_external_dependants { to preserves_the_composite_fk_through_hardening { satisfies_contract() } }
+        when(kind=Scenario::Legacy) as the_released_upstream_schema_contains_lost_owners { to preserves_terminal_history_and_recovers_only_active_work { satisfies_contract() } }
+        when(kind=Scenario::ExternalLegacy) as an_external_fk_requires_the_legacy_identity { to refuses_safely_and_allows_an_explicitly_resolved_retry { satisfies_contract() } }
+        when(kind=Scenario::Unsupported) as the_schema_is_an_unknown_partial_install { to refuses_without_altering_existing_data { satisfies_contract() } }
+        when(kind=Scenario::DriftColumn) as a_required_column_is_missing { to rejects_current_history_with_structural_damage { satisfies_contract() } }
+        when(kind=Scenario::DriftConstraint) as a_named_constraint_has_the_wrong_rule { to rejects_current_history_with_a_weakened_invariant { satisfies_contract() } }
+        when(kind=Scenario::DriftIndex) as the_deduplication_index_is_not_unique { to rejects_current_history_without_enqueue_uniqueness { satisfies_contract() } }
+        when(kind=Scenario::Concurrent) as eight_independent_backends_start_together { to serializes_the_entire_migration_series { satisfies_contract() } }
+        when(kind=Scenario::Contended) as eight_callers_share_one_connection { to completes_every_call_without_leaking_the_lock { satisfies_contract() } }
+        when(kind=Scenario::DowngradeCollision) as worker_ids_repeat_across_queues { to refuses_downgrade_without_deleting_registrations { satisfies_contract() } }
+        when(kind=Scenario::DowngradeUnique) as worker_ids_are_globally_unique { to preserves_workers_through_downgrade_and_upgrade { satisfies_contract() } }
+    }
+    expect(sql_claim_lock_order().await) as legacy_claim_lock_order {
+        when registration_is_locked_by_another_backend {
+            to waits_before_locking_jobs_and_clears_completion_on_the_new_attempt { satisfies_contract() }
         }
     }
-
-    expect(run_setup_drains_a_leaked_lock().await) {
-        when setup_runs_on_a_connection_that_already_holds_the_migration_lock {
-            to drains_every_reentrant_hold_to_zero { setup_drains_the_leaked_lock() }
+    expect(panicking_setup().await) as migration_panic {
+        when a_late_migration_panics { to rolls_back_the_whole_series_and_recovers_the_pool { satisfies_contract() } }
+    }
+    expect(listing_index_upgrade(panics).await) as listing_index_upgrade {
+        let panics = false;
+        to preserves_data_and_history_through_upgrade_downgrade_and_reupgrade { satisfies_contract() }
+        when delivery_of_the_migration_result_panics {
+            let panics = true;
+            to restores_the_previous_schema_and_allows_the_same_pool_to_retry { satisfies_contract() }
         }
     }
-
-    expect(run_setup_against_incompatible_schema().await) {
-        when a_migration_fails_inside_the_runner {
-            to surfaces_error_as_a_migration_failure { surfaces_the_migration_failure() }
-            to still_drains_the_advisory_lock_to_zero { failed_setup_still_releases_the_lock() }
+    expect(listing_index_verification(index, drift).await) as listing_index_verification {
+        let index = ListingIndex::Queue;
+        let drift = IndexDrift::MissingTieBreaker;
+        to rejects_the_damaged_index_despite_complete_migration_history { satisfies_contract() }
+        when the_tie_breaker_is_ascending {
+            let drift = IndexDrift::AscendingTieBreaker;
+            to rejects_the_damaged_index_despite_complete_migration_history { satisfies_contract() }
         }
-    }
-
-    expect(run_panic_unwinds_and_leaves_lock_clean().await) {
-        when the_migration_runner_panics {
-            to re_raises_the_panic_instead_of_swallowing_it { re_raises_the_panic() }
-            to leaves_the_connection_lock_clean_for_the_pool { leaves_the_connection_lock_clean() }
+        when the_index_is_missing {
+            let drift = IndexDrift::MissingIndex;
+            to rejects_the_damaged_index_despite_complete_migration_history { satisfies_contract() }
         }
-    }
-
-    expect(run_setup_does_not_flag_a_held_lock().await) {
-        when the_lock_is_held_when_release_runs {
-            to drains_it_without_flagging_a_broken_invariant { does_not_flag_a_held_lock() }
-        }
-    }
-
-    expect(run_concurrent_setup().await) {
-        when many_replicas_call_setup_concurrently_against_a_cold_database {
-            to applies_the_migrations_without_a_race { all_setups_succeed() }
-        }
-    }
-
-    expect(run_contended_setup_releases_lock().await) {
-        when many_replicas_contend_for_one_shared_connection {
-            to complete_every_setup_call { contended_setups_all_succeed() }
-            to leave_no_advisory_lock_held_on_the_shared_connection {
-                contended_setup_leaves_no_lock_held()
+        when the_view_covers_all_queues {
+            let index = ListingIndex::Global;
+            to rejects_the_damaged_index_despite_complete_migration_history { satisfies_contract() }
+            when the_tie_breaker_is_ascending {
+                let drift = IndexDrift::AscendingTieBreaker;
+                to rejects_the_damaged_index_despite_complete_migration_history { satisfies_contract() }
+            }
+            when the_index_is_missing {
+                let drift = IndexDrift::MissingIndex;
+                to rejects_the_damaged_index_despite_complete_migration_history { satisfies_contract() }
             }
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, QueryableByName)]
+struct SqlClaimRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempts: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    lock_by: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    locked: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    unfinished: bool,
+}
+
+async fn downgraded_claim_batch(
+    pool: &PgPool,
+    revisits_candidates: bool,
+) -> Result<Vec<SqlClaimRow>, String> {
+    with_conn(pool.clone(), move |conn| {
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            if revisits_candidates {
+                conn.batch_execute(
+                    "SET LOCAL enable_hashagg=off; SET LOCAL enable_hashjoin=off; \
+                     SET LOCAL enable_mergejoin=off; SET LOCAL enable_material=off; \
+                     SET LOCAL enable_sort=off",
+                )?;
+            }
+            sql_query(
+                "SELECT id, status, attempts, lock_by, lock_at IS NOT NULL AS locked, \
+                 done_at IS NULL AS unfinished \
+                 FROM apalis.get_jobs('bounded-worker','bounded-queue',1000)",
+            )
+            .load::<SqlClaimRow>(conn)
+        })
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn bounded_downgraded_claim(
+    revisits_candidates: bool,
+) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move |url| async move {
+        let claimant = pool(&url)?;
+        setup(&claimant).await.map_err(|error| error.to_string())?;
+        with_conn(claimant.clone(), |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                conn.batch_execute(include_str!(
+                    "../migrations/20260521000000_harden_apalis_sql/down.sql"
+                ))
+            })
+            .map_err(|error| error.to_string())
+        })
+        .await?;
+        sql(&claimant, "INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('bounded-worker','bounded-queue','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at) SELECT 'job-'||n,'bounded-queue',decode('2222','hex'),'Pending',0,3,'2020-01-01'::timestamptz FROM generate_series(1,1005) n; ANALYZE apalis.jobs").await?;
+        // This second pool reads only committed effects from a different backend.
+        let observer = pool(&url)?;
+        let mut out = Observations::new();
+        out.check(
+            "durable observations use an independent backend",
+            count(&claimant, "SELECT pg_backend_pid()::bigint AS n").await?
+                != count(&observer, "SELECT pg_backend_pid()::bigint AS n").await?,
+        );
+        let all_ids: std::collections::BTreeSet<_> =
+            (1..=1005).map(|id| format!("job-{id}")).collect();
+        let mut claimed_ids = std::collections::BTreeSet::new();
+        for (call, expected) in [1000, 5, 0].into_iter().enumerate() {
+            let returned = downgraded_claim_batch(&claimant, revisits_candidates).await?;
+            out.check(
+                &format!("claim {} returns {expected} jobs, observed {}", call + 1, returned.len()),
+                returned.len() == expected,
+            );
+            out.check(
+                "returned jobs retain attempts and identify the queued owner",
+                returned.iter().all(|row| {
+                    row.status == "Queued"
+                        && row.attempts == 0
+                        && row.lock_by.as_deref() == Some("bounded-worker")
+                        && row.locked
+                        && row.unfinished
+                }),
+            );
+            out.check(
+                "a subsequent claim never returns an earlier job",
+                returned.iter().all(|row| claimed_ids.insert(row.id.clone())),
+            );
+            let durable = with_conn(observer.clone(), |conn| {
+                sql_query("SELECT id, status, attempts, lock_by, lock_at IS NOT NULL AS locked, done_at IS NULL AS unfinished FROM apalis.jobs ORDER BY id")
+                    .load::<SqlClaimRow>(conn)
+                    .map_err(|error| error.to_string())
+            }).await?;
+            out.check(
+                "every original job survives each committed claim",
+                durable.iter().map(|row| row.id.clone()).collect::<std::collections::BTreeSet<_>>() == all_ids,
+            );
+            out.check(
+                "only returned jobs have committed queued ownership",
+                durable.iter().all(|row| {
+                    row.attempts == 0 && row.unfinished && if claimed_ids.contains(&row.id) {
+                        row.status == "Queued"
+                            && row.lock_by.as_deref() == Some("bounded-worker")
+                            && row.locked
+                    } else {
+                        row.status == "Pending" && row.lock_by.is_none() && !row.locked
+                    }
+                }),
+            );
+            let expected_queued = if call == 0 { 1000 } else { 1005 };
+            out.check(
+                &format!("committed claim {} leaves exactly {expected_queued} queued jobs", call + 1),
+                durable.iter().filter(|row| row.status == "Queued").count() == expected_queued,
+            );
+        }
+        Ok(out)
+    })
+    .await
+}
+
+lets_expect! { #tokio_test
+    expect(bounded_downgraded_claim(revisits_candidates).await) as bounded_downgraded_claim {
+        let revisits_candidates = false;
+        to caps_each_batch_and_preserves_the_remaining_jobs { satisfies_contract() }
+        when the_database_prefers_repeated_candidate_scans {
+            let revisits_candidates = true;
+            to caps_each_batch_and_preserves_the_remaining_jobs { satisfies_contract() }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UnjournaledGeneration {
+    KnownFinal,
+    Latest,
+}
+
+#[derive(Debug)]
+struct ObserveWorkerMigration {
+    worker: Arc<AtomicUsize>,
+    owner: Arc<AtomicUsize>,
+}
+impl CustomizeConnection<PgConnection, diesel::r2d2::Error> for ObserveWorkerMigration {
+    fn on_acquire(&self, conn: &mut PgConnection) -> Result<(), diesel::r2d2::Error> {
+        let worker_calls = self.worker.clone();
+        let owner_calls = self.owner.clone();
+        conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+            if let InstrumentationEvent::FinishQuery {
+                query, error: None, ..
+            } = event
+            {
+                let query = query.to_string();
+                if query.contains("CREATE OR REPLACE FUNCTION apalis.get_jobs")
+                    && query.contains("FOR KEY SHARE")
+                {
+                    if query.contains("worker_id must not be null") {
+                        owner_calls.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        worker_calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+async fn unjournaled_final_schema(
+    generation: UnjournaledGeneration,
+    public_history: bool,
+    concurrent: bool,
+    damaged: bool,
+) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move |url| async move {
+        let observer = pool(&url)?;
+        // Exercise the old public API using the real embedded SQL, without
+        // calling setup and without manufacturing private migration records.
+        with_conn(observer.clone(), move |conn| {
+            let mut migrations = conn.pending_migrations(MIGRATIONS).map_err(|e| e.to_string())?;
+            if matches!(generation, UnjournaledGeneration::KnownFinal) {
+                migrations.retain(|migration| migration.name().version().to_string().as_str() <= LISTING_MIGRATION_VERSION);
+            }
+            conn.run_migrations(&migrations).map_err(|e| e.to_string())?;
+            Ok(())
+        }).await?;
+        let mut out = Observations::new();
+        let expected_public_count = if matches!(generation, UnjournaledGeneration::KnownFinal) { 11 } else { 13 };
+        out.check("raw harness applied the intended generation", count(&observer, "SELECT count(*)::bigint AS n FROM public.__diesel_schema_migrations").await? == expected_public_count);
+        if !public_history {
+            sql(&observer, "DROP TABLE public.__diesel_schema_migrations").await?;
+        }
+        if damaged {
+            sql(&observer, "DROP INDEX apalis.jobs_list_all_idx").await?;
+        }
+        sql(&observer, "INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('preserved-worker','preserved-queue','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,done_at,last_result) VALUES ('preserved-job','preserved-queue',decode('2222','hex'),'Done',1,3,'2024-01-01','2024-01-02','{\"Ok\":\"retained\"}')").await?;
+        let data_query = "SELECT jsonb_build_object('jobs',(SELECT jsonb_agg(to_jsonb(j) ORDER BY id) FROM apalis.jobs j),'workers',(SELECT jsonb_agg(to_jsonb(w) ORDER BY id,worker_type) FROM apalis.workers w))::text AS value";
+        let public_query = "SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM public.__diesel_schema_migrations h";
+        let before_data = catalog_text(&observer, data_query).await?;
+        let before_public = if public_history { Some(catalog_text(&observer, public_query).await?) } else { None };
+        out.check("fixture has no private namespace", absent_private_schema(&observer).await?);
+        let migration_calls = Arc::new(AtomicUsize::new(0));
+        let owner_migration_calls = Arc::new(AtomicUsize::new(0));
+        let callers = if concurrent { 4 } else { 1 };
+        let barrier = Arc::new(tokio::sync::Barrier::new(callers));
+        let mut racers = Vec::new();
+        for _ in 0..callers {
+            let calls = migration_calls.clone();
+            let owner_calls = owner_migration_calls.clone();
+            let migrator = build_pool_with(&url, |builder| builder.max_size(1).connection_customizer(Box::new(ObserveWorkerMigration { worker: calls, owner: owner_calls }))).map_err(|e| e.to_string())?;
+            let barrier = barrier.clone();
+            racers.push(async move { barrier.wait().await; setup(&migrator).await });
+        }
+        let results = futures::future::join_all(racers).await;
+        if damaged {
+            out.check("unsupported damage is reported", results.iter().all(|result| matches!(result, Err(Error::Migration(error)) if error.to_string().contains("jobs_list_all_idx"))));
+            out.check("rejected adoption rolls back its private namespace", absent_private_schema(&observer).await?);
+            out.check("rejected adoption never executes later migrations", migration_calls.load(Ordering::SeqCst) == 0 && owner_migration_calls.load(Ordering::SeqCst) == 0);
+        } else {
+            out.check("every setup accepts the complete catalog", results.iter().all(Result::is_ok));
+            out.check("adopted schema verifies", verify_schema(&observer).await.is_ok());
+            out.check("fixed eleven-version adoption executes each later migration exactly once", migration_calls.load(Ordering::SeqCst) == 1 && owner_migration_calls.load(Ordering::SeqCst) == 1);
+            out.check("private history records all thirteen migrations", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+            out.check("the upgraded SQL function rejects NULL ownership", catalog_text(&observer, "SELECT pg_get_functiondef('apalis.get_jobs(text,text,integer)'::regprocedure)::text AS value").await?.contains("worker_id must not be null"));
+            out.check("the upgraded SQL function uses the current worker lock", catalog_text(&observer, "SELECT pg_get_functiondef('apalis.get_jobs(text,text,integer)'::regprocedure)::text AS value").await?.contains("FOR KEY SHARE"));
+            let private_query = "SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM apalis_diesel_postgres.__diesel_schema_migrations h";
+            let before_repeat = catalog_text(&observer, private_query).await?;
+            out.check("subsequent setup succeeds", setup(&observer).await.is_ok());
+            out.check("subsequent setup preserves all private timestamps", catalog_text(&observer, private_query).await? == before_repeat);
+        }
+        out.check("all application data survives", catalog_text(&observer, data_query).await? == before_data);
+        if let Some(before_public) = before_public {
+            out.check("every foreign journal row and timestamp survives", catalog_text(&observer, public_query).await? == before_public);
+        } else {
+            out.check("setup does not create a public journal", count(&observer, "SELECT (to_regclass('public.__diesel_schema_migrations') IS NULL)::integer::bigint AS n").await? == 1);
+        }
+        out.check("setup releases the migration lock", locks(&observer).await? == 0);
+        Ok(out)
+    }).await
+}
+
+#[derive(Debug)]
+struct AssumeMigrationRole(String);
+impl CustomizeConnection<PgConnection, diesel::r2d2::Error> for AssumeMigrationRole {
+    fn on_acquire(&self, conn: &mut PgConnection) -> Result<(), diesel::r2d2::Error> {
+        conn.batch_execute(&format!("SET ROLE \"{}\"", self.0))
+            .map_err(diesel::r2d2::Error::QueryError)
+    }
+}
+
+async fn namespace_privileges(
+    namespace_exists: bool,
+    database_create: bool,
+) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move |url| async move {
+        let owner = pool(&url)?;
+        let role = format!("apalis_migration_role_{}", ulid::Ulid::new().to_string().to_lowercase());
+        sql(&owner, format!("CREATE ROLE \"{role}\" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION")).await?;
+        // Keep all fallible scenario work inside this future so cleanup also
+        // executes on an infrastructure error, before the isolated DB is removed.
+        let result = async {
+            if namespace_exists {
+                setup(&owner).await.map_err(|e| e.to_string())?;
+                sql(&owner, format!("GRANT USAGE, CREATE ON SCHEMA apalis, apalis_diesel_postgres TO \"{role}\"; GRANT ALL ON ALL TABLES IN SCHEMA apalis, apalis_diesel_postgres TO \"{role}\"")).await?;
+            }
+            let database = catalog_text(&owner, "SELECT current_database()::text AS value").await?;
+            if database_create {
+                // Both identifiers are created by this fixture, not caller input.
+                sql(&owner, format!("GRANT CREATE ON DATABASE \"{database}\" TO \"{role}\"")).await?;
+            }
+            let caller = build_pool_with(&url, |builder| builder.max_size(1).connection_customizer(Box::new(AssumeMigrationRole(role.clone())))).map_err(|e| e.to_string())?;
+            let mut out = Observations::new();
+            out.check("caller has exactly the requested database CREATE privilege", count(&caller, "SELECT has_database_privilege(current_user,current_database(),'CREATE')::integer::bigint AS n").await? == i64::from(database_create));
+            let setup_result = setup(&caller).await;
+            if namespace_exists || database_create {
+                out.check("setup needs CREATE only for an absent namespace", setup_result.is_ok());
+                out.check("the resulting schema verifies for the same role", verify_schema(&caller).await.is_ok());
+            } else {
+                out.check("an absent namespace reports the missing privilege", matches!(setup_result, Err(Error::Migration(error)) if error.to_string().contains("permission denied for database")));
+                out.check("permission failure creates no private namespace", absent_private_schema(&owner).await?);
+            }
+            out.check("permission handling releases the advisory lock", locks(&owner).await? == 0);
+            drop(caller);
+            Ok::<_, String>(out)
+        }.await;
+        let cleanup = sql(&owner, format!("DROP OWNED BY \"{role}\"; DROP ROLE \"{role}\"")).await;
+        match (result, cleanup) {
+            (Ok(out), Ok(())) => Ok(out),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => Err(format!("{error}; role cleanup also failed: {cleanup}")),
+        }
+    }).await
+}
+
+lets_expect! { #tokio_test
+    expect(unjournaled_final_schema(generation, public_history, concurrent, false).await) as adopting_a_complete_unjournaled_schema {
+        let generation = UnjournaledGeneration::KnownFinal;
+        let public_history = true;
+        let concurrent = false;
+        to preserves_data_and_foreign_history_and_runs_later_migrations { satisfies_contract() }
+        when four_migration_replicas_start_together {
+            let concurrent = true;
+            to adopts_once_and_completes_every_replica { satisfies_contract() }
+        }
+        when no_public_history_exists {
+            let public_history = false;
+            to adopts_from_the_verified_catalog { satisfies_contract() }
+            when four_migration_replicas_start_together {
+                let concurrent = true;
+                to adopts_once_and_completes_every_replica { satisfies_contract() }
+            }
+        }
+        when the_raw_harness_has_already_applied_later_migrations {
+            let generation = UnjournaledGeneration::Latest;
+            to safely_reapplies_only_migrations_after_the_known_adoption_generation { satisfies_contract() }
+            when four_migration_replicas_start_together {
+                let concurrent = true;
+                to adopts_once_and_completes_every_replica { satisfies_contract() }
+            }
+            when no_public_history_exists {
+                let public_history = false;
+                to adopts_from_the_verified_catalog { satisfies_contract() }
+                when four_migration_replicas_start_together {
+                    let concurrent = true;
+                    to adopts_once_and_completes_every_replica { satisfies_contract() }
+                }
+            }
+        }
+    }
+    expect(unjournaled_final_schema(UnjournaledGeneration::Latest, public_history, false, true).await) as adopting_a_damaged_unjournaled_schema {
+        let public_history = true;
+        to refuses_without_blessing_history_or_modifying_data { satisfies_contract() }
+        when no_public_history_exists {
+            let public_history = false;
+            to refuses_without_creating_private_history { satisfies_contract() }
+        }
+    }
+    expect(namespace_privileges(namespace_exists, database_create).await) as migration_namespace_privileges {
+        let namespace_exists = true;
+        let database_create = true;
+        to reuses_the_existing_namespace { satisfies_contract() }
+        when database_create_is_denied {
+            let database_create = false;
+            to reuses_the_existing_namespace_without_extra_privileges { satisfies_contract() }
+        }
+        when the_private_namespace_is_absent {
+            let namespace_exists = false;
+            to creates_and_initializes_the_namespace { satisfies_contract() }
+            when database_create_is_denied {
+                let database_create = false;
+                to rejects_creation_without_leaving_a_namespace_or_lock { satisfies_contract() }
+            }
+        }
+    }
+}
+
+const ACTIVE_OWNER_MIGRATION_VERSION: &str = "20260912000001";
+
+// Apply the real previous embedded generation before inserting states that the
+// next migration deliberately makes unrepresentable. A public journal models
+// the formerly supported raw Diesel harness; setup must leave it untouched.
+async fn previous_owner_generation(pool: &PgPool, private: bool) -> Result<(), String> {
+    with_conn(pool.clone(), move |conn| {
+        conn.transaction::<_, Error, _>(|conn| {
+            if private {
+                conn.batch_execute("CREATE SCHEMA apalis_diesel_postgres; SET LOCAL search_path=apalis_diesel_postgres,pg_catalog,pg_temp")
+                    .map_err(|e| Error::Migration(Box::new(e)))?;
+            }
+            let mut migrations=conn.pending_migrations(MIGRATIONS).map_err(Error::Migration)?;
+            migrations.retain(|migration|migration.name().version().to_string().as_str()<ACTIVE_OWNER_MIGRATION_VERSION);
+            conn.run_migrations(&migrations).map_err(Error::Migration)?;
+            Ok(())
+        }).map_err(|e|e.to_string())
+    }).await
+}
+
+async fn owner_rows(pool: &PgPool) -> Result<serde_json::Value, String> {
+    let text = catalog_text(
+        pool,
+        "SELECT jsonb_object_agg(id,to_jsonb(j))::text AS value FROM apalis.jobs j",
+    )
+    .await?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+const LOST_OWNER_ROWS:&str="INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES('retained-owner','owner-queue','fixture');
+INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,lock_by,lock_at,done_at,last_result) VALUES
+('room','owner-queue',decode('2222','hex'),'Queued',0,3,'2000-01-01',NULL,'2000-01-01',NULL,NULL),
+('exhausted','owner-queue',decode('2222','hex'),'Running',3,3,'2000-01-01',NULL,'2000-01-01',NULL,NULL),
+('max-remaining','owner-queue',decode('2222','hex'),'Running',2147483646,2147483647,'2000-01-01',NULL,'2000-01-01',NULL,NULL),
+('max-exhausted','owner-queue',decode('2222','hex'),'Running',2147483647,2147483647,'2000-01-01',NULL,'2000-01-01',NULL,NULL),
+('valid','owner-queue',decode('2222','hex'),'Running',1,3,'2000-01-01','retained-owner','2000-01-01',NULL,'{\"Ok\":\"retained\"}'),
+('done','owner-queue',decode('2222','hex'),'Done',1,3,'2000-01-01',NULL,NULL,'2000-01-02','{\"Ok\":\"history\"}');";
+
+async fn rejects_active_ownerless_insert(pool: &PgPool) -> Result<bool, String> {
+    let error=sql(pool,"INSERT INTO apalis.jobs(id,job_type,job,status) VALUES('invalid-owner','owner-queue',decode('2222','hex'),'Running')").await.err();
+    Ok(
+        error.is_some_and(|error| error.contains("jobs_active_owner_check"))
+            && count(
+                pool,
+                "SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id='invalid-owner'",
+            )
+            .await?
+                == 0,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum OwnerScenario {
+    PrivatePrevious,
+    PublicPrevious,
+    MissingConstraint,
+    WrongConstraint,
+    UnvalidatedConstraint,
+    WrongUnjournaledConstraint,
+    UnvalidatedUnjournaledConstraint,
+    LatestDown,
+}
+
+async fn owner_schema_scenario(kind: OwnerScenario) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move|url|async move{
+        let pool=pool(&url)?;
+        let private=!matches!(kind,OwnerScenario::PublicPrevious);
+        previous_owner_generation(&pool,private).await?;
+        let function_query="SELECT pg_get_functiondef('apalis.get_jobs(text,text,integer)'::regprocedure)::text AS value";
+        let previous_function=catalog_text(&pool,function_query).await?;
+        let foreign_history=if private{None}else{Some(catalog_text(&pool,"SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM public.__diesel_schema_migrations h").await?)};
+        sql(&pool,LOST_OWNER_ROWS).await?;
+        let before=owner_rows(&pool).await?;
+        setup(&pool).await.map_err(|e|e.to_string())?;
+        let after=owner_rows(&pool).await?;
+        let mut out=Observations::new();
+        out.check("the upgraded schema verifies",verify_schema(&pool).await.is_ok());
+        out.check("a lost queued execution with remaining budget becomes pending",
+            after["room"]["status"]=="Pending"&&after["room"]["attempts"]==1&&after["room"]["lock_by"].is_null()
+            &&after["room"]["lock_at"].is_null()&&after["room"]["done_at"].is_null()&&after["room"]["last_result"]["Err"].is_string());
+        for(id,attempts)in[("exhausted",3),("max-remaining",i32::MAX),("max-exhausted",i32::MAX)]{
+            out.check(&format!("lost execution {id} terminates within its attempt budget"),
+                after[id]["status"]=="Killed"&&after[id]["attempts"]==attempts&&after[id]["lock_by"].is_null()
+                &&after[id]["lock_at"].is_null()&&after[id]["done_at"].is_string()&&after[id]["last_result"]["Err"].is_string());
+        }
+        out.check("all fields of valid ownership and terminal history remain unchanged",before["valid"]==after["valid"]&&before["done"]==after["done"]);
+        out.check("the current schema rejects active NULL ownership without inserting a row",rejects_active_ownerless_insert(&pool).await?);
+        let history_query="SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM apalis_diesel_postgres.__diesel_schema_migrations h";
+        let history=catalog_text(&pool,history_query).await?;
+        setup(&pool).await.map_err(|e|e.to_string())?;
+        out.check("repeated setup preserves every row and journal timestamp",after==owner_rows(&pool).await?&&history==catalog_text(&pool,history_query).await?);
+        if let Some(foreign_history)=foreign_history{
+            out.check("adoption preserves all foreign versions and timestamps",foreign_history==catalog_text(&pool,"SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM public.__diesel_schema_migrations h").await?);
+        }
+        match kind{
+            OwnerScenario::PrivatePrevious|OwnerScenario::PublicPrevious=>{},
+            OwnerScenario::LatestDown=>{
+                let function=catalog_text(&pool,function_query).await?;
+                with_conn(pool.clone(),|conn|conn.transaction::<_,diesel::result::Error,_>(|conn|{
+                    conn.batch_execute(include_str!("../migrations/20260912000001_require_active_owner/down.sql"))?;
+                    conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version='20260912000001'")
+                }).map_err(|e|e.to_string())).await?;
+                out.check("verification detects the pending active-owner migration",matches!(verify_schema(&pool).await,Err(Error::Migration(_))));
+                out.check("down removes only the new constraint",count(&pool,"SELECT count(*)::bigint AS n FROM pg_constraint WHERE conrelid='apalis.jobs'::regclass AND conname='jobs_active_owner_check'").await?==0);
+                out.check("down restores the complete previous function before reupgrade",previous_function==catalog_text(&pool,function_query).await?);
+                setup(&pool).await.map_err(|e|e.to_string())?;
+                out.check("reapplying restores the complete current function body",function==catalog_text(&pool,function_query).await?);
+                out.check("reapplying validates the constraint without changing repaired history",verify_schema(&pool).await.is_ok()&&after==owner_rows(&pool).await?&&rejects_active_ownerless_insert(&pool).await?);
+            },
+            _=>{
+                sql(&pool,"ALTER TABLE apalis.jobs DROP CONSTRAINT jobs_active_owner_check").await?;
+                match kind{
+                    OwnerScenario::WrongConstraint|OwnerScenario::WrongUnjournaledConstraint=>sql(&pool,"ALTER TABLE apalis.jobs ADD CONSTRAINT jobs_active_owner_check CHECK(true)").await?,
+                    OwnerScenario::UnvalidatedConstraint|OwnerScenario::UnvalidatedUnjournaledConstraint=>sql(&pool,"ALTER TABLE apalis.jobs ADD CONSTRAINT jobs_active_owner_check CHECK(status NOT IN('Queued','Running') OR lock_by IS NOT NULL) NOT VALID").await?,
+                    _=>{},
+                }
+                let unjournaled=matches!(kind,OwnerScenario::WrongUnjournaledConstraint|OwnerScenario::UnvalidatedUnjournaledConstraint);
+                if unjournaled{sql(&pool,"DROP SCHEMA apalis_diesel_postgres CASCADE").await?;}
+                out.check("verification rejects the damaged invariant",matches!(verify_schema(&pool).await,Err(Error::Migration(_))));
+                out.check("setup refuses the damaged invariant",matches!(setup(&pool).await,Err(Error::Migration(_))));
+                out.check("refusal leaves all job history unchanged",after==owner_rows(&pool).await?);
+                if unjournaled{out.check("refused adoption leaves no private namespace",absent_private_schema(&pool).await?);}
+                else{out.check("refusal preserves the current private history",history==catalog_text(&pool,history_query).await?);}
+            }
+        }
+        out.check("no migration lock survives",locks(&pool).await?==0);
+        Ok(out)
+    }).await
+}
+
+async fn runtime_catalog(pool: &PgPool) -> Result<String, String> {
+    catalog_text(pool,"SELECT jsonb_build_object(
+        'functions',(SELECT jsonb_object_agg(proname,pg_get_functiondef(oid)) FROM pg_proc WHERE pronamespace='apalis'::regnamespace AND proname IN('get_jobs','notify_new_jobs')),
+        'indexes',(SELECT jsonb_agg(indexdef ORDER BY indexname) FROM pg_indexes WHERE schemaname='apalis'),
+        'constraints',(SELECT jsonb_agg(pg_get_constraintdef(oid) ORDER BY conrelid::regclass::text,conname) FROM pg_constraint WHERE connamespace='apalis'::regnamespace),
+        'versions',(SELECT jsonb_agg(version ORDER BY version) FROM apalis_diesel_postgres.__diesel_schema_migrations))::text AS value").await
+}
+
+async fn completed_generation(released: bool) -> Result<Outcome<String>, String> {
+    with_isolated_database(move |url| async move {
+        let pool = pool(&url)?;
+        if released {
+            sql(
+                &pool,
+                include_str!("fixtures/apalis-diesel-postgres-0.4.1.sql"),
+            )
+            .await?;
+        }
+        setup(&pool).await.map_err(|e| e.to_string())?;
+        verify_schema(&pool).await.map_err(|e| e.to_string())?;
+        let first = runtime_catalog(&pool).await?;
+        setup(&pool).await.map_err(|e| e.to_string())?;
+        let repeated = runtime_catalog(&pool).await?;
+        if first != repeated {
+            return Err("repeated setup changed the runtime catalog".into());
+        }
+        Ok(first)
+    })
+    .await
+}
+
+async fn released_and_fresh_equivalence() -> Result<Outcome<Observations>, String> {
+    match (
+        completed_generation(false).await?,
+        completed_generation(true).await?,
+    ) {
+        (Outcome::Completed(fresh), Outcome::Completed(released)) => {
+            let mut out = Observations::new();
+            out.check("fresh and released upgrades have identical functions, indexes, constraints and versions",fresh==released);
+            Ok(Outcome::Completed(out))
+        }
+        (Outcome::Skipped, Outcome::Skipped) => Ok(Outcome::Skipped),
+        _ => Err("database availability changed between the two schema origins".into()),
+    }
+}
+
+async fn untrusted_notify_search_path() -> Result<Outcome<Observations>, String> {
+    with_isolated_database(|url| async move {
+        let pool = pool(&url)?;
+        setup(&pool).await.map_err(|e| e.to_string())?;
+        sql(
+            &pool,
+            "ALTER FUNCTION apalis.notify_new_jobs() RESET search_path",
+        )
+        .await?;
+        let mut out = Observations::new();
+        out.check(
+            "verify rejects a current function without the required search_path",
+            matches!(verify_schema(&pool).await, Err(Error::Migration(_))),
+        );
+        out.check(
+            "setup rejects the same unsafe function attributes",
+            matches!(setup(&pool).await, Err(Error::Migration(_))),
+        );
+        out.check(
+            "rejected setup releases the advisory lock",
+            locks(&pool).await? == 0,
+        );
+        Ok(out)
+    })
+    .await
+}
+
+lets_expect! { #tokio_test
+    expect(owner_schema_scenario(kind).await) as upgrading_active_owner_invariants{
+        let kind=OwnerScenario::PrivatePrevious;
+        to repairs_only_lost_active_executions_and_preserves_other_history{satisfies_contract()}
+        when the_previous_generation_has_only_a_public_journal{
+            let kind=OwnerScenario::PublicPrevious;
+            to adopts_then_repairs_without_rewriting_foreign_history{satisfies_contract()}
+        }
+    }
+    expect(owner_schema_scenario(kind).await) as verifying_active_owner_invariants{
+        let kind=OwnerScenario::MissingConstraint;
+        to rejects_the_missing_constraint_without_changing_history{satisfies_contract()}
+        when the_constraint_definition_is_wrong{let kind=OwnerScenario::WrongConstraint;to rejects_the_wrong_definition{satisfies_contract()}}
+        when the_constraint_is_not_validated{let kind=OwnerScenario::UnvalidatedConstraint;to refuses_to_treat_unchecked_rows_as_valid{satisfies_contract()}}
+    }
+    expect(owner_schema_scenario(kind).await) as adopting_an_invalid_active_owner_invariant{
+        let kind=OwnerScenario::WrongUnjournaledConstraint;
+        to refuses_the_wrong_definition_without_blessing_history{satisfies_contract()}
+        when the_constraint_is_not_validated{let kind=OwnerScenario::UnvalidatedUnjournaledConstraint;to refuses_without_creating_private_history{satisfies_contract()}}
+    }
+    expect(owner_schema_scenario(OwnerScenario::LatestDown).await) as downgrading_active_owner_invariants{
+        to restores_the_current_function_and_constraint_on_reupgrade{satisfies_contract()}
+    }
+    expect(released_and_fresh_equivalence().await) as the_released_and_fresh_schema{
+        to converges_to_the_same_complete_runtime_catalog{satisfies_contract()}
+    }
+    expect(untrusted_notify_search_path().await) as unsafe_notification_function_attributes{
+        to rejects_unsafe_attributes_during_verification_and_setup{satisfies_contract()}
     }
 }

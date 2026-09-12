@@ -185,7 +185,7 @@ mod tests {
     }
 
     lets_expect! { #tokio_test
-        expect(forwarded_value(work_succeeds).await) {
+        expect(forwarded_value(work_succeeds).await) as blocking_work_result {
             let work_succeeds = true;
 
             when blocking_work_returns_ok {
@@ -202,7 +202,7 @@ mod tests {
             }
         }
 
-        expect(panicked_value().await) {
+        expect(panicked_value().await) as panicking_blocking_work {
             when blocking_work_panics {
                 to maps_the_join_error_to_error_blocking {
                     be_err_and is_blocking_join_error
@@ -212,77 +212,11 @@ mod tests {
     }
 }
 
-// When BOTH runtime features are enabled, `run_blocking` prefers tokio only
-// while a tokio runtime is actually entered; otherwise it falls back to ntex's
-// blocking pool. The tokio lets_expect spec above always runs inside a tokio
-// runtime (lets_expect emits `#[tokio::test]`), so it can never reach the
-// fallback. These specs drive `run_blocking` from inside an ntex runtime with
-// no tokio runtime entered (`#[ntex::test]`), exercising the
-// `Handle::try_current().is_err()` branch end to end. They use a plain ntex
-// harness rather than lets_expect for the same reason — a `#[tokio::test]`
-// would enter a tokio runtime and defeat the very condition under test.
-#[cfg(all(test, feature = "tokio", feature = "ntex"))]
-mod both_features_no_tokio_runtime_tests {
-    use super::test_assertions::{
-        equals_invalid_argument, forwarded_work, is_blocking_join_error, panicking_work,
-    };
-    use super::*;
-
-    #[ntex::test]
-    async fn forwards_the_ok_value_via_ntex_fallback() {
-        assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "the ntex fallback branch is only reached without an entered tokio runtime"
-        );
-
-        let result = run_blocking(forwarded_work(true)).await;
-
-        assert_eq!(result.expect("ok value forwarded"), 42);
-    }
-
-    #[ntex::test]
-    async fn forwards_the_err_value_via_ntex_fallback() {
-        assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "the ntex fallback branch is only reached without an entered tokio runtime"
-        );
-
-        let result = run_blocking(forwarded_work(false)).await;
-
-        let error = result.expect_err("err value forwarded");
-        equals_invalid_argument("synthetic failure")(&error)
-            .expect("err forwarded unchanged as InvalidArgument");
-    }
-
-    #[ntex::test]
-    async fn maps_a_panic_to_error_blocking_via_ntex_fallback() {
-        assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "the ntex fallback branch is only reached without an entered tokio runtime"
-        );
-
-        let result = run_blocking(panicking_work()).await;
-
-        let error = result.expect_err("panic surfaces as Err");
-        is_blocking_join_error(&error).expect("panic mapped to Error::Blocking");
-    }
-}
-
-// Deterministic regression test for the ntex `spawn_blocking` cancel-on-drop
-// hazard. ntex-rt's blocking pool wraps every submitted closure in
-// `if !tx.is_closed()` (`ntex-rt/src/pool.rs`), so a closure still queued when
-// the awaiting future is dropped is silently skipped — even though ntex-rt's
-// own docs promise "the task will not be cancelled even if the future is
-// dropped". `run_blocking` relied on that (false) promise, matching tokio's
-// real guarantee, so a dropped ack/flush future could strand a `Running` row or
-// lose accepted tasks under the `ntex` feature. A saturated one-thread pool
-// makes the queueing deterministic: the occupier holds the only worker, the
-// probe's closure is queued, and cancelling the probe's future before the
-// worker frees exercises the exact skip window. Runs under the
-// `--no-default-features --features ntex --lib` CI job and `--all-features`
-// (where the ntex fallback branch is taken because no tokio runtime is entered).
+// The synchronous lets_expect subject owns the ntex runner. That preserves
+// ntex-only and both-feature fallback preconditions without entering Tokio.
+// Off-runtime cases deliberately use the synchronous futures executor instead.
 #[cfg(all(test, feature = "ntex"))]
-mod ntex_drop_safety_tests {
+mod ntex_tests {
     use std::future::Future;
     use std::sync::{
         Arc,
@@ -292,16 +226,51 @@ mod ntex_drop_safety_tests {
     use std::task::{Context, Poll};
 
     use futures::task::noop_waker;
+    use lets_expect::*;
 
+    use super::test_assertions::{
+        equals_invalid_argument, forwarded_work, is_blocking_join_error, panicking_work,
+    };
     use super::*;
 
-    // Yields control back to the ntex arbiter a bounded number of times so any
-    // task spawned via `ntex_rt::spawn` (here, `run_blocking`'s detached
-    // forwarding task) gets polled. This replaces the previous wall-clock
-    // `sleep(50ms)` barrier: it advances the executor by *events*, not elapsed
-    // time, so it can neither race a slow scheduler nor spuriously fail a loaded
-    // one. `poll_fn` that returns `Pending` once (after waking itself) hands the
-    // arbiter a chance to run other ready tasks before resuming.
+    fn assert_ntex_runtime() {
+        assert!(
+            ntex_rt::System::try_current().is_some(),
+            "the blocking work must be polled inside the ntex System"
+        );
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the ntex path requires no entered Tokio runtime, including when both features are enabled"
+        );
+    }
+
+    fn on_ntex<F: Future + 'static>(future: F) -> F::Output
+    where
+        F::Output: 'static,
+    {
+        ntex::rt::System::build()
+            .build(ntex::rt::DefaultRuntime)
+            .block_on(async move {
+                assert_ntex_runtime();
+                future.await
+            })
+    }
+
+    fn ntex_work_result(work_succeeds: bool) -> Result<usize, Error> {
+        on_ntex(run_blocking(forwarded_work(work_succeeds)))
+    }
+
+    fn ntex_panicked_work() -> Result<usize, Error> {
+        on_ntex(run_blocking(panicking_work()))
+    }
+
+    #[derive(Debug)]
+    struct QueuedWorkRun {
+        probe_was_pending: bool,
+        work_signalled: bool,
+        work_ran: bool,
+    }
+
     async fn yield_to_arbiter() {
         for _ in 0..16 {
             let mut yielded = false;
@@ -318,8 +287,7 @@ mod ntex_drop_safety_tests {
         }
     }
 
-    #[test]
-    fn dropped_run_blocking_future_still_runs_the_work() {
+    fn cancelled_queued_work() -> QueuedWorkRun {
         let runner = ntex::rt::System::build()
             .thread_pool_limit(1)
             .build(ntex::rt::DefaultRuntime);
@@ -329,6 +297,8 @@ mod ntex_drop_safety_tests {
         runner.block_on({
             let ran = ran.clone();
             async move {
+                assert_ntex_runtime();
+                let probe_was_pending;
                 let (busy_tx, busy_rx) = mpsc::channel::<()>();
                 let (release_tx, release_rx) = mpsc::channel::<()>();
                 // The probe closure signals here the instant it runs, so the
@@ -370,10 +340,7 @@ mod ntex_drop_safety_tests {
                     let mut cx = Context::from_waker(&waker);
                     // A first poll enters `run_blocking_ntex`, spawns the detached
                     // task, and parks on the forwarding receiver.
-                    assert!(
-                        probe.as_mut().poll(&mut cx).is_pending(),
-                        "the probe cannot resolve while the only blocking worker is occupied"
-                    );
+                    probe_was_pending = probe.as_mut().poll(&mut cx).is_pending();
                     // Drop the caller's future — the cancel-on-drop event under test.
                     drop(probe);
                 }
@@ -402,186 +369,117 @@ mod ntex_drop_safety_tests {
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .is_ok();
 
-                assert!(
-                    ran_before_deadline && ran.load(Ordering::SeqCst),
-                    "run_blocking silently dropped the work when its future was cancelled before the ntex blocking pool picked the closure up"
-                );
+                QueuedWorkRun {
+                    probe_was_pending,
+                    work_signalled: ran_before_deadline,
+                    work_ran: ran.load(Ordering::SeqCst),
+                }
             }
-        });
+        })
     }
-}
 
-// Regression test for the no-`System` fallback. `run_blocking_ntex` normally
-// detaches through `ntex_rt::spawn`, which panics when no ntex `System` is
-// running ("not in a neon runtime"). A caller that drives these futures without
-// an entered ntex runtime — e.g. a synchronous bootstrap
-// `futures::executor::block_on(setup(&pool))` under `--features ntex`, which the
-// free `ntex_rt::spawn_blocking` historically served by running the closure
-// inline via `ThreadPool::execute_inplace` — must keep working rather than
-// abort. This spec polls `run_blocking` with no ntex `System` entered (and,
-// under `--all-features`, no tokio runtime either, so the `Handle::try_current`
-// check routes to the ntex path): before the fix the first poll panicked inside
-// `ntex_rt::spawn`; after it, the closure runs inline and its value is
-// forwarded. A plain `#[test]` (no `#[ntex::test]`/`#[tokio::test]`) is what
-// keeps both runtimes un-entered. Runs under both the `--all-features` and
-// `--no-default-features --features ntex --lib` CI jobs.
-#[cfg(all(test, feature = "ntex"))]
-mod ntex_no_system_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    #[derive(Debug)]
+    struct InlineWorkRun {
+        system_was_absent: bool,
+        tokio_was_absent: bool,
+        result: Result<usize, Error>,
+        work_ran: bool,
+    }
 
-    use super::*;
+    fn off_runtime_work(runner_returned: bool) -> InlineWorkRun {
+        if runner_returned {
+            let runner = ntex::rt::System::build()
+                .thread_pool_limit(1)
+                .build(ntex::rt::DefaultRuntime);
+            runner.block_on(async {});
+        }
 
-    #[test]
-    fn run_blocking_without_an_ntex_system_runs_inline() {
-        assert!(
-            ntex_rt::System::try_current().is_none(),
-            "this spec must run without an entered ntex System to exercise the fallback"
-        );
-
+        // Observe the gate before polling the operation. A stale current System
+        // after runner shutdown must fail this same leaf, even if work returns.
+        let system_was_absent = ntex_rt::System::try_current().is_none();
+        let tokio_was_absent = tokio::runtime::Handle::try_current().is_err();
         let ran = Arc::new(AtomicBool::new(false));
         let result = futures::executor::block_on(run_blocking({
             let ran = ran.clone();
             move || {
                 ran.store(true, Ordering::SeqCst);
-                Ok::<usize, Error>(7)
+                Ok::<usize, Error>(if runner_returned { 9 } else { 7 })
             }
         }));
-
-        assert_eq!(result.expect("work forwarded its value"), 7);
-        assert!(
-            ran.load(Ordering::SeqCst),
-            "the blocking closure must have run inline without an ntex System"
-        );
+        InlineWorkRun {
+            system_was_absent,
+            tokio_was_absent,
+            result,
+            work_ran: ran.load(Ordering::SeqCst),
+        }
     }
-}
 
-// Guards the assumption behind the `System::try_current()` gate in
-// `run_blocking_ntex`. It is tempting to think that after an ntex
-// `SystemRunner::block_on` returns the thread keeps a *current* `System` while
-// its runtime is no longer entered — which would make the gate insufficient,
-// since `ntex_rt::spawn` needs a running `Runtime`, not merely a `System`. In
-// practice the runner clears the current `System` as it winds down (the
-// arbiter's shutdown calls `unregister_arbiter`/`remove_current`), so once
-// `block_on` returns `System::try_current()` is `None`. A caller that then
-// drives these futures off the runtime (e.g. `futures::executor::block_on`)
-// therefore takes the no-`System` inline/pool fallback, never the detached
-// `ntex_rt::spawn` path that would panic without a running runtime. The only way
-// to observe a current `System` with no running runtime is to call the
-// `#[doc(hidden)]` `System::set_current` by hand, which is not supported usage.
-// Were a future ntex release stop clearing the `System` here, this spec fails
-// loudly — signalling that the gate must then probe the runtime itself.
-#[cfg(all(test, feature = "ntex"))]
-mod ntex_runner_returned_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
-
-    use super::*;
-
-    #[test]
-    fn current_system_is_cleared_after_a_runner_returns_so_run_blocking_falls_back() {
-        let runner = ntex::rt::System::build()
-            .thread_pool_limit(1)
-            .build(ntex::rt::DefaultRuntime);
-        runner.block_on(async {});
-
-        assert!(
-            ntex_rt::System::try_current().is_none(),
-            "an ntex runner must clear the current System when it returns; the \
-             run_blocking gate relies on this to route off-runtime callers to \
-             the inline/pool fallback instead of the detached spawn path"
-        );
-
-        let ran = Arc::new(AtomicBool::new(false));
-        let result = futures::executor::block_on(run_blocking({
-            let ran = ran.clone();
-            move || {
-                ran.store(true, Ordering::SeqCst);
-                Ok::<usize, Error>(9)
-            }
-        }));
-
-        assert_eq!(result.expect("work forwarded its value"), 9);
-        assert!(
-            ran.load(Ordering::SeqCst),
-            "the blocking closure must have run after the runner returned"
-        );
-    }
-}
-
-// Covers the third `rx.await` arm of `run_blocking_ntex`'s detached path:
-// `Err(canceled)`, taken when the forwarding `oneshot` is dropped before the
-// detached task reports back (only reachable end to end when the arbiter itself
-// is tearing down, which is not deterministically reproducible). This spec drives
-// the real `resolve_forwarded_result` — the exact function `run_blocking_ntex`
-// awaits, so the actual `match rx.await { .. Err(canceled) => .. }` code runs —
-// against a receiver whose sender has been dropped without sending, reproducing
-// the same `oneshot::Canceled` a torn-down forwarding task would leave behind and
-// pinning the `canceled -> Error::Blocking` translation against regression.
-#[cfg(all(test, feature = "ntex"))]
-mod ntex_forwarding_canceled_tests {
-    use super::test_assertions::is_blocking_join_error;
-    use super::*;
-
-    #[test]
-    fn a_cancelled_forwarding_oneshot_maps_to_error_blocking() {
-        // Build the exact channel `run_blocking_ntex` uses to forward the detached
-        // task's outcome, then drop the sender without sending — the receiver now
-        // yields the same `oneshot::Canceled` the detached forwarding task leaves
-        // behind when the arbiter tears it down before it reports back. Awaiting
-        // through `resolve_forwarded_result` executes the production `rx.await`
-        // match, including its `Err(canceled)` arm, end to end.
+    fn cancelled_forwarder() -> Result<usize, Error> {
+        // Drive the actual folding operation with the exact channel type it
+        // receives when the detached forwarding task goes away before sending.
+        // This is a translation check, not a simulated full arbiter shutdown.
         let (tx, rx) = futures::channel::oneshot::channel::<
             Result<Result<usize, Error>, ntex_rt::BlockingError>,
         >();
         drop(tx);
-
-        let result = futures::executor::block_on(resolve_forwarded_result(rx));
-
-        let error = result.expect_err(
-            "a cancelled forwarding oneshot must surface as an Err from resolve_forwarded_result",
-        );
-        is_blocking_join_error(&error)
-            .expect("a cancelled forwarding oneshot must surface as Error::Blocking");
-    }
-}
-
-// The ntex-only `run_blocking` implementation (no tokio feature) has its own
-// spec. lets_expect is tokio-feature-bound (it emits `#[tokio::test]`), so this
-// module uses a plain `#[ntex::test]` harness, which runs under the existing
-// `cargo test --no-default-features --features ntex --lib` CI job.
-#[cfg(all(test, feature = "ntex", not(feature = "tokio")))]
-mod ntex_only_tests {
-    use super::test_assertions::{
-        equals_invalid_argument, forwarded_work, is_blocking_join_error, panicking_work,
-    };
-    use super::*;
-
-    #[ntex::test]
-    async fn forwards_the_ok_value() {
-        let result = run_blocking(forwarded_work(true)).await;
-
-        assert_eq!(result.expect("ok value forwarded"), 42);
+        futures::executor::block_on(resolve_forwarded_result(rx))
     }
 
-    #[ntex::test]
-    async fn forwards_the_err_value() {
-        let result = run_blocking(forwarded_work(false)).await;
+    lets_expect! {
+        expect(ntex_work_result(work_succeeds)) as ntex_blocking_work_result {
+            let work_succeeds = true;
+            when the_work_succeeds {
+                to forwards_the_successful_value { be_ok_and equal(42) }
+            }
+            when the_work_returns_an_error {
+                let work_succeeds = false;
+                to forwards_the_exact_error {
+                    be_err_and equals_invalid_argument("synthetic failure")
+                }
+            }
+        }
 
-        let error = result.expect_err("err value forwarded");
-        equals_invalid_argument("synthetic failure")(&error)
-            .expect("err forwarded unchanged as InvalidArgument");
-    }
+        expect(ntex_panicked_work()) as ntex_panicking_work {
+            when the_work_panics {
+                to reports_the_blocking_failure { be_err_and is_blocking_join_error }
+            }
+        }
 
-    #[ntex::test]
-    async fn maps_a_panic_to_error_blocking() {
-        let result = run_blocking(panicking_work()).await;
+        expect(cancelled_queued_work()) as queued_work_ownership {
+            when the_waiter_is_dropped_while_the_pool_is_busy {
+                to preserves_the_submitted_work {
+                    have(probe_was_pending) be_true,
+                    have(work_signalled) be_true,
+                    have(work_ran) be_true
+                }
+            }
+        }
 
-        let error = result.expect_err("panic surfaces as Err");
-        is_blocking_join_error(&error).expect("panic mapped to Error::Blocking");
+        expect(off_runtime_work(runner_returned)) as off_runtime_work {
+            let runner_returned = false;
+            when no_system_has_been_started {
+                to executes_the_work_without_entering_a_runtime {
+                    have(system_was_absent) be_true,
+                    have(tokio_was_absent) be_true,
+                    have(result) be_ok_and equal(7),
+                    have(work_ran) be_true
+                }
+            }
+            when the_system_runner_has_returned {
+                let runner_returned = true;
+                to executes_the_work_after_the_system_is_cleared {
+                    have(system_was_absent) be_true,
+                    have(tokio_was_absent) be_true,
+                    have(result) be_ok_and equal(9),
+                    have(work_ran) be_true
+                }
+            }
+        }
+
+        expect(cancelled_forwarder()) as forwarding_task_ownership {
+            when the_forwarder_disappears_before_sending {
+                to reports_the_blocking_failure { be_err_and is_blocking_join_error }
+            }
+        }
     }
 }

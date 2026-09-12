@@ -63,7 +63,7 @@ use apalis_core::{
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 use diesel::{
     QueryableByName, RunQueryDsl, sql_query,
-    sql_types::{BigInt, Integer, Text},
+    sql_types::{BigInt, Integer, Nullable, Text},
 };
 use lets_expect::{AssertionResult, *};
 use ulid::Ulid;
@@ -131,9 +131,8 @@ fn fresh_task_id() -> String {
 // --------------------------------------------------------------------------
 // row insertion helpers
 //
-// Pending rows never carry `lock_by`, so no workers row is needed. Terminal
-// rows (Done/Failed/Killed) likewise don't need a `lock_by` (the FK is only
-// enforced when `lock_by IS NOT NULL`), so we keep all helpers FK-free.
+// Non-active rows need no worker in this fixture. Active rows have a
+// registered owner in the same queue and a claim timestamp.
 // --------------------------------------------------------------------------
 
 async fn insert_job(
@@ -147,16 +146,24 @@ async fn insert_job(
 ) -> Result<String, String> {
     let id = Ulid::new().to_string();
     let task_id = id.clone();
+    let owner = if matches!(status, "Queued" | "Running") {
+        let owner = format!("seeded-owner-{id}");
+        insert_worker(pool.clone(), queue.clone(), owner.clone()).await?;
+        Some(owner)
+    } else {
+        None
+    };
     with_conn(pool, move |conn| {
         let job = serde_json::to_vec("admin-spec-payload").map_err(|e| e.to_string())?;
         match done_at_offset_secs {
             Some(done) => {
                 sql_query(
                     "INSERT INTO apalis.jobs (
-                        id, job_type, job, status, attempts, max_attempts, run_at, done_at
+                        id, job_type, job, status, attempts, max_attempts, run_at, done_at, lock_by, lock_at
                     ) VALUES ($1, $2, $3, $4, $5, $6,
                         now() - ($7 * INTERVAL '1 second'),
-                        now() - ($8 * INTERVAL '1 second'))",
+                        now() - ($8 * INTERVAL '1 second'), $9,
+                        CASE WHEN $9 IS NOT NULL THEN date_trunc('second', clock_timestamp()) ELSE NULL END)",
                 )
                 .bind::<Text, _>(&id)
                 .bind::<Text, _>(&queue)
@@ -166,15 +173,17 @@ async fn insert_job(
                 .bind::<Integer, _>(max_attempts)
                 .bind::<Integer, _>(run_at_offset_secs as i32)
                 .bind::<Integer, _>(done as i32)
+                .bind::<Nullable<Text>, _>(owner)
                 .execute(conn)
                 .map_err(|e| e.to_string())?;
             }
             None => {
                 sql_query(
                     "INSERT INTO apalis.jobs (
-                        id, job_type, job, status, attempts, max_attempts, run_at
+                        id, job_type, job, status, attempts, max_attempts, run_at, lock_by, lock_at
                     ) VALUES ($1, $2, $3, $4, $5, $6,
-                        now() - ($7 * INTERVAL '1 second'))",
+                        now() - ($7 * INTERVAL '1 second'), $8,
+                        CASE WHEN $8 IS NOT NULL THEN date_trunc('second', clock_timestamp()) ELSE NULL END)",
                 )
                 .bind::<Text, _>(&id)
                 .bind::<Text, _>(&queue)
@@ -183,6 +192,7 @@ async fn insert_job(
                 .bind::<Integer, _>(attempts)
                 .bind::<Integer, _>(max_attempts)
                 .bind::<Integer, _>(run_at_offset_secs as i32)
+                .bind::<Nullable<Text>, _>(owner)
                 .execute(conn)
                 .map_err(|e| e.to_string())?;
             }

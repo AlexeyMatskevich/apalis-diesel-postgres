@@ -30,7 +30,7 @@ BEGIN
                 (row_number() OVER (PARTITION BY job_type ORDER BY id) - 1) / 100
                     AS chunk
             FROM new_jobs
-            WHERE run_at <= now()
+            WHERE run_at <= statement_timestamp()
         ) sub
         GROUP BY job_type, chunk
     LOOP

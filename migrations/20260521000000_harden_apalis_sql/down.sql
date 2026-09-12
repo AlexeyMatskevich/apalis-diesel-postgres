@@ -1,3 +1,12 @@
+-- Downgrade cannot represent the same worker id in multiple queues.
+-- Refuse before DDL instead of silently deleting registrations.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM apalis.workers GROUP BY id HAVING count(*) > 1) THEN
+        RAISE EXCEPTION 'cannot downgrade: worker ids occur in multiple queues; resolve registrations explicitly first';
+    END IF;
+END $$;
+
 ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_lock_by_worker_type_fkey;
 ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_attempts_check;
@@ -16,18 +25,6 @@ DROP INDEX IF EXISTS apalis.jobs_job_type_done_at_idx;
 DROP INDEX IF EXISTS apalis.idx_jobs_idempotency_key;
 
 ALTER TABLE apalis.jobs ALTER COLUMN priority DROP NOT NULL;
-
-WITH duplicate_workers AS (
-    SELECT ctid,
-           ROW_NUMBER() OVER (PARTITION BY id ORDER BY worker_type) AS row_number
-    FROM apalis.workers
-)
-DELETE FROM apalis.workers
-WHERE ctid IN (
-    SELECT ctid
-    FROM duplicate_workers
-    WHERE row_number > 1
-);
 
 ALTER TABLE apalis.workers DROP CONSTRAINT IF EXISTS workers_pkey;
 ALTER TABLE apalis.workers
@@ -55,21 +52,33 @@ CREATE OR REPLACE FUNCTION apalis.get_jobs(
     v_job_count INTEGER DEFAULT 5
 ) RETURNS SETOF apalis.jobs AS $$
 BEGIN
+    -- Match native claim/recovery ordering even for this trusted, token-free API.
+    -- The FK's implicit worker KEY SHARE would otherwise happen after job locks.
+    PERFORM 1 FROM apalis.workers AS worker
+    WHERE worker.id = worker_id AND worker.worker_type = v_job_type
+    FOR SHARE;
+
     RETURN QUERY
-    UPDATE apalis.jobs
-    SET status = 'Queued',
-        lock_by = worker_id,
-        lock_at = now()
-    WHERE id IN (
+    -- Keep the limit on one candidate set, even when the UPDATE plan rescans it.
+    WITH candidates AS MATERIALIZED (
         SELECT id
         FROM apalis.jobs
-        WHERE (status = 'Pending' OR (status = 'Failed' AND attempts < max_attempts))
-            AND run_at < now()
+        WHERE (status IN ('Pending', 'Failed') AND attempts < max_attempts)
+            AND run_at <= statement_timestamp()
             AND job_type = v_job_type
         ORDER BY priority DESC, run_at ASC
         LIMIT v_job_count
         FOR UPDATE SKIP LOCKED
     )
-    RETURNING *;
+    UPDATE apalis.jobs AS job
+    SET status = 'Queued',
+        lock_by = worker_id,
+        lock_at = date_trunc('second', statement_timestamp()),
+        done_at = NULL
+    FROM candidates
+    WHERE job.id = candidates.id
+    RETURNING job.*;
 END;
-$$ LANGUAGE plpgsql VOLATILE;
+$$ LANGUAGE plpgsql VOLATILE
+   SECURITY INVOKER
+   SET search_path = pg_catalog, apalis, pg_temp;

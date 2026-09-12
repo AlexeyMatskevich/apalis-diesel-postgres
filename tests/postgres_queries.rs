@@ -1,8 +1,11 @@
 #![cfg(feature = "tokio")]
 
 mod support;
+#[path = "support/unreachable.rs"]
+mod unreachable;
 
 use support::{Outcome, observe, with_conn};
+use unreachable::unreachable_pool;
 
 use std::{
     str::FromStr,
@@ -24,9 +27,7 @@ use apalis_diesel_postgres::{
 };
 use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
 use diesel::{
-    PgConnection, QueryableByName, RunQueryDsl,
-    r2d2::{ConnectionManager, Pool},
-    sql_query,
+    QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz},
 };
 use futures::StreamExt;
@@ -52,14 +53,6 @@ struct StatusRow {
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
     support::shared_pool().await
-}
-
-fn invalid_pool() -> PgPool {
-    let manager = ConnectionManager::<PgConnection>::new("postgres://127.0.0.1:1/not-used");
-    Pool::builder()
-        .max_size(1)
-        .connection_timeout(Duration::from_millis(10))
-        .build_unchecked(manager)
 }
 
 async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
@@ -306,6 +299,7 @@ struct PushFetchRun {
     first_args: String,
     second_args: String,
     delayed_args: Option<String>,
+    delayed_pending: bool,
 }
 
 async fn run_push_fetch() -> Result<Outcome<PushFetchRun>, String> {
@@ -344,6 +338,9 @@ async fn run_push_fetch() -> Result<Outcome<PushFetchRun>, String> {
     Ok(Outcome::Completed(PushFetchRun {
         first_args: first.args,
         second_args: second.args,
+        delayed_pending: fetched_later
+            .as_ref()
+            .is_some_and(|t| t.parts.status.load() == Status::Pending),
         delayed_args: fetched_later.map(|t| t.args),
     }))
 }
@@ -388,7 +385,7 @@ fn delayed_task_fetchable_by_id()
 fn delayed_task_not_polled() -> impl Fn(&Result<Outcome<PushFetchRun>, String>) -> AssertionResult {
     observe::<PushFetchRun, _>("delayed task polling", |run| {
         let polled = [run.first_args.as_str(), run.second_args.as_str()];
-        if polled.contains(&"later") {
+        if polled.contains(&"later") || !run.delayed_pending {
             Err("future-dated task was polled before its run_at".into())
         } else {
             Ok(())
@@ -880,7 +877,11 @@ async fn run_lock_boundary(lockable: bool) -> Result<Outcome<LockBoundaryRun>, S
     cleanup_queue(pool, queue).await?;
 
     Ok(Outcome::Completed(LockBoundaryRun {
-        lock_succeeded: lock_result.is_ok(),
+        lock_succeeded: match lock_result {
+            Ok(()) => true,
+            Err(apalis_diesel_postgres::Error::TaskNotFound { .. }) => false,
+            Err(error) => return Err(error.to_string()),
+        },
     }))
 }
 
@@ -997,8 +998,10 @@ async fn run_skip_locked_concurrency() -> Result<Outcome<SkipLockedRun>, String>
         .await
         .map_err(|e| e.to_string())?;
 
-    let storage_a = PostgresStorage::<String>::new_with_config(&pool, &config);
-    let storage_b = PostgresStorage::<String>::new_with_config(&pool, &config);
+    let storage_a = PostgresStorage::<String>::new_with_config(&pool, &config)
+        .with_poll_strategy_factory(|| Config::default().poll_strategy().clone());
+    let storage_b = PostgresStorage::<String>::new_with_config(&pool, &config)
+        .with_poll_strategy_factory(|| Config::default().poll_strategy().clone());
     let worker_a = WorkerContext::new::<()>(&format!("skip-locked-a-{queue}"));
     let worker_b = WorkerContext::new::<()>(&format!("skip-locked-b-{queue}"));
 
@@ -1236,7 +1239,11 @@ async fn run_lock_status_scenario(
     cleanup_queue(pool, queue).await?;
 
     Ok(Outcome::Completed(LockScenarioRun {
-        lock_succeeded: lock_result.is_ok(),
+        lock_succeeded: match lock_result {
+            Ok(()) => true,
+            Err(apalis_diesel_postgres::Error::TaskNotFound { .. }) => false,
+            Err(error) => return Err(error.to_string()),
+        },
         final_status: row.status,
         final_lock_by: row.lock_by,
         final_lock_at: row.lock_at.map(|dt| dt.to_unix_timestamp()),
@@ -1291,7 +1298,11 @@ async fn run_lock_in_queue_scenario(
     cleanup_queue(pool, queue).await?;
 
     Ok(Outcome::Completed(LockScenarioRun {
-        lock_succeeded: lock_result.is_ok(),
+        lock_succeeded: match lock_result {
+            Ok(()) => true,
+            Err(apalis_diesel_postgres::Error::TaskNotFound { .. }) => false,
+            Err(error) => return Err(error.to_string()),
+        },
         final_status: row.status,
         final_lock_by: row.lock_by,
         final_lock_at: row.lock_at.map(|dt| dt.to_unix_timestamp()),
@@ -1402,82 +1413,86 @@ struct ListingMetricsRun {
 }
 
 async fn run_listing_metrics() -> Result<Outcome<ListingMetricsRun>, String> {
-    let Some(pool) = test_pool().await? else {
-        return Ok(Outcome::Skipped);
-    };
-    let queue = format!("apalis-query-listing-{}", Ulid::new());
-    let other_queue = format!("{queue}-other");
-    cleanup_queue(pool.clone(), queue.clone()).await?;
-    cleanup_queue(pool.clone(), other_queue.clone()).await?;
+    support::with_isolated_database(|url| async move {
+        let pool = apalis_diesel_postgres::build_pool(url).map_err(|error| error.to_string())?;
+        apalis_diesel_postgres::setup(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let queue = format!("apalis-query-listing-{}", Ulid::new());
+        let other_queue = format!("{queue}-other");
+        cleanup_queue(pool.clone(), queue.clone()).await?;
+        cleanup_queue(pool.clone(), other_queue.clone()).await?;
 
-    let config = Config::new(&queue);
-    let other_config = Config::new(&other_queue);
-    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
-    let mut other = PostgresStorage::<String>::new_with_config(&pool, &other_config);
-    storage
-        .push_task(task("pending", now_unix() - 1, 0, 25, None))
-        .await
-        .map_err(|e| e.to_string())?;
-    other
-        .push_task(task("other-pending", now_unix() - 1, 0, 25, None))
-        .await
-        .map_err(|e| e.to_string())?;
-    storage
-        .register_worker("listing-worker".to_owned())
-        .await
-        .map_err(|e| e.to_string())?;
-    other
-        .register_worker("other-listing-worker".to_owned())
-        .await
-        .map_err(|e| e.to_string())?;
+        let config = Config::new(&queue);
+        let other_config = Config::new(&other_queue);
+        let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+        let mut other = PostgresStorage::<String>::new_with_config(&pool, &other_config);
+        storage
+            .push_task(task("pending", now_unix() - 1, 0, 25, None))
+            .await
+            .map_err(|e| e.to_string())?;
+        other
+            .push_task(task("other-pending", now_unix() - 1, 0, 25, None))
+            .await
+            .map_err(|e| e.to_string())?;
+        storage
+            .register_worker("listing-worker".to_owned())
+            .await
+            .map_err(|e| e.to_string())?;
+        other
+            .register_worker("other-listing-worker".to_owned())
+            .await
+            .map_err(|e| e.to_string())?;
 
-    let filter = Filter {
-        status: Some(Status::Pending),
-        page: 1,
-        page_size: Some(20),
-    };
-    let listed = storage
-        .list_tasks(&filter)
-        .await
-        .map_err(|e| e.to_string())?;
-    let all = storage
-        .list_all_tasks(&filter)
-        .await
-        .map_err(|e| e.to_string())?;
-    let workers = storage.list_workers().await.map_err(|e| e.to_string())?;
-    let all_workers = storage
-        .list_all_workers()
-        .await
-        .map_err(|e| e.to_string())?;
-    let queues = storage.list_queues().await.map_err(|e| e.to_string())?;
-    let queue_metrics = storage.fetch_by_queue().await.map_err(|e| e.to_string())?;
-    let global_metrics = storage.global().await.map_err(|e| e.to_string())?;
+        let filter = Filter {
+            status: Some(Status::Pending),
+            page: 1,
+            page_size: Some(20),
+        };
+        let listed = storage
+            .list_tasks(&filter)
+            .await
+            .map_err(|e| e.to_string())?;
+        let all = storage
+            .list_all_tasks(&filter)
+            .await
+            .map_err(|e| e.to_string())?;
+        let workers = storage.list_workers().await.map_err(|e| e.to_string())?;
+        let all_workers = storage
+            .list_all_workers()
+            .await
+            .map_err(|e| e.to_string())?;
+        let queues = storage.list_queues().await.map_err(|e| e.to_string())?;
+        let queue_metrics = storage.fetch_by_queue().await.map_err(|e| e.to_string())?;
+        let global_metrics = storage.global().await.map_err(|e| e.to_string())?;
 
-    cleanup_queue(pool.clone(), queue.clone()).await?;
-    cleanup_queue(pool, other_queue.clone()).await?;
+        cleanup_queue(pool.clone(), queue.clone()).await?;
+        cleanup_queue(pool, other_queue.clone()).await?;
 
-    let run = ListingMetricsRun {
-        listed_tasks_current_queue_only: listed.len() == 1 && listed[0].args == "pending",
-        all_tasks_includes_both_queues: all
-            .iter()
-            .filter(|t| {
-                t.parts.ctx.queue().as_deref() == Some(queue.as_str())
-                    || t.parts.ctx.queue().as_deref() == Some(other_queue.as_str())
-            })
-            .count()
-            >= 2,
-        current_queue_worker_visible: workers.iter().any(|w| w.id == "listing-worker"),
-        other_queue_worker_hidden_from_scoped_list: !workers
-            .iter()
-            .any(|w| w.id == "other-listing-worker"),
-        other_queue_worker_visible_in_all_list: all_workers
-            .iter()
-            .any(|w| w.id == "other-listing-worker"),
-        queue_info_present: queues.iter().any(|info| info.name == queue),
-        pending_metric_present: queue_metrics.iter().any(|s| s.title == "PENDING_JOBS"),
-        total_metric_present: global_metrics.iter().any(|s| s.title == "TOTAL_JOBS"),
-    };
-    Ok(Outcome::Completed(run))
+        let run = ListingMetricsRun {
+            listed_tasks_current_queue_only: listed.len() == 1 && listed[0].args == "pending",
+            all_tasks_includes_both_queues: all
+                .iter()
+                .filter(|t| {
+                    t.parts.ctx.queue().as_deref() == Some(queue.as_str())
+                        || t.parts.ctx.queue().as_deref() == Some(other_queue.as_str())
+                })
+                .count()
+                >= 2,
+            current_queue_worker_visible: workers.iter().any(|w| w.id == "listing-worker"),
+            other_queue_worker_hidden_from_scoped_list: !workers
+                .iter()
+                .any(|w| w.id == "other-listing-worker"),
+            other_queue_worker_visible_in_all_list: all_workers
+                .iter()
+                .any(|w| w.id == "other-listing-worker"),
+            queue_info_present: queues.iter().any(|info| info.name == queue),
+            pending_metric_present: queue_metrics.iter().any(|s| s.title == "PENDING_JOBS"),
+            total_metric_present: global_metrics.iter().any(|s| s.title == "TOTAL_JOBS"),
+        };
+        Ok(run)
+    })
+    .await
 }
 
 fn list_tasks_scoped_to_current_queue()
@@ -1711,7 +1726,7 @@ struct WaitEmptyRun {
 
 async fn run_wait_empty() -> Result<Outcome<WaitEmptyRun>, String> {
     let storage = PostgresStorage::<String>::new_with_config(
-        &invalid_pool(),
+        &unreachable_pool(),
         &Config::new("apalis-query-wait-empty"),
     );
     let mut stream = <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, []);
@@ -1739,7 +1754,7 @@ struct WaitErrorRun {
 
 async fn run_wait_error() -> Result<Outcome<WaitErrorRun>, String> {
     let storage = PostgresStorage::<String>::new_with_config(
-        &invalid_pool(),
+        &unreachable_pool(),
         &Config::new("apalis-query-wait-error"),
     );
     let mut stream =
@@ -2679,9 +2694,17 @@ async fn run_ack_on_terminal_row() -> Result<Outcome<AckOnTerminalRun>, String> 
     )
     .await?;
 
+    let fixture_pool = pool.clone();
+    let fixture_queue = queue.clone();
+    let fixture_owner = worker_name.clone();
+    with_conn(fixture_pool,move|conn| {
+        sql_query("UPDATE apalis.jobs SET lock_by=$2,lock_at=to_timestamp($3::double precision) WHERE id=$1 AND job_type=$4")
+            .bind::<Text,_>(id.to_string()).bind::<Text,_>(fixture_owner).bind::<BigInt,_>(lock_at_secs).bind::<Text,_>(fixture_queue)
+            .execute(conn).map_err(|e|e.to_string())?;Ok(())
+    }).await?;
     let parts = TaskBuilder::new(())
         .with_task_id(id)
-        .with_attempt(Attempt::new_with_value(1))
+        .with_attempt(Attempt::new_with_value(2))
         .with_ctx(
             PgContext::new()
                 .with_max_attempts(2)
@@ -2980,24 +3003,18 @@ fn empty_key_row_count_is_one()
 }
 
 lets_expect! { #tokio_test
-    expect(run_push_fetch().await) {
+    expect(run_push_fetch().await) as push_fetch {
         when due_and_delayed_tasks_are_pushed_together {
             to polls_the_oldest_due_task_first {
-                fetched_oldest_task_first()
-            }
-            to polls_the_newer_due_task_second {
-                fetched_newer_task_second()
-            }
-            to does_not_poll_the_delayed_task_until_its_run_at {
-                delayed_task_not_polled()
-            }
-            to keeps_the_delayed_task_fetchable_by_id {
+                fetched_oldest_task_first(),
+                fetched_newer_task_second(),
+                delayed_task_not_polled(),
                 delayed_task_fetchable_by_id()
             }
         }
     }
 
-    expect(run_fetch_by_id_cross_queue().await) {
+    expect(run_fetch_by_id_cross_queue().await) as fetch_by_id_cross_queue {
         when a_task_is_fetched_by_id_from_an_unrelated_queue_storage {
             to does_not_leak_the_row_across_queues {
                 cross_queue_fetch_returns_none()
@@ -3005,16 +3022,12 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_idempotency(same_queue).await) {
+    expect(run_idempotency(same_queue).await) as idempotency {
         when an_idempotency_key_collides_in_the_same_queue {
             let same_queue = true;
             to rejects_the_second_push {
-                duplicate_push_rejected()
-            }
-            to keeps_exactly_one_row_in_the_primary_queue {
-                keeps_one_job_in_primary_queue()
-            }
-            to leaves_unrelated_queues_empty {
+                duplicate_push_rejected(),
+                keeps_one_job_in_primary_queue(),
                 other_queue_remains_empty_for_same_queue_duplicate()
             }
         }
@@ -3022,27 +3035,19 @@ lets_expect! { #tokio_test
         when the_same_key_is_pushed_into_a_different_queue {
             let same_queue = false;
             to accepts_both_pushes {
-                duplicate_push_accepted()
-            }
-            to keeps_one_row_in_the_primary_queue {
-                keeps_one_row_in_primary_queue_for_cross_queue_duplicate()
-            }
-            to keeps_one_row_in_the_secondary_queue {
+                duplicate_push_accepted(),
+                keeps_one_row_in_primary_queue_for_cross_queue_duplicate(),
                 keeps_one_row_in_secondary_queue_for_cross_queue_duplicate()
             }
         }
     }
 
-    expect(run_ack_boundary(terminal).await) {
+    expect(run_ack_boundary(terminal).await) as ack_boundary {
         when a_failed_attempt_still_has_retries_left {
             let terminal = false;
             to records_status_failed {
-                ack_recorded_status("Failed")
-            }
-            to records_the_executed_attempt_count {
-                ack_recorded_attempts(1)
-            }
-            to persists_the_failure_payload {
+                ack_recorded_status("Failed"),
+                ack_recorded_attempts(1),
                 ack_persisted_last_result()
             }
         }
@@ -3050,18 +3055,14 @@ lets_expect! { #tokio_test
         when a_failed_attempt_has_exhausted_the_retry_budget {
             let terminal = true;
             to records_status_killed {
-                ack_recorded_status("Killed")
-            }
-            to records_the_final_attempt_count {
-                ack_recorded_attempts(2)
-            }
-            to persists_the_failure_payload {
+                ack_recorded_status("Killed"),
+                ack_recorded_attempts(2),
                 ack_persisted_last_result()
             }
         }
     }
 
-    expect(run_ack_oversized_error().await) {
+    expect(run_ack_oversized_error().await) as ack_oversized_error {
         when a_failed_attempt_carries_an_error_larger_than_the_payload_cap {
             to truncates_the_failure_payload_with_the_marker {
                 ack_truncates_oversized_error_payload()
@@ -3069,24 +3070,18 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_ack_stale().await) {
+    expect(run_ack_stale().await) as ack_stale {
         when ack_arrives_from_a_worker_that_no_longer_holds_the_lock {
             to surfaces_a_stale_acknowledgement_error {
-                stale_ack_returns_error()
-            }
-            to keeps_the_row_in_running_status {
-                stale_ack_keeps_status_running()
-            }
-            to does_not_advance_the_attempt_counter {
-                stale_ack_does_not_increment_attempts()
-            }
-            to does_not_write_a_last_result_payload {
+                stale_ack_returns_error(),
+                stale_ack_keeps_status_running(),
+                stale_ack_does_not_increment_attempts(),
                 stale_ack_does_not_write_last_result()
             }
         }
     }
 
-    expect(run_lock_boundary(lockable).await) {
+    expect(run_lock_boundary(lockable).await) as lock_boundary {
         when the_task_is_due_for_execution {
             let lockable = true;
             to succeeds_in_acquiring_the_row {
@@ -3102,7 +3097,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_priority_ordering().await) {
+    expect(run_priority_ordering().await) as priority_ordering {
         when due_tasks_have_different_priorities {
             to polls_high_priority_before_mid_then_low {
                 priority_ordering_high_then_mid_then_low()
@@ -3110,178 +3105,178 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_skip_locked_concurrency().await) {
+    expect(run_skip_locked_concurrency().await) as skip_locked_concurrency {
         when two_workers_poll_the_same_queue_concurrently {
             to delivers_distinct_payloads_via_skip_locked {
-                skip_locked_distributes_distinct_rows()
-            }
-            to covers_every_pushed_payload_between_the_workers {
+                skip_locked_distributes_distinct_rows(),
                 skip_locked_covers_the_pushed_set()
             }
         }
     }
 
-    expect(run_lock_status_scenario(scenario).await) {
+    expect(run_lock_status_scenario(scenario).await) as lock_status_scenario {
         let scenario = "pending_due";
 
         when the_task_is_pending_with_a_past_run_at {
-            to acquires_the_row_for_the_primary_worker { lock_matrix_succeeds() }
-            to leaves_the_row_in_running_state { lock_matrix_status_equals("Running") }
-            to records_the_primary_worker_as_lock_holder { lock_matrix_owned_by("primary") }
+            to acquires_the_row_for_the_primary_worker {
+                lock_matrix_succeeds(),
+                lock_matrix_status_equals("Running"),
+                lock_matrix_owned_by("primary")
+            }
         }
 
         when the_task_is_pending_with_a_future_run_at {
             let scenario = "pending_future";
-            to refuses_to_acquire_the_row { lock_matrix_refuses() }
-            to keeps_the_row_in_pending_state { lock_matrix_status_equals("Pending") }
+            to refuses_to_acquire_the_row {
+                lock_matrix_refuses(),
+                lock_matrix_status_equals("Pending")
+            }
         }
 
         when the_task_is_queued_by_the_same_worker {
             let scenario = "queued_by_self";
-            to re_locks_the_row_for_the_same_worker { lock_matrix_succeeds() }
-            to leaves_the_row_in_running_state { lock_matrix_status_equals("Running") }
-            to clears_done_at_when_re_locking_the_row { lock_matrix_cleared_done_at() }
-            to preserves_the_existing_lock_at_timestamp { lock_matrix_preserved_past_lock_at() }
+            to re_locks_the_row_for_the_same_worker {
+                lock_matrix_succeeds(),
+                lock_matrix_status_equals("Running"),
+                lock_matrix_cleared_done_at(),
+                lock_matrix_preserved_past_lock_at()
+            }
         }
 
         when the_task_is_queued_by_a_different_worker {
             let scenario = "queued_by_other";
-            to refuses_to_acquire_the_row { lock_matrix_refuses() }
-            to keeps_the_row_in_queued_state { lock_matrix_status_equals("Queued") }
-            to preserves_the_other_worker_as_lock_holder { lock_matrix_owned_by("other") }
+            to refuses_to_acquire_the_row {
+                lock_matrix_refuses(),
+                lock_matrix_status_equals("Queued"),
+                lock_matrix_owned_by("other")
+            }
         }
 
         when the_task_is_running_by_the_same_worker {
             let scenario = "running_by_self";
-            to re_locks_the_already_running_row_for_the_same_worker { lock_matrix_succeeds() }
-            to keeps_the_row_in_running_state { lock_matrix_status_equals("Running") }
-            to clears_done_at_when_re_locking_the_row { lock_matrix_cleared_done_at() }
-            to preserves_the_existing_lock_at_timestamp { lock_matrix_preserved_past_lock_at() }
+            to re_locks_the_already_running_row_for_the_same_worker {
+                lock_matrix_succeeds(),
+                lock_matrix_status_equals("Running"),
+                lock_matrix_cleared_done_at(),
+                lock_matrix_preserved_past_lock_at()
+            }
         }
 
         when the_task_is_running_by_a_different_worker {
             let scenario = "running_by_other";
-            to refuses_to_acquire_the_row { lock_matrix_refuses() }
-            to keeps_the_row_in_running_state { lock_matrix_status_equals("Running") }
-            to preserves_the_running_worker_as_lock_holder { lock_matrix_owned_by("other") }
+            to refuses_to_acquire_the_row {
+                lock_matrix_refuses(),
+                lock_matrix_status_equals("Running"),
+                lock_matrix_owned_by("other")
+            }
         }
 
         when the_task_failed_but_still_has_retries {
             let scenario = "failed_retryable";
-            to acquires_the_row_for_a_retry { lock_matrix_succeeds() }
-            to transitions_the_row_into_running_state { lock_matrix_status_equals("Running") }
-            to records_the_primary_worker_as_lock_holder { lock_matrix_owned_by("primary") }
+            to acquires_the_row_for_a_retry {
+                lock_matrix_succeeds(),
+                lock_matrix_status_equals("Running"),
+                lock_matrix_owned_by("primary")
+            }
         }
 
         when the_task_failed_and_exhausted_the_retry_budget {
             let scenario = "failed_exhausted";
-            to refuses_to_acquire_the_row { lock_matrix_refuses() }
-            to keeps_the_row_in_failed_state { lock_matrix_status_equals("Failed") }
+            to refuses_to_acquire_the_row {
+                lock_matrix_refuses(),
+                lock_matrix_status_equals("Failed")
+            }
         }
 
         when the_task_is_already_done {
             let scenario = "done";
-            to refuses_to_acquire_a_completed_row { lock_matrix_refuses() }
-            to keeps_the_row_in_done_state { lock_matrix_status_equals("Done") }
+            to refuses_to_acquire_a_completed_row {
+                lock_matrix_refuses(),
+                lock_matrix_status_equals("Done")
+            }
         }
 
         when the_task_is_killed {
             let scenario = "killed";
-            to refuses_to_acquire_a_killed_row { lock_matrix_refuses() }
-            to keeps_the_row_in_killed_state { lock_matrix_status_equals("Killed") }
+            to refuses_to_acquire_a_killed_row {
+                lock_matrix_refuses(),
+                lock_matrix_status_equals("Killed")
+            }
         }
     }
 
-    expect(run_lock_in_queue_scenario(scenario).await) {
+    expect(run_lock_in_queue_scenario(scenario).await) as lock_in_queue_scenario {
         let scenario = "matching_queue";
 
         when lock_task_in_queue_targets_the_rows_own_queue {
-            to acquires_the_row_for_the_primary_worker { lock_matrix_succeeds() }
-            to transitions_the_row_into_running_state { lock_matrix_status_equals("Running") }
-            to records_the_primary_worker_as_lock_holder { lock_matrix_owned_by("primary") }
+            to acquires_the_row_for_the_primary_worker {
+                lock_matrix_succeeds(),
+                lock_matrix_status_equals("Running"),
+                lock_matrix_owned_by("primary")
+            }
         }
 
         when lock_task_in_queue_targets_a_foreign_queue {
             let scenario = "foreign_queue";
-            to refuses_to_acquire_the_cross_queue_row { lock_matrix_refuses() }
-            to leaves_the_row_in_pending_state { lock_matrix_status_equals("Pending") }
+            to refuses_to_acquire_the_cross_queue_row {
+                lock_matrix_refuses(),
+                lock_matrix_status_equals("Pending")
+            }
         }
     }
 
-    expect(run_listing_metrics().await) {
+    expect(run_listing_metrics().await) as listing_metrics {
         when storage_exposes_listing_and_metric_apis_on_a_populated_database {
-            to list_tasks_is_scoped_to_the_current_queue {
-                list_tasks_scoped_to_current_queue()
-            }
-            to list_all_tasks_spans_every_queue {
-                list_all_tasks_covers_all_queues()
-            }
-            to includes_the_current_queue_worker_in_list_workers {
-                list_workers_includes_current_queue_worker()
-            }
-            to hides_other_queue_workers_from_list_workers {
-                list_workers_hides_other_queue_workers()
-            }
-            to surfaces_other_queue_workers_through_list_all_workers {
-                list_all_workers_surfaces_other_queue_workers()
-            }
-            to list_queues_includes_the_active_queue {
-                list_queues_includes_active_queue()
-            }
-            to queue_metrics_expose_pending_jobs_counter {
-                queue_metrics_include_pending_jobs()
-            }
-            to global_metrics_expose_total_jobs_counter {
+            to lists_only_tasks_in_the_current_queue {
+                list_tasks_scoped_to_current_queue(),
+                list_all_tasks_covers_all_queues(),
+                list_workers_includes_current_queue_worker(),
+                list_workers_hides_other_queue_workers(),
+                list_all_workers_surfaces_other_queue_workers(),
+                list_queues_includes_active_queue(),
+                queue_metrics_include_pending_jobs(),
                 global_metrics_include_total_jobs()
             }
         }
     }
 
-    expect(run_completion_check_status().await) {
+    expect(run_completion_check_status().await) as completion_check_status {
         when check_status_inspects_a_terminal_task {
             to reports_done_status {
-                completion_reports_done_status()
-            }
-            to surfaces_the_decoded_payload {
+                completion_reports_done_status(),
                 completion_carries_decoded_payload()
             }
         }
     }
 
-    expect(run_completion_wait_for().await) {
+    expect(run_completion_wait_for().await) as completion_wait_for {
         when wait_for_streams_a_terminal_task {
             to reports_done_status {
-                completion_reports_done_status()
-            }
-            to surfaces_the_decoded_payload {
+                completion_reports_done_status(),
                 completion_carries_decoded_payload()
             }
         }
     }
 
-    expect(run_completion_cross_check().await) {
+    expect(run_completion_cross_check().await) as completion_cross_check {
         when check_status_is_used_from_an_unrelated_queue_storage {
             to reports_done_status {
-                completion_reports_done_status()
-            }
-            to surfaces_the_decoded_payload {
+                completion_reports_done_status(),
                 completion_carries_decoded_payload()
             }
         }
     }
 
-    expect(run_completion_cross_wait().await) {
+    expect(run_completion_cross_wait().await) as completion_cross_wait {
         when wait_for_is_used_from_an_unrelated_queue_storage {
             to reports_done_status {
-                completion_reports_done_status()
-            }
-            to surfaces_the_decoded_payload {
+                completion_reports_done_status(),
                 completion_carries_decoded_payload()
             }
         }
     }
 
-    expect(run_wait_empty().await) {
+    expect(run_wait_empty().await) as wait_empty {
         when wait_for_is_called_with_no_ids {
             to ends_the_stream_without_touching_the_database {
                 wait_empty_terminates_without_db()
@@ -3289,7 +3284,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_wait_error().await) {
+    expect(run_wait_error().await) as wait_error {
         when wait_for_cannot_reach_the_database {
             to surfaces_the_database_error_through_the_stream {
                 wait_error_surfaces_db_error()
@@ -3297,7 +3292,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_wait_pending().await) {
+    expect(run_wait_pending().await) as wait_pending {
         when wait_for_targets_a_non_terminal_task {
             to keeps_waiting_until_the_task_finishes {
                 wait_pending_does_not_complete_early()
@@ -3305,18 +3300,16 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_wait_malformed_terminal().await) {
+    expect(run_wait_malformed_terminal().await) as wait_malformed_terminal {
         when wait_for_observes_a_terminal_row_with_an_unparseable_result {
             to yields_a_decode_error_first {
-                malformed_wait_first_yields_decode_error()
-            }
-            to does_not_keep_retrying_after_the_decode_error {
+                malformed_wait_first_yields_decode_error(),
                 malformed_wait_finishes_after_one()
             }
         }
     }
 
-    expect(run_zero_buffer_fetch().await) {
+    expect(run_zero_buffer_fetch().await) as zero_buffer_fetch {
         when buffer_size_is_zero_in_the_config {
             to still_polls_one_due_task {
                 zero_buffer_still_fetches_one()
@@ -3324,29 +3317,21 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_orphan_reenqueue(false, false).await) {
+    expect(run_orphan_reenqueue(false, false).await) as orphaned_running_task_with_retries {
         when a_stale_worker_left_a_running_task_with_retries_available {
             to requeues_the_task_back_to_pending {
-                orphan_status_equals("Pending")
-            }
-            to records_the_retry_attempt {
-                orphan_attempts_equals(1)
-            }
-            to populates_last_result_after_reenqueue {
+                orphan_status_equals("Pending"),
+                orphan_attempts_equals(1),
                 orphan_recorded_last_result()
             }
         }
     }
 
-    expect(run_orphan_reenqueue(true, true).await) {
+    expect(run_orphan_reenqueue(true, true).await) as orphaned_queued_task_at_limit {
         when a_stale_worker_left_a_queued_task_with_no_retries_remaining {
             to kills_the_task {
-                orphan_status_equals("Killed")
-            }
-            to records_the_final_attempt {
-                orphan_attempts_equals(2)
-            }
-            to populates_last_result_after_reenqueue {
+                orphan_status_equals("Killed"),
+                orphan_attempts_equals(2),
                 orphan_recorded_last_result()
             }
         }
@@ -3357,35 +3342,27 @@ lets_expect! { #tokio_test
     // so a future regression that conflates "Queued" with "no retries" or
     // "Running" with "has retries" is caught.
 
-    expect(run_orphan_reenqueue(true, false).await) {
+    expect(run_orphan_reenqueue(true, false).await) as orphaned_queued_task_with_retries {
         when a_stale_worker_left_a_queued_task_with_retries_available {
             to requeues_the_task_back_to_pending {
-                orphan_status_equals("Pending")
-            }
-            to records_the_retry_attempt {
-                orphan_attempts_equals(1)
-            }
-            to populates_last_result_after_reenqueue {
+                orphan_status_equals("Pending"),
+                orphan_attempts_equals(1),
                 orphan_recorded_last_result()
             }
         }
     }
 
-    expect(run_orphan_reenqueue(false, true).await) {
+    expect(run_orphan_reenqueue(false, true).await) as orphaned_running_task_at_limit {
         when a_stale_worker_left_a_running_task_with_no_retries_remaining {
             to kills_the_task {
-                orphan_status_equals("Killed")
-            }
-            to records_the_final_attempt {
-                orphan_attempts_equals(2)
-            }
-            to populates_last_result_after_reenqueue {
+                orphan_status_equals("Killed"),
+                orphan_attempts_equals(2),
                 orphan_recorded_last_result()
             }
         }
     }
 
-    expect(run_poll_decode_basic().await) {
+    expect(run_poll_decode_basic().await) as poll_decode_basic {
         when basic_polling_storage_decodes_a_malformed_payload {
             to surfaces_a_decode_error_through_the_stream {
                 poll_decode_error_mentions_payload()
@@ -3393,7 +3370,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_poll_decode_notify().await) {
+    expect(run_poll_decode_notify().await) as poll_decode_notify {
         when notify_polling_storage_decodes_a_malformed_payload {
             to surfaces_a_decode_error_through_the_stream {
                 poll_decode_error_mentions_payload()
@@ -3403,19 +3380,15 @@ lets_expect! { #tokio_test
 
     // Each `to` re-runs the scenario against a fresh ULID-named queue, so the
     // runs are independent.
-    expect(run_decode_release(notify, max_attempts, second_poll).await) {
+    expect(run_decode_release(notify, max_attempts, second_poll).await) as decode_release {
         let notify = false;
         let max_attempts = 25;
         let second_poll = false;
 
         when the_poll_path_claims_an_undecodable_payload_with_retry_budget_left {
             to surfaces_the_decode_error {
-                decode_release_surfaces_the_error()
-            }
-            to fails_the_attempt_instead_of_stranding_the_row_in_running {
-                decode_release_row("Failed", 1)
-            }
-            to persists_the_decode_error_in_last_result {
+                decode_release_surfaces_the_error(),
+                decode_release_row("Failed", 1),
                 decode_release_persists_decode_error()
             }
         }
@@ -3442,77 +3415,57 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_idempotency_without_keys().await) {
+    expect(run_idempotency_without_keys().await) as idempotency_without_keys {
         when two_pushes_into_the_same_queue_omit_the_idempotency_key {
             to accepts_the_second_push {
-                no_key_second_push_is_accepted()
-            }
-            to stores_one_row_per_push {
+                no_key_second_push_is_accepted(),
                 no_key_pushes_create_two_rows()
             }
         }
     }
 
-    expect(run_lock_already_held().await) {
+    expect(run_lock_already_held().await) as lock_already_held {
         when lock_task_is_called_on_a_row_already_locked_by_another_worker {
             to refuses_to_re_lock_the_row {
-                second_lock_is_refused()
-            }
-            to preserves_the_original_lock_holder {
-                original_lock_holder_is_preserved()
-            }
-            to keeps_the_row_in_running_status {
+                second_lock_is_refused(),
+                original_lock_holder_is_preserved(),
                 locked_row_status_remains_running()
             }
         }
     }
 
-    expect(run_ack_on_pending_row().await) {
+    expect(run_ack_on_pending_row().await) as ack_on_pending_row {
         when ack_targets_a_row_that_was_never_locked {
             to returns_a_stale_acknowledgement_error {
-                ack_on_pending_row_is_rejected()
-            }
-            to does_not_change_the_row_status {
-                pending_row_status_unchanged_after_rejected_ack()
-            }
-            to does_not_advance_the_attempt_counter {
-                pending_row_attempts_unchanged_after_rejected_ack()
-            }
-            to does_not_write_a_last_result_payload {
+                ack_on_pending_row_is_rejected(),
+                pending_row_status_unchanged_after_rejected_ack(),
+                pending_row_attempts_unchanged_after_rejected_ack(),
                 pending_row_last_result_unchanged_after_rejected_ack()
             }
         }
     }
 
-    expect(run_lock_missing_row().await) {
+    expect(run_lock_missing_row().await) as lock_missing_row {
         when lock_task_targets_an_id_that_was_never_inserted {
             to returns_a_task_not_found_error {
-                lock_missing_row_rejected()
-            }
-            to surfaces_the_missing_task_id_in_the_error {
+                lock_missing_row_rejected(),
                 lock_missing_row_error_mentions_task()
             }
         }
     }
 
-    expect(run_ack_on_terminal_row().await) {
+    expect(run_ack_on_terminal_row().await) as ack_on_terminal_row {
         when ack_targets_a_row_that_is_already_marked_done {
             to returns_a_stale_acknowledgement_error {
-                terminal_ack_rejected()
-            }
-            to leaves_the_row_in_done_state {
-                terminal_ack_status_unchanged()
-            }
-            to does_not_advance_the_attempt_counter {
-                terminal_ack_attempts_unchanged()
-            }
-            to preserves_the_existing_last_result_payload {
+                terminal_ack_rejected(),
+                terminal_ack_status_unchanged(),
+                terminal_ack_attempts_unchanged(),
                 terminal_ack_last_result_unchanged()
             }
         }
     }
 
-    expect(run_fetch_by_id_missing().await) {
+    expect(run_fetch_by_id_missing().await) as fetch_by_id_missing {
         when fetch_by_id_is_called_with_an_id_that_does_not_exist {
             to returns_none {
                 fetch_by_id_missing_returns_none()
@@ -3520,7 +3473,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_check_status_variants(scenario).await) {
+    expect(run_check_status_variants(scenario).await) as check_status_variants {
         let scenario = "pending";
 
         when check_status_inspects_a_non_terminal_row {
@@ -3558,23 +3511,19 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_idempotency_empty_key().await) {
+    expect(run_idempotency_empty_key().await) as idempotency_empty_key {
         when an_empty_string_idempotency_key_is_used_for_two_pushes_in_the_same_queue {
             to rejects_the_second_push {
-                empty_key_duplicate_rejected()
-            }
-            to keeps_a_single_row_in_the_queue {
+                empty_key_duplicate_rejected(),
                 empty_key_row_count_is_one()
             }
         }
     }
 
-    expect(run_wait_for_mixed().await) {
+    expect(run_wait_for_mixed().await) as wait_for_mixed {
         when wait_for_is_called_with_one_pending_and_one_terminal_id {
             to yields_the_terminal_task_first {
-                mixed_wait_yields_terminal_first()
-            }
-            to keeps_waiting_for_the_pending_task_after_the_first_item {
+                mixed_wait_yields_terminal_first(),
                 mixed_wait_keeps_pending_open()
             }
         }

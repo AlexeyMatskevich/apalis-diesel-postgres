@@ -366,6 +366,8 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
                 _registration: registration,
             },
             lease_token: crate::queries::worker::mint_lease_token().into(),
+            leases: Default::default(),
+            poll_factory: None,
         })
     }
 }
@@ -466,6 +468,7 @@ impl crate::fetcher::PgFetcherSource for SharedFetcher {
         config: Config,
         worker: WorkerContext,
         lease_token: std::sync::Arc<str>,
+        factory: Option<crate::fetcher::PollStrategyFactory>,
     ) -> apalis_core::backend::TaskStream<PgTask<CompactType>, Error> {
         crate::fetcher::notify_backed_compact_stream(
             Self::STORAGE_NAME,
@@ -474,6 +477,7 @@ impl crate::fetcher::PgFetcherSource for SharedFetcher {
             config,
             worker,
             lease_token,
+            factory,
         )
     }
 }
@@ -481,10 +485,6 @@ impl crate::fetcher::PgFetcherSource for SharedFetcher {
 #[cfg(test)]
 mod tests {
     use apalis_core::backend::{Backend, BackendExt, shared::MakeShared};
-    use diesel::{
-        PgConnection,
-        r2d2::{ConnectionManager, Pool},
-    };
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
@@ -496,11 +496,7 @@ mod tests {
     }
 
     fn unchecked_pool() -> PgPool {
-        let manager = ConnectionManager::<PgConnection>::new("postgres://127.0.0.1:1/not-used");
-        Pool::builder()
-            .max_size(1)
-            .connection_timeout(std::time::Duration::from_millis(10))
-            .build_unchecked(manager)
+        crate::unreachable::unreachable_pool()
     }
 
     fn shared_debug() -> String {

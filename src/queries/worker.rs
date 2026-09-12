@@ -1,113 +1,112 @@
-use std::sync::Arc;
-
+use crate::{Config, Error, PgPool, queries::with_conn};
 use apalis_core::worker::context::WorkerContext;
 use diesel::{
-    Connection, PgConnection, RunQueryDsl, sql_query,
-    sql_types::{Integer, Text},
+    Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
+    sql_types::{Array, BigInt, Bool, Double, Nullable, Text},
 };
 use futures::stream;
+use std::{sync::Arc, time::Duration};
 use ulid::Ulid;
 
-use crate::{
-    Config, Error, PgPool,
-    queries::{clamp_i32, with_conn},
-};
-
-/// Mint a per-registration lease token. Tokens are random Ulids: only the
-/// process that issued one can refresh the corresponding `apalis.workers` row,
-/// closing the heartbeat-spoofing window described on the `lease_token`
-/// migration.
 pub(crate) fn mint_lease_token() -> String {
     Ulid::new().to_string()
 }
-
-/// Per-statement cap on the orphan-recovery sweep. Without a bound, a mass
-/// worker death could leave every in-flight row eligible at once and turn the
-/// sweep into a single unbounded UPDATE that locks and rewrites the entire
-/// backlog in one statement. Capping the subselect keeps each sweep's lock
-/// footprint and statement duration bounded; a backlog larger than one batch
-/// drains across subsequent `keep_alive`-interval sweeps (and is further
-/// parallelised across a queue's workers by `FOR UPDATE ... SKIP LOCKED`).
 pub(crate) const REENQUEUE_ORPHANED_BATCH_LIMIT: i32 = 1000;
+
+// Compare elapsed seconds as a numeric value instead of constructing an interval:
+// even Duration::MAX is representable, and subsecond deadlines are preserved.
+fn timeout_seconds(duration: Duration) -> f64 {
+    duration.as_secs_f64()
+}
+#[derive(QueryableByName)]
+struct WorkerIdentity {
+    #[diesel(sql_type = Text)]
+    id: String,
+}
+#[derive(QueryableByName)]
+struct Decision {
+    #[diesel(sql_type = Bool)]
+    allowed: bool,
+}
+
+#[derive(QueryableByName)]
+struct RegistrationDecision {
+    #[diesel(sql_type = Bool)]
+    allowed: bool,
+    #[diesel(sql_type = Bool)]
+    lost: bool,
+}
+
+/// All native ownership operations take the worker row before any job row.
+/// Takeover/recovery explicitly use FOR UPDATE, so KEY SHARE fences identity
+/// changes while allowing the independent last_seen heartbeat UPDATE to proceed.
+pub(crate) fn lock_current_worker(
+    conn: &mut PgConnection,
+    worker: &str,
+    queue: &str,
+    token: Option<&str>,
+) -> Result<bool, Error> {
+    let rows = sql_query("SELECT id FROM apalis.workers WHERE id=$1 AND worker_type=$2 AND ($3::text IS NULL OR lease_token=$3) FOR KEY SHARE")
+        .bind::<Text,_>(worker).bind::<Text,_>(queue).bind::<Nullable<Text>,_>(token)
+        .load::<WorkerIdentity>(conn).map_err(Error::database("checking worker registration"))?;
+    Ok(!rows.is_empty())
+}
+
+fn recover_owned(
+    conn: &mut PgConnection,
+    queue: &str,
+    workers: Vec<String>,
+    bounded: bool,
+) -> Result<usize, Error> {
+    if workers.is_empty() {
+        return Ok(0);
+    }
+    // Takeover must wait for every incumbent claim. SKIP LOCKED is appropriate
+    // only for a periodic sweep, whose stale worker identity remains unchanged.
+    let skip = if bounded { "SKIP LOCKED" } else { "" };
+    // Keep one candidate set even when the planner chooses a nested-loop
+    // join. Re-evaluating a locking LIMIT subquery after each UPDATE can select
+    // more rows as earlier candidates leave the active states.
+    sql_query(format!("WITH candidates AS MATERIALIZED (
+        SELECT id FROM apalis.jobs WHERE job_type=$1 AND lock_by=ANY($2)
+            AND status IN ('Running','Queued') ORDER BY id LIMIT $3 FOR UPDATE {skip}
+        )
+        UPDATE apalis.jobs SET
+        status=CASE WHEN attempts::bigint+1>=max_attempts THEN 'Killed' ELSE 'Pending' END,
+        done_at=CASE WHEN attempts::bigint+1>=max_attempts THEN clock_timestamp() ELSE NULL END,
+        lock_by=NULL, lock_at=NULL,
+        attempts=LEAST(attempts::bigint+1,max_attempts),
+        last_result=CASE WHEN attempts::bigint+1>=max_attempts OR last_result IS NULL
+            THEN '{{\"Err\":\"Re-enqueued due to worker heartbeat timeout.\"}}'::jsonb ELSE last_result END
+        FROM candidates
+        WHERE apalis.jobs.status IN ('Running','Queued') AND apalis.jobs.id=candidates.id"))
+        .bind::<Text,_>(queue).bind::<Array<Text>,_>(workers)
+        .bind::<Nullable<BigInt>,_>(bounded.then_some(i64::from(REENQUEUE_ORPHANED_BATCH_LIMIT)))
+        .execute(conn).map_err(Error::database("re-enqueueing orphaned jobs"))
+}
 
 pub(crate) fn reenqueue_orphaned_blocking(
     conn: &mut PgConnection,
     config: &Config,
 ) -> Result<usize, Error> {
-    sql_query(
-        "UPDATE apalis.jobs
-         SET status = CASE
-                 WHEN attempts::bigint + 1 >= max_attempts THEN 'Killed'
-                 ELSE 'Pending'
-             END,
-             done_at = CASE
-                 WHEN attempts::bigint + 1 >= max_attempts THEN now()
-                 ELSE NULL
-             END,
-             lock_by = NULL,
-             lock_at = NULL,
-             -- attempts::bigint promotes the arithmetic so a corrupt row
-             -- sitting at i32::MAX cannot overflow the + 1 (which PostgreSQL
-             -- rejects as an integer-out-of-range error); LEAST re-bounds the
-             -- result to max_attempts, so it fits the int column again. The
-             -- >= comparisons above are likewise promoted to avoid the overflow.
-             attempts = LEAST(attempts::bigint + 1, max_attempts),
-             -- On terminal `Killed` transitions stamp the timeout marker
-             -- unconditionally (no further ack can succeed because
-             -- `ack_task` requires status='Running'). On `Pending`
-             -- transitions stamp the marker only when `last_result` is NULL
-             -- so observers can tell a heartbeat-timeout reenqueue from a
-             -- normal retry — but never clobber an existing result, because
-             -- a worker racing this UPDATE (heartbeat not yet refreshed)
-             -- might have acked the task moments earlier and its outcome
-             -- must remain visible.
-             last_result = CASE
-                 WHEN attempts::bigint + 1 >= max_attempts
-                     THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
-                 WHEN last_result IS NULL
-                     THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
-                 ELSE last_result
-             END
-         -- The status predicate is repeated outside the sub-select on purpose.
-         -- Under READ COMMITTED, a row that a concurrent transaction already
-         -- re-enqueued (or acked) between our sub-select snapshot and our row
-         -- lock is re-checked here against its NEW version (EvalPlanQual);
-         -- without the outer predicate this sweep would apply twice — burning
-         -- an extra attempt, prematurely killing the job, or flipping an
-         -- already-acked 'Done' row back to 'Pending'. `FOR UPDATE SKIP
-         -- LOCKED` below additionally keeps concurrent sweeps from queueing
-         -- behind each other's row locks.
-         WHERE (status = 'Running' OR status = 'Queued')
-           AND id IN (
-             SELECT jobs.id
-             FROM apalis.jobs
-             INNER JOIN apalis.workers
-                 ON jobs.lock_by = workers.id
-                 AND jobs.job_type = workers.worker_type
-             WHERE (status = 'Running' OR status = 'Queued')
-                 AND now() - apalis.workers.last_seen >= ($1 * INTERVAL '1 second')
-                 AND jobs.job_type = $2
-             -- Bound the sweep so a mass worker death cannot turn this into one
-             -- unbounded UPDATE over the whole backlog; the remainder drains on
-             -- the next keep_alive-interval sweep.
-             LIMIT $3
-             FOR UPDATE OF jobs SKIP LOCKED
-         )",
-    )
-    .bind::<Integer, _>(clamp_i32(config.reenqueue_orphaned_after().as_secs()))
-    .bind::<Text, _>(config.queue().to_string())
-    .bind::<Integer, _>(REENQUEUE_ORPHANED_BATCH_LIMIT)
-    .execute(conn)
-    .map_err(Error::database("re-enqueueing orphaned jobs"))
+    conn.transaction(|tx| {
+        let workers=sql_query("SELECT id FROM apalis.workers w WHERE worker_type=$1
+            AND EXTRACT(EPOCH FROM (clock_timestamp()-last_seen)) >= $2
+            AND EXISTS(SELECT 1 FROM apalis.jobs j WHERE j.job_type=w.worker_type AND j.lock_by=w.id AND j.status IN ('Running','Queued'))
+            ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED")
+            .bind::<Text,_>(config.queue().as_ref())
+            .bind::<Double,_>(timeout_seconds(config.reenqueue_orphaned_after()))
+            .bind::<BigInt,_>(i64::from(REENQUEUE_ORPHANED_BATCH_LIMIT))
+            .load::<WorkerIdentity>(tx).map_err(Error::database("locking orphaned workers"))?;
+        recover_owned(tx, config.queue().as_ref(), workers.into_iter().map(|w|w.id).collect(), true)
+    })
 }
-
 pub(crate) fn reenqueue_orphaned(
     pool: PgPool,
     config: Config,
 ) -> impl Future<Output = Result<usize, Error>> + Send {
     with_conn(pool, move |conn| reenqueue_orphaned_blocking(conn, &config))
 }
-
 pub(crate) fn reenqueue_orphaned_stream(
     pool: PgPool,
     config: Config,
@@ -128,49 +127,43 @@ pub(crate) fn register_worker_blocking(
     worker: &WorkerContext,
     storage_name: &'static str,
     lease_token: &str,
-    stale_after_secs: i32,
+    stale_after: Duration,
 ) -> Result<(), Error> {
-    // ON CONFLICT update is gated on the existing row being either
-    // unbound (NULL lease_token, e.g. left over from a dashboard-side
-    // registration) or stale (last_seen older than the orphan-recovery
-    // threshold). This closes the live-hijack window: a process that
-    // re-registers with an already-claimed `(worker_id, worker_type)`
-    // can no longer silently rotate the lease_token out from under a
-    // healthy heartbeater. Legitimate restart still works once the
-    // previous registration ages past the orphan threshold (the same
-    // moment `reenqueue_orphaned` would start stealing its jobs back).
-    let count = sql_query(
-        "WITH registration_lock AS (
-             SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired
-         )
-         INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at, lease_token)
-         SELECT $1, $2, $3, $4, now(), now(), $5
-         FROM registration_lock
-         WHERE acquired
-         ON CONFLICT (id, worker_type) DO UPDATE
-         SET storage_name = EXCLUDED.storage_name,
-             layers = EXCLUDED.layers,
-             last_seen = now(),
-             lease_token = EXCLUDED.lease_token
-         WHERE apalis.workers.lease_token IS NULL
-            OR apalis.workers.lease_token = EXCLUDED.lease_token
-            OR now() - apalis.workers.last_seen >= ($6 * INTERVAL '1 second')",
-    )
-    .bind::<Text, _>(worker.name())
-    .bind::<Text, _>(worker_type)
-    .bind::<Text, _>(storage_name)
-    .bind::<Text, _>(worker.get_service())
-    .bind::<Text, _>(lease_token)
-    .bind::<Integer, _>(stale_after_secs)
-    .execute(conn)
-    .map_err(Error::database("registering worker"))?;
-    if count == 0 {
-        Err(Error::already_registered(worker.name(), worker_type))
-    } else {
+    conn.transaction(|tx| {
+        let acquired=sql_query("SELECT pg_try_advisory_xact_lock(hashtext($1),hashtext($2)) AS allowed")
+            .bind::<Text,_>(worker.name()).bind::<Text,_>(worker_type).get_result::<Decision>(tx)
+            .map_err(Error::database("locking worker registration"))?.allowed;
+        if !acquired { return Err(Error::already_registered(worker.name(),worker_type)); }
+        // Materialize the locked row before sampling the server clock. A caller
+        // waiting behind a heartbeat must use its updated row, and a caller
+        // waiting across the stale deadline must decide after that wait.
+        let existing=sql_query("WITH locked AS MATERIALIZED (
+                SELECT lease_token,last_seen FROM apalis.workers
+                WHERE id=$1 AND worker_type=$2 FOR UPDATE
+            ), sampled AS MATERIALIZED (
+                SELECT lease_token,last_seen,clock_timestamp() AS observed_at FROM locked
+            )
+            SELECT lease_token IS NULL OR lease_token=$3
+                    OR EXTRACT(EPOCH FROM(observed_at-last_seen)) >= $4 AS allowed,
+                lease_token IS DISTINCT FROM $3
+                    OR EXTRACT(EPOCH FROM(observed_at-last_seen)) >= $4 AS lost
+            FROM sampled")
+            .bind::<Text,_>(worker.name()).bind::<Text,_>(worker_type).bind::<Text,_>(lease_token)
+            .bind::<Double,_>(timeout_seconds(stale_after)).load::<RegistrationDecision>(tx)
+            .map_err(Error::database("checking worker registration"))?;
+        if let Some(decision)=existing.into_iter().next() {
+            if !decision.allowed { return Err(Error::already_registered(worker.name(),worker_type)); }
+            if decision.lost { recover_owned(tx,worker_type,vec![worker.name().to_owned()],false)?; }
+        }
+        sql_query("INSERT INTO apalis.workers(id,worker_type,storage_name,layers,last_seen,started_at,lease_token)
+            VALUES($1,$2,$3,$4,clock_timestamp(),clock_timestamp(),$5)
+            ON CONFLICT(id,worker_type) DO UPDATE SET storage_name=EXCLUDED.storage_name,layers=EXCLUDED.layers,last_seen=clock_timestamp(),lease_token=EXCLUDED.lease_token")
+            .bind::<Text,_>(worker.name()).bind::<Text,_>(worker_type).bind::<Text,_>(storage_name)
+            .bind::<Text,_>(worker.get_service()).bind::<Text,_>(lease_token).execute(tx)
+            .map_err(Error::database("registering worker"))?;
         Ok(())
-    }
+    })
 }
-
 pub(crate) fn initial_heartbeat(
     pool: PgPool,
     config: Config,
@@ -179,18 +172,19 @@ pub(crate) fn initial_heartbeat(
     lease_token: Arc<str>,
 ) -> impl Future<Output = Result<(), Error>> + Send {
     with_conn(pool, move |conn| {
-        let stale_after_secs = clamp_i32(config.reenqueue_orphaned_after().as_secs());
-        conn.transaction(|tx| {
-            reenqueue_orphaned_blocking(tx, &config)?;
-            register_worker_blocking(
-                tx,
-                config.queue().as_ref(),
-                &worker,
-                storage_name,
-                &lease_token,
-                stale_after_secs,
-            )
-        })
+        // A failed startup sweep must not publish a new registration first.
+        // Keep these transactions separate: registration locks its own worker,
+        // whereas the global sweep locks unrelated workers in sorted order.
+        reenqueue_orphaned_blocking(conn, &config)?;
+        register_worker_blocking(
+            conn,
+            config.queue().as_ref(),
+            &worker,
+            storage_name,
+            &lease_token,
+            config.reenqueue_orphaned_after(),
+        )?;
+        Ok(())
     })
 }
 
@@ -201,24 +195,29 @@ pub(crate) fn keep_alive(
     lease_token: Arc<str>,
 ) -> impl Future<Output = Result<(), Error>> + Send {
     with_conn(pool, move |conn| {
-        let count = sql_query(
-            "UPDATE apalis.workers
-             SET last_seen = now()
-             WHERE id = $1 AND worker_type = $2 AND lease_token = $3",
-        )
-        .bind::<Text, _>(worker.name())
-        .bind::<Text, _>(config.queue().to_string())
-        .bind::<Text, _>(&*lease_token)
-        .execute(conn)
-        .map_err(Error::database("updating worker heartbeat"))?;
-        // Either no row exists for this (worker_id, queue) OR the stored
-        // lease_token does not match — both mean *this* process is no longer
-        // the authoritative heartbeater (e.g. another registration took over).
-        // Recreating the worker stream rotates the token.
-        // Pass the queue by reference: the successful (non-zero) path never
-        // needs it, so the `String` is allocated only when building the error.
-        heartbeat_outcome(count, &worker, config.queue().as_ref())
+        keep_alive_blocking(conn, &config, &worker, &lease_token)
     })
+}
+
+pub(crate) fn keep_alive_blocking(
+    conn: &mut PgConnection,
+    config: &Config,
+    worker: &WorkerContext,
+    lease_token: &str,
+) -> Result<(), Error> {
+    let count = sql_query(
+        "UPDATE apalis.workers
+         SET last_seen = clock_timestamp()
+         WHERE id = $1 AND worker_type = $2 AND lease_token = $3",
+    )
+    .bind::<Text, _>(worker.name())
+    .bind::<Text, _>(config.queue().as_ref())
+    .bind::<Text, _>(lease_token)
+    .execute(conn)
+    .map_err(Error::database("updating worker heartbeat"))?;
+    // Zero rows means the worker has been removed or its token was replaced.
+    // The successful path does not allocate a queue name for an error.
+    heartbeat_outcome(count, worker, config.queue().as_ref())
 }
 
 /// Map the heartbeat UPDATE's affected-row count to a result: zero rows means
@@ -294,19 +293,19 @@ mod tests {
     }
 
     lets_expect! {
-        expect(minted_lease_token_parses_as_ulid()) {
+        expect(minted_lease_token_parses_as_ulid()) as a_new_lease_token {
             when a_lease_token_is_minted {
                 to is_a_well_formed_ulid { be_true }
             }
         }
 
-        expect(two_minted_lease_tokens_differ()) {
+        expect(two_minted_lease_tokens_differ()) as independent_registrations {
             when two_lease_tokens_are_minted {
-                to each_call_mints_a_distinct_token { be_true }
+                to mints_a_distinct_token { be_true }
             }
         }
 
-        expect(heartbeat(rows)) {
+        expect(heartbeat(rows)) as renewing_a_registration {
             let rows = 1;
 
             to reports_a_successful_heartbeat { be_ok }
@@ -314,6 +313,30 @@ mod tests {
             when the_update_affected_no_rows {
                 let rows = 0;
                 to reports_the_worker_is_no_longer_registered { be_err_and worker_not_registered }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use lets_expect::*;
+    lets_expect! {
+        expect(timeout_seconds(duration)) as orphan_timeout_seconds {
+            let duration=Duration::from_secs(1);
+            to preserves_a_whole_second { equal(1.0) }
+            when the_timeout_has_a_fractional_second {
+                let duration=Duration::from_millis(500);
+                to preserves_the_requested_half_second { equal(0.5) }
+            }
+            when the_timeout_is_zero {
+                let duration=Duration::ZERO;
+                to permits_immediate_recovery { equal(0.0) }
+            }
+            when the_timeout_is_the_largest_duration {
+                let duration=Duration::MAX;
+                to remains_representable_without_interval_overflow { equal(Duration::MAX.as_secs_f64()) }
             }
         }
     }

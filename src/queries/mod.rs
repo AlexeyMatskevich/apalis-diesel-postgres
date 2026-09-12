@@ -6,7 +6,7 @@ use crate::{CompactType, Error, PgPool, PgTask, models::JobRow, runtime};
 
 mod ack;
 pub(crate) mod admin;
-mod fetch;
+pub(crate) mod fetch;
 mod metrics;
 mod notify;
 mod push;
@@ -75,8 +75,11 @@ pub(super) fn task_row(row: JobRow) -> Result<PgTask<CompactType>, Error> {
         .map_err(|error| Error::Row(Box::new(error)))
 }
 
-pub(super) fn task_rows(rows: Vec<JobRow>) -> Result<Vec<PgTask<CompactType>>, Error> {
-    rows.into_iter().map(task_row).collect()
+/// Record acknowledgement evidence only for rows returned by a successful claim.
+pub(super) fn claimed_task_row(row: JobRow) -> Result<PgTask<CompactType>, Error> {
+    let mut task = task_row(row)?;
+    crate::ack::record_claim(&mut task.parts);
+    Ok(task)
 }
 
 /// Chunk an id stream into batches and resolve each batch into tasks via
@@ -90,6 +93,7 @@ pub(crate) fn batch_ids_into_tasks<S>(
     worker_id: String,
     chunk_size: usize,
     ids: S,
+    lease_token: Option<std::sync::Arc<str>>,
 ) -> impl futures::Stream<Item = Result<Option<PgTask<CompactType>>, Error>> + Send + 'static
 where
     S: futures::Stream<Item = Result<crate::PgTaskId, Error>> + Send + 'static,
@@ -102,12 +106,13 @@ where
             let pool = pool.clone();
             let queue = queue.clone();
             let worker_id = worker_id.clone();
+            let lease_token = lease_token.clone();
             async move {
                 let ids = events
                     .into_iter()
                     .map(|event| event.map(|task_id| task_id.to_string()))
                     .collect::<Result<Vec<_>, Error>>()?;
-                fetch::queue_by_id(pool, queue, ids, worker_id)
+                fetch::queue_by_id(pool, queue, ids, worker_id, lease_token)
                     .await
                     .map(|tasks| tasks.into_iter().map(Some).collect::<Vec<_>>())
             }
@@ -439,13 +444,10 @@ mod tests {
     /// `batch_ids_into_tasks` can be driven for branches that short-circuit
     /// before `queue_by_id` ever touches the database.
     fn lazy_pool() -> PgPool {
-        crate::build_pool_with("postgres://127.0.0.1:1/unused", |builder| {
-            builder.min_idle(Some(0))
-        })
-        .expect("lazy pool build should not open a connection")
+        crate::unreachable::unreachable_pool()
     }
 
-    // Finding 1: an `Err` element anywhere in the id stream must fail-fast the
+    // an `Err` element anywhere in the id stream must fail-fast the
     // whole chunk — the collect into `Result<Vec<_>, Error>` short-circuits on
     // the first error, so `queue_by_id` is never invoked and the output stream
     // yields exactly one `Err` (not a skip-and-continue). Because the error
@@ -462,8 +464,15 @@ mod tests {
         ]);
 
         let out: Vec<Result<Option<PgTask<CompactType>>, Error>> = block_on(
-            batch_ids_into_tasks(lazy_pool(), "queue".to_owned(), "worker".to_owned(), 8, ids)
-                .collect(),
+            batch_ids_into_tasks(
+                lazy_pool(),
+                "queue".to_owned(),
+                "worker".to_owned(),
+                8,
+                ids,
+                None,
+            )
+            .collect(),
         );
 
         // The entire chunk collapses to a single Err carrying the decode error;
@@ -477,7 +486,7 @@ mod tests {
         }
     }
 
-    // Finding 2: `chunk_size == 0` must be guarded by `chunk_size.max(1)` so
+    // `chunk_size == 0` must be guarded by `chunk_size.max(1)` so
     // `ready_chunks(0)` cannot panic (`ready_chunks` asserts capacity > 0). With
     // an empty id stream no chunk is ever produced, so the stream completes
     // empty instead of panicking, and `queue_by_id` is never reached.
@@ -488,8 +497,15 @@ mod tests {
         let ids = stream::iter(Vec::<Result<crate::PgTaskId, Error>>::new());
 
         let out: Vec<Result<Option<PgTask<CompactType>>, Error>> = block_on(
-            batch_ids_into_tasks(lazy_pool(), "queue".to_owned(), "worker".to_owned(), 0, ids)
-                .collect(),
+            batch_ids_into_tasks(
+                lazy_pool(),
+                "queue".to_owned(),
+                "worker".to_owned(),
+                0,
+                ids,
+                None,
+            )
+            .collect(),
         );
 
         // Guard held: no panic from `ready_chunks(0)`, empty input yields no

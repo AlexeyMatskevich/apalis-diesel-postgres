@@ -30,7 +30,7 @@ fn normalize_url(value: String) -> Option<String> {
     }
 }
 
-fn require_database() -> bool {
+pub fn require_database() -> bool {
     std::env::var("APALIS_DIESEL_POSTGRES_REQUIRE_DATABASE")
         .as_deref()
         .map(is_truthy_flag)
@@ -119,6 +119,9 @@ where
         Err(error) => Err(AssertionError::new(vec![format!(
             "{label}: scenario failed: {error}"
         )])),
+        Ok(Outcome::Skipped) if require_database() => Err(AssertionError::new(vec![format!(
+            "{label}: a required database scenario was skipped"
+        )])),
         Ok(Outcome::Skipped) => Ok(()),
         Ok(Outcome::Completed(run)) => {
             body(run).map_err(|reason| AssertionError::new(vec![format!("{label}: {reason}")]))
@@ -135,80 +138,382 @@ where
     F: FnOnce(&mut PgConnection) -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    let work = move || {
         let mut conn = pool.get().map_err(|e| e.to_string())?;
         work(&mut conn)
+    };
+    #[cfg(feature = "ntex")]
+    if tokio::runtime::Handle::try_current().is_err() {
+        return ntex_rt::spawn_blocking(work)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Run a scenario against its own database and remove only that database.
+/// A supplied DATABASE_URL must support CREATE DATABASE and use URI syntax.
+/// Infrastructure failures are errors even in optional mode once a URL is set.
+#[allow(dead_code)]
+pub async fn with_isolated_database<T, F, Fut>(work: F) -> Result<Outcome<T>, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    use diesel::{Connection, RunQueryDsl, sql_query};
+    let Some(maintenance_url) = database_url_or_skip()? else {
+        return Ok(Outcome::Skipped);
+    };
+    let name = format!(
+        "apalis_test_{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    );
+    let scheme_end = maintenance_url
+        .find("://")
+        .ok_or("isolated tests require a PostgreSQL URI")?
+        + 3;
+    let rest = &maintenance_url[scheme_end..];
+    let path_start = rest
+        .find('/')
+        .ok_or("isolated tests require a database URI path")?;
+    let query = rest.find('?').map(|i| &rest[i..]).unwrap_or("");
+    let url = format!(
+        "{}{}/{name}{query}",
+        &maintenance_url[..scheme_end],
+        &rest[..path_start]
+    );
+    let create_url = maintenance_url.clone();
+    let create_name = name.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = PgConnection::establish(&create_url).map_err(|e| e.to_string())?;
+        sql_query(format!("CREATE DATABASE \"{create_name}\""))
+            .execute(&mut conn)
+            .map_err(|e| format!("creating isolated database (CREATEDB required): {e}"))?;
+        Ok::<_, String>(())
     })
     .await
-    .map_err(|e| e.to_string())?
-}
-
-// These cover the two pure helpers behind the env-driven gate without touching
-// process env, so they are safe to run in parallel with the DB-gated specs.
-// `mod support` is included by several integration binaries, so these run in each
-// one; that is redundant but harmless.
-
-#[test]
-fn is_truthy_flag_accepts_the_canonical_enabled_spellings() {
-    for value in ["1", "true", "yes", "y", "on", "enabled"] {
-        assert!(
-            is_truthy_flag(value),
-            "{value:?} should enable the require-database gate"
-        );
+    .map_err(|e| e.to_string())??;
+    let check_url = url.clone();
+    let expected_name = name.clone();
+    let validated = tokio::task::spawn_blocking(move || {
+        #[derive(diesel::QueryableByName)]
+        struct DatabaseName {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+        let mut conn = PgConnection::establish(&check_url).map_err(|e| e.to_string())?;
+        let actual = sql_query("SELECT current_database()::text AS name")
+            .get_result::<DatabaseName>(&mut conn)
+            .map_err(|e| e.to_string())?
+            .name;
+        if actual != expected_name {
+            return Err(
+                "derived URI did not resolve to the isolated database; refusing to modify it"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(std::convert::identity);
+    let outcome = match validated {
+        Ok(()) => work(url).await,
+        Err(error) => Err(error),
+    };
+    let cleaned = tokio::task::spawn_blocking(move || {
+        let mut conn = PgConnection::establish(&maintenance_url).map_err(|e| e.to_string())?;
+        sql_query(format!("DROP DATABASE \"{name}\" WITH (FORCE)"))
+            .execute(&mut conn)
+            .map_err(|e| format!("removing owned isolated database {name}: {e}"))?;
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(std::convert::identity);
+    match (outcome, cleaned) {
+        (Ok(value), Ok(())) => Ok(Outcome::Completed(value)),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup also failed: {cleanup}")),
     }
 }
 
-#[test]
-fn is_truthy_flag_accepts_mixed_case_and_surrounding_whitespace() {
-    // The regression this guards: a boolean YAML value rendered as `True`, or a
-    // hand-exported `Yes`/`On`/`  true  `, must not silently degrade the gate.
-    for value in [
-        "True", "TRUE", "Yes", "On", "Y", "Enabled", "  true  ", "\tyes\n",
-    ] {
-        assert!(
-            is_truthy_flag(value),
-            "{value:?} should enable the require-database gate"
-        );
+// Pure specifications for the environment gate helpers. They do not mutate
+// process environment and can run alongside database scenarios.
+#[cfg(test)]
+mod helper_specs {
+    use super::{is_truthy_flag, normalize_url};
+    use lets_expect::*;
+
+    #[derive(Clone, Copy)]
+    enum FlagMembership {
+        Accepted,
+        Rejected,
+        Empty,
     }
-}
-
-#[test]
-fn is_truthy_flag_rejects_falsy_and_unrelated_values() {
-    for value in [
-        "", "0", "false", "no", "off", "disabled", "  ", "truthy", "onward",
-    ] {
-        assert!(
-            !is_truthy_flag(value),
-            "{value:?} must not enable the require-database gate"
-        );
+    #[derive(Clone, Copy)]
+    enum LetterCase {
+        Lower,
+        Upper,
+        Mixed,
     }
-}
+    #[derive(Clone, Copy)]
+    enum Padding {
+        None,
+        Spaces,
+        Controls,
+        Unicode,
+    }
+    #[derive(Clone, Copy)]
+    enum UrlContent {
+        Uri,
+        SingleCharacter,
+        Empty,
+    }
 
-#[test]
-fn normalize_url_strips_surrounding_whitespace_from_a_real_url() {
-    // Whitespace around the whole URI must be trimmed before it reaches
-    // `ConnectionManager::new`, since libpq does not strip it itself.
-    assert_eq!(
-        normalize_url(" postgres://user@host/db ".to_owned()),
-        Some("postgres://user@host/db".to_owned())
-    );
-    assert_eq!(
-        normalize_url("\tpostgres://user@host/db\n".to_owned()),
-        Some("postgres://user@host/db".to_owned())
-    );
-}
+    fn flag_samples(membership: FlagMembership, case: LetterCase, padding: Padding) -> Vec<String> {
+        let words: &[&str] = match membership {
+            FlagMembership::Accepted => &["1", "true", "yes", "y", "on", "enabled"],
+            FlagMembership::Rejected => {
+                &["0", "false", "no", "off", "disabled", "truthy", "onward"]
+            }
+            FlagMembership::Empty => {
+                return vec![
+                    match padding {
+                        Padding::None => "",
+                        Padding::Spaces => "  ",
+                        Padding::Controls => "\t\n",
+                        Padding::Unicode => "\u{00a0}\u{2003}",
+                    }
+                    .to_owned(),
+                ];
+            }
+        };
+        words
+            .iter()
+            .map(|word| {
+                let word = match case {
+                    LetterCase::Lower => (*word).to_owned(),
+                    LetterCase::Upper => word.to_ascii_uppercase(),
+                    LetterCase::Mixed => {
+                        let mut chars = word.chars();
+                        chars
+                            .next()
+                            .map(|first| first.to_ascii_uppercase().to_string())
+                            .unwrap_or_default()
+                            + chars.as_str()
+                    }
+                };
+                match padding {
+                    Padding::None => word,
+                    Padding::Spaces => format!("  {word}  "),
+                    Padding::Controls => format!("\t{word}\n"),
+                    Padding::Unicode => format!("\u{00a0}{word}\u{2003}"),
+                }
+            })
+            .collect()
+    }
 
-#[test]
-fn normalize_url_treats_whitespace_only_and_empty_values_as_unset() {
-    assert_eq!(normalize_url(String::new()), None);
-    assert_eq!(normalize_url("   ".to_owned()), None);
-    assert_eq!(normalize_url("\t\n".to_owned()), None);
-}
+    fn flag_observations(values: &[String]) -> Vec<(String, bool)> {
+        values
+            .iter()
+            .map(|value| (value.clone(), is_truthy_flag(value)))
+            .collect()
+    }
 
-#[test]
-fn normalize_url_leaves_a_clean_url_untouched() {
-    assert_eq!(
-        normalize_url("postgres://user@host/db".to_owned()),
-        Some("postgres://user@host/db".to_owned())
-    );
+    fn url_content(content: UrlContent) -> &'static str {
+        match content {
+            UrlContent::Uri => "postgres://user@host/db",
+            UrlContent::SingleCharacter => "x",
+            UrlContent::Empty => "",
+        }
+    }
+
+    fn url_sample(content: UrlContent, padding: Padding) -> String {
+        let value = url_content(content);
+        match padding {
+            Padding::None => value.to_owned(),
+            Padding::Spaces if matches!(content, UrlContent::Empty) => "   ".to_owned(),
+            Padding::Spaces => format!(" {value} "),
+            Padding::Controls => format!("\t{value}\n"),
+            Padding::Unicode => format!("\u{00a0}{value}\u{2003}"),
+        }
+    }
+
+    lets_expect! {
+        expect(flag_observations(&values)) as database_requirement_flag {
+            let membership = FlagMembership::Accepted;
+            let case = LetterCase::Lower;
+            let padding = Padding::None;
+            let values = flag_samples(membership, case, padding);
+            let enabled = matches!(membership, FlagMembership::Accepted);
+            let expected = values.iter().map(|value| (value.clone(), enabled)).collect::<Vec<_>>();
+            to enables_every_recognized_spelling { equal(expected) }
+            when ascii_spaces_surround_the_value {
+                let padding = Padding::Spaces;
+                to enables_every_recognized_spelling { equal(expected) }
+            }
+            when tabs_and_newlines_surround_the_value {
+                let padding = Padding::Controls;
+                to enables_every_recognized_spelling { equal(expected) }
+            }
+            when unicode_whitespace_surrounds_the_value {
+                let padding = Padding::Unicode;
+                to enables_every_recognized_spelling { equal(expected) }
+            }
+            when the_letters_are_uppercase {
+                let case = LetterCase::Upper;
+                to enables_every_recognized_spelling { equal(expected) }
+                when ascii_spaces_surround_the_value {
+                    let padding = Padding::Spaces;
+                    to enables_every_recognized_spelling { equal(expected) }
+                }
+                when tabs_and_newlines_surround_the_value {
+                    let padding = Padding::Controls;
+                    to enables_every_recognized_spelling { equal(expected) }
+                }
+                when unicode_whitespace_surrounds_the_value {
+                    let padding = Padding::Unicode;
+                    to enables_every_recognized_spelling { equal(expected) }
+                }
+            }
+            when the_letters_have_mixed_case {
+                let case = LetterCase::Mixed;
+                to enables_every_recognized_spelling { equal(expected) }
+                when ascii_spaces_surround_the_value {
+                    let padding = Padding::Spaces;
+                    to enables_every_recognized_spelling { equal(expected) }
+                }
+                when tabs_and_newlines_surround_the_value {
+                    let padding = Padding::Controls;
+                    to enables_every_recognized_spelling { equal(expected) }
+                }
+                when unicode_whitespace_surrounds_the_value {
+                    let padding = Padding::Unicode;
+                    to enables_every_recognized_spelling { equal(expected) }
+                }
+            }
+            when the_spelling_is_not_an_enabled_value {
+                let membership = FlagMembership::Rejected;
+                to rejects_every_unrecognized_spelling { equal(expected) }
+                when ascii_spaces_surround_the_value {
+                    let padding = Padding::Spaces;
+                    to rejects_every_unrecognized_spelling { equal(expected) }
+                }
+                when tabs_and_newlines_surround_the_value {
+                    let padding = Padding::Controls;
+                    to rejects_every_unrecognized_spelling { equal(expected) }
+                }
+                when unicode_whitespace_surrounds_the_value {
+                    let padding = Padding::Unicode;
+                    to rejects_every_unrecognized_spelling { equal(expected) }
+                }
+                when the_letters_are_uppercase {
+                    let case = LetterCase::Upper;
+                    to rejects_every_unrecognized_spelling { equal(expected) }
+                    when ascii_spaces_surround_the_value {
+                        let padding = Padding::Spaces;
+                        to rejects_every_unrecognized_spelling { equal(expected) }
+                    }
+                    when tabs_and_newlines_surround_the_value {
+                        let padding = Padding::Controls;
+                        to rejects_every_unrecognized_spelling { equal(expected) }
+                    }
+                    when unicode_whitespace_surrounds_the_value {
+                        let padding = Padding::Unicode;
+                        to rejects_every_unrecognized_spelling { equal(expected) }
+                    }
+                }
+                when the_letters_have_mixed_case {
+                    let case = LetterCase::Mixed;
+                    to rejects_every_unrecognized_spelling { equal(expected) }
+                    when ascii_spaces_surround_the_value {
+                        let padding = Padding::Spaces;
+                        to rejects_every_unrecognized_spelling { equal(expected) }
+                    }
+                    when tabs_and_newlines_surround_the_value {
+                        let padding = Padding::Controls;
+                        to rejects_every_unrecognized_spelling { equal(expected) }
+                    }
+                    when unicode_whitespace_surrounds_the_value {
+                        let padding = Padding::Unicode;
+                        to rejects_every_unrecognized_spelling { equal(expected) }
+                    }
+                }
+            }
+            when the_normalized_value_is_empty {
+                let membership = FlagMembership::Empty;
+                to keeps_the_database_requirement_disabled { equal(expected) }
+                when ascii_spaces_surround_the_value {
+                    let padding = Padding::Spaces;
+                    to keeps_the_database_requirement_disabled { equal(expected) }
+                }
+                when tabs_and_newlines_surround_the_value {
+                    let padding = Padding::Controls;
+                    to keeps_the_database_requirement_disabled { equal(expected) }
+                }
+                when unicode_whitespace_surrounds_the_value {
+                    let padding = Padding::Unicode;
+                    to keeps_the_database_requirement_disabled { equal(expected) }
+                }
+            }
+        }
+
+        expect(normalize_url(value.clone())) as normalized_database_url {
+            let content = UrlContent::Uri;
+            let padding = Padding::None;
+            let value = url_sample(content, padding);
+            let expected = match content {
+                UrlContent::Empty => None,
+                _ => Some(url_content(content).to_owned()),
+            };
+            to returns_the_exact_nonempty_value { equal(expected) }
+            when ascii_spaces_surround_the_value {
+                let padding = Padding::Spaces;
+                to returns_the_exact_nonempty_value { equal(expected) }
+            }
+            when tabs_and_newlines_surround_the_value {
+                let padding = Padding::Controls;
+                to returns_the_exact_nonempty_value { equal(expected) }
+            }
+            when unicode_whitespace_surrounds_the_value {
+                let padding = Padding::Unicode;
+                to returns_the_exact_nonempty_value { equal(expected) }
+            }
+            when the_content_has_the_minimum_nonempty_length {
+                let content = UrlContent::SingleCharacter;
+                to returns_the_exact_nonempty_value { equal(expected) }
+                when ascii_spaces_surround_the_value {
+                    let padding = Padding::Spaces;
+                    to returns_the_exact_nonempty_value { equal(expected) }
+                }
+                when tabs_and_newlines_surround_the_value {
+                    let padding = Padding::Controls;
+                    to returns_the_exact_nonempty_value { equal(expected) }
+                }
+                when unicode_whitespace_surrounds_the_value {
+                    let padding = Padding::Unicode;
+                    to returns_the_exact_nonempty_value { equal(expected) }
+                }
+            }
+            when the_normalized_content_is_empty {
+                let content = UrlContent::Empty;
+                to treats_the_url_as_unset { equal(expected) }
+                when ascii_spaces_surround_the_value {
+                    let padding = Padding::Spaces;
+                    to treats_the_url_as_unset { equal(expected) }
+                }
+                when tabs_and_newlines_surround_the_value {
+                    let padding = Padding::Controls;
+                    to treats_the_url_as_unset { equal(expected) }
+                }
+                when unicode_whitespace_surrounds_the_value {
+                    let padding = Padding::Unicode;
+                    to treats_the_url_as_unset { equal(expected) }
+                }
+            }
+        }
+    }
 }

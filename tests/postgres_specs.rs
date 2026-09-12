@@ -1,16 +1,12 @@
-//! Exhaustive specification through nested contexts for behaviours not yet
-//! covered elsewhere. Tests in this file gate on `DATABASE_URL`; without it
-//! every scenario resolves to `Outcome::Skipped` and the assertions pass.
-//!
-//! Each `expect` block enumerates a behaviour under a single fixed context.
-//! When a leaf reveals a defect we either fix the source (minimally) or mark
-//! the test `#[ignore]` with a comment so the discussion is preserved.
+//! Contract scenarios with independent fixtures and grouped mutation outcomes.
+//! Without DATABASE_URL the optional DB scenarios skip; required mode rejects
+//! every skipped scenario. Infrastructure errors never stand in for empty data.
 
 #![cfg(feature = "tokio")]
 
 mod support;
 
-use support::{Outcome, observe, with_conn};
+use support::{Outcome, observe, with_conn, with_isolated_database};
 
 use std::{
     str::FromStr,
@@ -25,7 +21,7 @@ use apalis_core::{
     worker::{context::WorkerContext, ext::ack::Acknowledge},
 };
 use apalis_diesel_postgres::{
-    Config, Error as PgError, PgAck, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage,
+    Config, Error as PgError, PgAck, PgContext, PgPool, PgTaskId, PostgresStorage,
     refresh_queue_stats_snapshot, setup, verify_schema,
 };
 use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
@@ -83,31 +79,11 @@ fn task(
         .build()
 }
 
-async fn next_task(
-    stream: &mut (
-             impl futures::Stream<Item = Result<Option<PgTask<String>>, apalis_diesel_postgres::Error>>
-             + Unpin
-         ),
-) -> Result<PgTask<String>, String> {
-    let deadline = Duration::from_secs(5);
-    loop {
-        let item = tokio::time::timeout(deadline, stream.next())
-            .await
-            .map_err(|_| "timed out waiting for a task".to_owned())?
-            .ok_or_else(|| "task stream ended".to_owned())?
-            .map_err(|e| e.to_string())?;
-        if let Some(task) = item {
-            return Ok(task);
-        }
-    }
-}
-
 // --------------------------------------------------------------------------
 // fetch_next: `Failed` tasks below their `max_attempts` are re-eligible
 // without needing the orphan reenqueue path.
 //
-// `queries::fetch_next` SQL `WHERE` clause lists
-//   `(status = 'Pending' OR (status = 'Failed' AND attempts < max_attempts))`.
+// A failed task is claimable only while its retry budget remains.
 // This integration test pins that contract: after `ack_task` writes
 // `status='Failed', attempts=1`, the next poll on a fresh stream must
 // reclaim the row.
@@ -156,28 +132,37 @@ async fn run_failed_retry(retryable: bool) -> Result<Outcome<FailedRetryRun>, St
     let (attempts, max_attempts) = if retryable { (1, 3) } else { (3, 3) };
     insert_failed_task(pool.clone(), queue.clone(), attempts, max_attempts).await?;
 
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    // One permit makes an empty fetch observable as strategy exhaustion, not
+    // as a timeout indistinguishable from an unavailable database.
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue))
+        .with_poll_strategy_factory(|| {
+            apalis_core::backend::poll_strategy::StreamStrategy::new(futures::stream::iter([()]))
+        });
     let worker = WorkerContext::new::<()>(&format!("spec-failed-retry-worker-{queue}"));
     let mut stream = storage.poll(&worker);
 
-    let polled = tokio::time::timeout(Duration::from_secs(3), async {
-        // Two poll ticks: first emits the registration ack; second carries the task.
-        let mut polled: Option<PgTask<String>> = None;
-        for _ in 0..6 {
-            match tokio::time::timeout(Duration::from_millis(800), next_task(&mut stream)).await {
-                Ok(Ok(t)) => {
-                    polled = Some(t);
-                    break;
-                }
-                _ => continue,
-            }
+    let observed = async {
+        let registered = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .map_err(|_| "registration timed out".to_owned())?;
+        match registered {
+            Some(Ok(None)) => {}
+            other => return Err(format!("expected successful registration, got {other:?}")),
         }
-        polled
-    })
-    .await
-    .unwrap_or(None);
-
+        let fetched = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .map_err(|_| "fetch timed out; absence was not verified".to_owned())?;
+        match fetched {
+            Some(Ok(task)) => Ok(task),
+            Some(Err(PgError::PollStrategyExhausted { .. })) => Ok(None),
+            Some(Err(error)) => Err(format!("fetch failed: {error}")),
+            None => Err("stream ended before a successful fetch".to_owned()),
+        }
+    }
+    .await;
+    drop(stream);
     cleanup_queue(pool, queue).await?;
+    let polled = observed?;
     Ok(Outcome::Completed(FailedRetryRun {
         polled_attempts: polled
             .as_ref()
@@ -202,7 +187,7 @@ fn failed_retry_preserves_attempt_count()
 -> impl Fn(&Result<Outcome<FailedRetryRun>, String>) -> AssertionResult {
     observe::<FailedRetryRun, _>("failed retry attempts", |run| {
         if run.polled_payload.is_none() {
-            return Ok(()); // covered by the other assertion
+            return Err("the retryable task was not delivered".to_owned());
         }
         if run.polled_attempts == 1 {
             Ok(())
@@ -379,18 +364,19 @@ async fn run_two_worker_race() -> Result<Outcome<TwoWorkerRaceRun>, String> {
             match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
                 Ok(Some(Ok(Some(t)))) => out.push(t.args),
                 Ok(Some(Ok(None))) => continue,
-                Ok(Some(Err(_))) => break,
-                Ok(None) => break,
+                Ok(Some(Err(error))) => return Err(format!("concurrent fetch failed: {error}")),
+                Ok(None) => return Err("concurrent fetch stream ended unexpectedly".to_owned()),
                 Err(_) => continue,
             }
         }
-        out
+        Ok::<_, String>(out)
     };
 
     let (a_args, b_args) =
         tokio::join!(collect(storage_a, worker_a), collect(storage_b, worker_b),);
-    let mut all = a_args;
-    all.extend(b_args);
+    cleanup_queue(pool, queue).await?;
+    let mut all = a_args?;
+    all.extend(b_args?);
     let mut sorted = all.clone();
     sorted.sort();
     let mut duplicates = 0;
@@ -400,7 +386,6 @@ async fn run_two_worker_race() -> Result<Outcome<TwoWorkerRaceRun>, String> {
         }
     }
 
-    cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(TwoWorkerRaceRun {
         total: all.len(),
         duplicates,
@@ -438,7 +423,7 @@ fn _force_status_import() -> Status {
 }
 
 // --------------------------------------------------------------------------
-// P3: refresh_queue_stats_snapshot on an unpopulated matview must succeed.
+// refresh_queue_stats_snapshot on an unpopulated matview must succeed.
 //
 // The matview is created `WITH NO DATA` (migration 20260521000003). The
 // pre-fix implementation always ran `REFRESH ... CONCURRENTLY`, which
@@ -456,41 +441,44 @@ struct RefreshSnapshotRun {
 }
 
 async fn run_refresh_unpopulated_snapshot() -> Result<Outcome<RefreshSnapshotRun>, String> {
-    let Some(pool) = test_pool().await? else {
-        return Ok(Outcome::Skipped);
-    };
-    with_conn(pool.clone(), |conn| {
-        // Force the matview back to the unpopulated state without dropping
-        // and recreating it — `REFRESH ... WITH NO DATA` resets
-        // `pg_matviews.ispopulated` to false, which is exactly the branch
-        // exercised by the fixed code path.
-        sql_query("REFRESH MATERIALIZED VIEW apalis.queue_stats_snapshot WITH NO DATA")
-            .execute(conn)
+    with_isolated_database(|url| async move {
+        let pool = apalis_diesel_postgres::build_pool_with(url, |builder| builder.max_size(8))
             .map_err(|e| e.to_string())?;
-        Ok(())
-    })
-    .await?;
+        setup(&pool).await.map_err(|e| e.to_string())?;
+        with_conn(pool.clone(), |conn| {
+            // Force the matview back to the unpopulated state without dropping
+            // and recreating it — `REFRESH ... WITH NO DATA` resets
+            // `pg_matviews.ispopulated` to false, which is exactly the branch
+            // exercised by the fixed code path.
+            sql_query("REFRESH MATERIALIZED VIEW apalis.queue_stats_snapshot WITH NO DATA")
+                .execute(conn)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await?;
 
-    let refresh_result = refresh_queue_stats_snapshot(&pool)
-        .await
-        .map_err(|e| e.to_string());
+        let refresh_result = refresh_queue_stats_snapshot(&pool)
+            .await
+            .map_err(|e| e.to_string());
 
-    let populated_after = with_conn(pool.clone(), |conn| {
-        sql_query(
-            "SELECT ispopulated AS populated
+        let populated_after = with_conn(pool.clone(), |conn| {
+            sql_query(
+                "SELECT ispopulated AS populated
              FROM pg_matviews
              WHERE schemaname = 'apalis' AND matviewname = 'queue_stats_snapshot'",
-        )
-        .load::<PopulatedRow>(conn)
-        .map_err(|e| e.to_string())
-        .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
-    })
-    .await?;
+            )
+            .load::<PopulatedRow>(conn)
+            .map_err(|e| e.to_string())
+            .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
+        })
+        .await?;
 
-    Ok(Outcome::Completed(RefreshSnapshotRun {
-        refresh_result,
-        populated_after,
-    }))
+        Ok(RefreshSnapshotRun {
+            refresh_result,
+            populated_after,
+        })
+    })
+    .await
 }
 
 #[derive(Debug, diesel::QueryableByName)]
@@ -597,111 +585,116 @@ enum ConcurrentRefreshOutcome {
 }
 
 async fn run_refresh_populated_snapshot() -> Result<Outcome<RefreshPopulatedRun>, String> {
-    let Some(pool) = test_pool().await? else {
-        return Ok(Outcome::Skipped);
-    };
+    with_isolated_database(|url| async move {
+        let pool = apalis_diesel_postgres::build_pool_with(url, |builder| builder.max_size(8))
+            .map_err(|e| e.to_string())?;
+        setup(&pool).await.map_err(|e| e.to_string())?;
 
-    // Prime: guarantee the matview is populated so the helper under test reads
-    // `ispopulated = true` and must take the CONCURRENTLY arm.
-    let prime_result = refresh_queue_stats_snapshot(&pool)
-        .await
-        .map_err(|e| e.to_string());
+        // Prime: guarantee the matview is populated so the helper under test reads
+        // `ispopulated = true` and must take the CONCURRENTLY arm.
+        let prime_result = refresh_queue_stats_snapshot(&pool)
+            .await
+            .map_err(|e| e.to_string());
 
-    // Hold an `ACCESS SHARE` lock on the matview from a dedicated pooled
-    // connection inside an open transaction. The blocking task acquires the
-    // lock, reports `ispopulated` seen under it, signals readiness, then waits
-    // for a release signal before committing. This keeps a real lock live on the
-    // server for the whole window of the concurrent refresh.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool, String>>();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let lock_pool = pool.clone();
-    let lock_holder = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut conn = lock_pool.get().map_err(|e| e.to_string())?;
-        // Explicit BEGIN/COMMIT (not `conn.transaction`) so the transaction —
-        // and thus the lock — stays open across the readiness/release handshake.
-        sql_query("BEGIN").execute(&mut conn).map_err(|e| {
-            let _ = ready_tx.send(Err(e.to_string()));
-            e.to_string()
-        })?;
-        let lock_and_read = (|| -> Result<bool, String> {
-            // PostgreSQL's `LOCK TABLE` does not support materialized views
-            // ("this operation is not supported for materialized views"), so
-            // the `ACCESS SHARE` lock is acquired the way any real reader
-            // would: a `SELECT` against the matview inside this open
-            // transaction. The lock is held until `COMMIT`/`ROLLBACK` below,
-            // exactly like an explicit `LOCK TABLE` would have been.
-            sql_query("SELECT 1 FROM apalis.queue_stats_snapshot LIMIT 1")
-                .execute(&mut conn)
-                .map_err(|e| e.to_string())?;
-            sql_query(
-                "SELECT ispopulated AS populated
+        // Hold an `ACCESS SHARE` lock on the matview from a dedicated pooled
+        // connection inside an open transaction. The blocking task acquires the
+        // lock, reports `ispopulated` seen under it, signals readiness, then waits
+        // for a release signal before committing. This keeps a real lock live on the
+        // server for the whole window of the concurrent refresh.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<bool, String>>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let lock_pool = pool.clone();
+        let lock_holder = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let mut conn = lock_pool.get().map_err(|e| e.to_string())?;
+            // Explicit BEGIN/COMMIT (not `conn.transaction`) so the transaction —
+            // and thus the lock — stays open across the readiness/release handshake.
+            sql_query("BEGIN").execute(&mut conn).map_err(|e| {
+                let _ = ready_tx.send(Err(e.to_string()));
+                e.to_string()
+            })?;
+            let lock_and_read = (|| -> Result<bool, String> {
+                // PostgreSQL's `LOCK TABLE` does not support materialized views
+                // ("this operation is not supported for materialized views"), so
+                // the `ACCESS SHARE` lock is acquired the way any real reader
+                // would: a `SELECT` against the matview inside this open
+                // transaction. The lock is held until `COMMIT`/`ROLLBACK` below,
+                // exactly like an explicit `LOCK TABLE` would have been.
+                sql_query("SELECT 1 FROM apalis.queue_stats_snapshot LIMIT 1")
+                    .execute(&mut conn)
+                    .map_err(|e| e.to_string())?;
+                sql_query(
+                    "SELECT ispopulated AS populated
                  FROM pg_matviews
                  WHERE schemaname = 'apalis' AND matviewname = 'queue_stats_snapshot'",
-            )
-            .load::<PopulatedRow>(&mut conn)
-            .map_err(|e| e.to_string())
-            .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
-        })();
-        match lock_and_read {
-            Ok(populated) => {
-                let _ = ready_tx.send(Ok(populated));
-                // Block until the async side has finished (or timed out) the
-                // concurrent refresh, then release the lock.
-                let _ = release_rx.recv();
-                let _ = sql_query("COMMIT").execute(&mut conn);
-                Ok(())
+                )
+                .load::<PopulatedRow>(&mut conn)
+                .map_err(|e| e.to_string())
+                .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
+            })();
+            match lock_and_read {
+                Ok(populated) => {
+                    let _ = ready_tx.send(Ok(populated));
+                    // Block until the async side has finished (or timed out) the
+                    // concurrent refresh, then release the lock.
+                    let _ = release_rx.recv();
+                    sql_query("COMMIT")
+                        .execute(&mut conn)
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err.clone()));
+                    let _ = sql_query("ROLLBACK").execute(&mut conn);
+                    Err(err)
+                }
             }
-            Err(err) => {
-                let _ = ready_tx.send(Err(err.clone()));
-                let _ = sql_query("ROLLBACK").execute(&mut conn);
-                Err(err)
-            }
-        }
-    });
+        });
 
-    // Wait for the lock to be held before racing the refresh against it. The
-    // `recv` is on a `std::sync::mpsc` channel, so hop it onto a blocking thread
-    // to avoid stalling the async runtime.
-    let ready = tokio::task::spawn_blocking(move || ready_rx.recv())
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?; // channel closed => lock task panicked
-    let populated_under_lock = ready?;
-
-    // With the `ACCESS SHARE` lock held, call the helper. A CONCURRENTLY refresh
-    // (ExclusiveLock) does not conflict and returns quickly; a blocking refresh
-    // (AccessExclusiveLock) conflicts and stalls until the timeout.
-    let concurrent_outcome =
-        match tokio::time::timeout(Duration::from_secs(5), refresh_queue_stats_snapshot(&pool))
+        // Wait for the lock to be held before racing the refresh against it. The
+        // `recv` is on a `std::sync::mpsc` channel, so hop it onto a blocking thread
+        // to avoid stalling the async runtime.
+        let ready = tokio::task::spawn_blocking(move || ready_rx.recv())
             .await
-        {
-            Ok(Ok(())) => ConcurrentRefreshOutcome::Completed,
-            Ok(Err(e)) => ConcurrentRefreshOutcome::Errored(e.to_string()),
-            Err(_) => ConcurrentRefreshOutcome::TimedOut,
-        };
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?; // channel closed => lock task panicked
+        let populated_under_lock = ready?;
 
-    // Release the lock holder and reap it so the connection returns to the pool.
-    let _ = release_tx.send(());
-    let _ = lock_holder.await;
+        // With the `ACCESS SHARE` lock held, call the helper. A CONCURRENTLY refresh
+        // (ExclusiveLock) does not conflict and returns quickly; a blocking refresh
+        // (AccessExclusiveLock) conflicts and stalls until the timeout.
+        let concurrent_outcome =
+            match tokio::time::timeout(Duration::from_secs(5), refresh_queue_stats_snapshot(&pool))
+                .await
+            {
+                Ok(Ok(())) => ConcurrentRefreshOutcome::Completed,
+                Ok(Err(e)) => ConcurrentRefreshOutcome::Errored(e.to_string()),
+                Err(_) => ConcurrentRefreshOutcome::TimedOut,
+            };
 
-    let populated_after = with_conn(pool.clone(), |conn| {
-        sql_query(
-            "SELECT ispopulated AS populated
+        // Release the lock holder and reap it so the connection returns to the pool.
+        release_tx.send(()).map_err(|e| e.to_string())?;
+        lock_holder.await.map_err(|e| e.to_string())??;
+
+        let populated_after = with_conn(pool.clone(), |conn| {
+            sql_query(
+                "SELECT ispopulated AS populated
              FROM pg_matviews
              WHERE schemaname = 'apalis' AND matviewname = 'queue_stats_snapshot'",
-        )
-        .load::<PopulatedRow>(conn)
-        .map_err(|e| e.to_string())
-        .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
-    })
-    .await?;
+            )
+            .load::<PopulatedRow>(conn)
+            .map_err(|e| e.to_string())
+            .map(|rows| rows.first().map(|r| r.populated).unwrap_or(false))
+        })
+        .await?;
 
-    Ok(Outcome::Completed(RefreshPopulatedRun {
-        prime_result,
-        populated_under_lock,
-        concurrent_outcome,
-        populated_after,
-    }))
+        Ok(RefreshPopulatedRun {
+            prime_result,
+            populated_under_lock,
+            concurrent_outcome,
+            populated_after,
+        })
+    })
+    .await
 }
 
 fn refresh_populated_snapshot_uses_concurrently()
@@ -755,7 +748,7 @@ fn refresh_populated_snapshot_stays_populated()
 }
 
 // --------------------------------------------------------------------------
-// P4: UNLISTEN after NotifyTaskIds drop.
+// UNLISTEN after NotifyTaskIds drop.
 //
 // `notify_task_ids` installs `LISTEN "apalis::job::insert"` on a pooled
 // connection. When the returned stream is dropped, the listener thread must
@@ -844,7 +837,7 @@ fn no_stale_listen_subscription_after_drop()
 }
 
 // --------------------------------------------------------------------------
-// P6: `list_queues.workers` excludes locks left on terminal-status jobs.
+// `list_queues.workers` excludes locks left on terminal-status jobs.
 //
 // The `locked_workers` CTE in `list_queues` now filters on
 // `status IN ('Pending', 'Queued', 'Running')`. A Done/Failed/Killed row
@@ -958,7 +951,7 @@ fn locked_workers_shows_active_only()
 }
 
 // --------------------------------------------------------------------------
-// P7: list_workers no longer caps at 100 rows.
+// list_workers no longer caps at 100 rows.
 //
 // The pre-fix `list_workers` body carried `LIMIT 100` even though the apalis
 // `ListWorkers` trait does not accept a filter. Operators with >100 workers
@@ -1023,7 +1016,7 @@ fn list_workers_returns_every_row()
 }
 
 // --------------------------------------------------------------------------
-// P1: registration gate — initial_heartbeat failure stops the fetcher.
+// registration gate — initial_heartbeat failure stops the fetcher.
 //
 // `poll_basic` runs `initial_heartbeat` first; on `Err` it must surface the
 // error and stop, not start dequeueing. We trigger AlreadyRegistered by
@@ -1190,8 +1183,7 @@ fn swap_database_name(url: &str, database: &str) -> Result<String, String> {
 /// Provision a throwaway database, apply migrations, delete the latest migration
 /// row, and confirm `verify_schema` rejects the out-of-date schema — fully
 /// isolated from the shared test database. Returns `Ok(())` on the expected
-/// rejection (or when skipped because the role lacks `CREATE DATABASE`); returns
-/// `Err` on an unexpected verify outcome or an infrastructure failure.
+/// rejection, and `Err` on an unexpected outcome or infrastructure failure.
 async fn verify_pending_branch_on_temp_db(
     maintenance_url: &str,
 ) -> Result<Result<(), String>, String> {
@@ -1211,7 +1203,7 @@ async fn verify_pending_branch_on_temp_db(
                 rolcreatedb: bool,
             }
             let can_create =
-                sql_query("SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user")
+                sql_query("SELECT (rolcreatedb OR rolsuper) AS rolcreatedb FROM pg_roles WHERE rolname = current_user")
                     .load::<Flag>(&mut conn)
                     .map_err(|e| e.to_string())?
                     .into_iter()
@@ -1230,15 +1222,16 @@ async fn verify_pending_branch_on_temp_db(
         .map_err(|e| e.to_string())??
     };
     if !provisioned {
-        return Ok(Ok(()));
+        return Err(
+            "verify_schema isolation requires CREATEDB; scenario was not executed".to_owned(),
+        );
     }
 
     let temp_url = match swap_database_name(maintenance_url, &db_name) {
         Ok(url) => url,
-        Err(_) => {
-            // Could not derive a throwaway URL; drop the orphan DB and skip.
-            drop_temp_database(maintenance_url, &db_name).await;
-            return Ok(Ok(()));
+        Err(error) => {
+            drop_temp_database(maintenance_url, &db_name).await?;
+            return Err(format!("cannot derive an isolated database URI: {error}"));
         }
     };
     let outcome: Result<Result<(), String>, String> = async {
@@ -1251,7 +1244,7 @@ async fn verify_pending_branch_on_temp_db(
         // `?dbname=` query parameter (or other libpq forms) can make `temp_url`
         // resolve back to the main database despite the swapped path — deleting a
         // migration row there would corrupt the shared schema. If we are not on
-        // `db_name`, skip the branch rather than mutate the wrong database.
+        // `db_name`, report failure before modifying any database.
         let on_temp_db = {
             let expected = db_name.clone();
             with_conn(temp_pool.clone(), move |conn| {
@@ -1272,14 +1265,17 @@ async fn verify_pending_branch_on_temp_db(
             .await?
         };
         if !on_temp_db {
-            return Ok(Ok(()));
+            return Err(
+                "derived URI resolved outside the owned database; refusing schema mutation"
+                    .to_owned(),
+            );
         }
         setup(&temp_pool).await.map_err(|e| e.to_string())?;
         with_conn(temp_pool.clone(), |conn| {
             sql_query(
-                "DELETE FROM __diesel_schema_migrations \
+                "DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations \
                  WHERE version = ( \
-                     SELECT version FROM __diesel_schema_migrations \
+                     SELECT version FROM apalis_diesel_postgres.__diesel_schema_migrations \
                      ORDER BY version DESC LIMIT 1)",
             )
             .execute(conn)
@@ -1295,24 +1291,25 @@ async fn verify_pending_branch_on_temp_db(
     .await;
 
     // Teardown runs on every path after CREATE so an error cannot leak the DB.
-    drop_temp_database(maintenance_url, &db_name).await;
+    drop_temp_database(maintenance_url, &db_name).await?;
     outcome
 }
 
-/// Best-effort drop of a throwaway database, terminating any lingering sessions
-/// with `WITH (FORCE)`. A leaked test database is harmless but undesirable.
-async fn drop_temp_database(maintenance_url: &str, db_name: &str) {
+/// Drop only the scenario's generated database and report cleanup failures.
+async fn drop_temp_database(maintenance_url: &str, db_name: &str) -> Result<(), String> {
     let maintenance_url = maintenance_url.to_owned();
     let db_name = db_name.to_owned();
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(mut conn) = PgConnection::establish(&maintenance_url) {
-            let _ = sql_query(format!(
-                "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-            ))
-            .execute(&mut conn);
-        }
+    tokio::task::spawn_blocking(move || {
+        let mut conn = PgConnection::establish(&maintenance_url).map_err(|e| e.to_string())?;
+        sql_query(format!(
+            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+        ))
+        .execute(&mut conn)
+        .map_err(|e| format!("removing owned database {db_name}: {e}"))?;
+        Ok::<_, String>(())
     })
-    .await;
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn verify_schema_accepts_a_fully_applied_database()
@@ -2547,12 +2544,14 @@ fn be_a_stale_ack_rejection()
 }
 
 lets_expect! { #tokio_test
-    expect(run_failed_retry(retryable).await) {
+    expect(run_failed_retry(retryable).await) as failed_task_delivery {
         let retryable = true;
 
         when a_failed_row_still_has_attempts_remaining {
-            to is_reclaimed_by_fetch_next { failed_retry_reclaims_row() }
-            to preserves_the_persisted_attempt_count { failed_retry_preserves_attempt_count() }
+            to delivers_the_task_with_its_persisted_attempt_count {
+                failed_retry_reclaims_row(),
+                failed_retry_preserves_attempt_count()
+            }
         }
 
         when a_failed_row_has_exhausted_its_attempts {
@@ -2561,48 +2560,42 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_concurrent_admin_register().await) {
+    expect(run_concurrent_admin_register().await) as worker_registration {
         when two_admin_register_worker_calls_race_on_the_same_id {
-            to both_succeed_via_upsert_semantics {
-                concurrent_admin_register_both_succeed()
-            }
-            to leaves_exactly_one_workers_row {
+            to registers_one_worker_for_both_callers {
+                concurrent_admin_register_both_succeed(),
                 concurrent_admin_register_creates_single_row()
             }
         }
     }
 
-    expect(run_two_worker_race().await) {
+    expect(run_two_worker_race().await) as concurrent_delivery {
         when two_workers_poll_the_same_queue_concurrently {
-            to deliver_disjoint_payloads_thanks_to_for_update_skip_locked {
+            to delivers_every_payload_once_across_the_workers {
                 two_workers_share_set_without_duplicates()
             }
         }
     }
 
-    expect(run_refresh_unpopulated_snapshot().await) {
+    expect(run_refresh_unpopulated_snapshot().await) as initial_snapshot_refresh {
         when refresh_runs_against_a_freshly_created_with_no_data_matview {
-            to falls_back_to_a_blocking_refresh_and_succeeds {
-                refresh_unpopulated_snapshot_succeeds()
-            }
-            to leaves_the_matview_populated_for_subsequent_callers {
+            to refreshes_and_populates_the_snapshot {
+                refresh_unpopulated_snapshot_succeeds(),
                 refresh_unpopulated_snapshot_populates()
             }
         }
     }
 
-    expect(run_refresh_populated_snapshot().await) {
+    expect(run_refresh_populated_snapshot().await) as populated_snapshot_refresh {
         when refresh_runs_against_an_already_populated_matview {
-            to takes_the_concurrently_arm_and_succeeds {
-                refresh_populated_snapshot_uses_concurrently()
-            }
-            to leaves_the_matview_populated {
+            to refreshes_without_blocking_readers {
+                refresh_populated_snapshot_uses_concurrently(),
                 refresh_populated_snapshot_stays_populated()
             }
         }
     }
 
-    expect(run_unlisten_after_drop().await) {
+    expect(run_unlisten_after_drop().await) as listener_release {
         when notify_task_ids_is_dropped_and_the_connection_returns_to_the_pool {
             to leaves_no_apalis_subscription_on_the_returned_connection {
                 no_stale_listen_subscription_after_drop()
@@ -2610,7 +2603,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_locked_workers_excludes_terminal().await) {
+    expect(run_locked_workers_excludes_terminal().await) as active_worker_listing {
         when terminal_jobs_still_carry_a_lock_by_value {
             to omits_them_from_the_active_workers_column {
                 locked_workers_shows_active_only()
@@ -2618,7 +2611,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_list_workers_beyond_100().await) {
+    expect(run_list_workers_beyond_100().await) as worker_listing {
         when more_than_one_hundred_workers_are_registered_for_the_queue {
             to returns_every_row_without_a_hidden_limit {
                 list_workers_returns_every_row()
@@ -2626,7 +2619,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_registration_gate_blocks_fetcher().await) {
+    expect(run_registration_gate_blocks_fetcher().await) as worker_registration_gate {
         when the_initial_heartbeat_fails_with_already_registered {
             to yields_the_registration_error_and_terminates_without_dequeue {
                 registration_gate_emits_error_then_ends()
@@ -2634,17 +2627,10 @@ lets_expect! { #tokio_test
         }
     }
 
-    // Each `to` re-runs `run_verify_schema()`, which is safe to run twice in
-    // parallel: the applied branch only reads the shared database, and the
-    // pending branch mutates a throwaway database named with a fresh ULID per
-    // call (see `verify_pending_branch_on_temp_db`), so the two runs never
-    // touch the same migrations table.
-    expect(run_verify_schema().await) {
+    expect(run_verify_schema().await) as schema_verification {
         when verify_schema_is_called_against_a_freshly_migrated_database {
-            to accepts_a_fully_applied_database {
-                verify_schema_accepts_a_fully_applied_database()
-            }
-            to rejects_a_database_with_an_unrecorded_migration {
+            to distinguishes_complete_and_incomplete_migration_history {
+                verify_schema_accepts_a_fully_applied_database(),
                 verify_schema_rejects_a_database_with_unrecorded_migrations()
             }
         }
@@ -2653,7 +2639,7 @@ lets_expect! { #tokio_test
     // Both sides of the column comparison are recomputed per run and the
     // roundtrip inserts a fresh worker row per call, so re-running per `to`
     // block is safe.
-    expect(run_schema_agreement(table).await) {
+    expect(run_schema_agreement(table).await) as typed_schema {
         let table = "jobs";
 
         when the_typed_jobs_table_is_compared_to_the_database {
@@ -2670,7 +2656,7 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_lease_token_roundtrip(with_token).await) {
+    expect(run_lease_token_roundtrip(with_token).await) as worker_lease {
         let with_token = true;
 
         when the_worker_row_carries_a_lease_token {
@@ -2687,40 +2673,34 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_partial_batch_conflict().await) {
+    expect(run_partial_batch_conflict().await) as conflicting_batch {
         when a_buffered_batch_collides_on_a_shared_idempotency_key {
-            to surfaces_an_idempotency_conflict_with_the_rejected_count {
-                partial_batch_rejects_with_count()
-            }
-            to rolls_back_every_partial_insertion_in_the_batch {
+            to rejects_the_conflict_and_rolls_back_the_batch {
+                partial_batch_rejects_with_count(),
                 partial_batch_rolls_back_inserts()
             }
         }
     }
 
-    expect(run_mixed_batch_conflict().await) {
+    expect(run_mixed_batch_conflict().await) as mixed_batch {
         when a_batch_mixes_fresh_keys_with_one_duplicate {
-            to reports_only_the_duplicate_as_rejected {
-                mixed_batch_reports_only_the_duplicate()
-            }
-            to rolls_back_the_fresh_rows_with_the_whole_batch {
+            to reports_the_duplicate_and_rolls_back_the_batch {
+                mixed_batch_reports_only_the_duplicate(),
                 mixed_batch_rolls_back_the_fresh_rows_too()
             }
         }
     }
 
-    expect(run_intrabatch_dup_with_nulls().await) {
+    expect(run_intrabatch_dup_with_nulls().await) as repeated_batch_key {
         when a_batch_repeats_a_key_and_interleaves_a_null_key_with_no_seed {
-            to reports_only_the_repeated_key_excluding_the_null {
-                intrabatch_reports_only_the_repeated_key()
-            }
-            to rolls_back_every_row_leaving_the_queue_empty {
+            to reports_the_repeated_key_and_rolls_back_the_batch {
+                intrabatch_reports_only_the_repeated_key(),
                 intrabatch_dup_rolls_back_the_whole_batch()
             }
         }
     }
 
-    expect(run_metadata_cap(meta_payload_len).await) {
+    expect(run_metadata_cap(meta_payload_len).await) as enqueue_metadata {
         let meta_payload_len = 1024usize;
 
         when the_metadata_serialization_length_is_well_below_the_cap {
@@ -2744,35 +2724,43 @@ lets_expect! { #tokio_test
 
         when the_metadata_serialization_length_is_one_byte_over_the_eight_kib_cap {
             let meta_payload_len = 8195usize;
-            to rejects_the_push_with_invalid_argument { metadata_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { metadata_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                metadata_cap_rejects(),
+                metadata_cap_persists_nothing()
+            }
         }
 
         when the_metadata_serialization_length_exceeds_the_eight_kib_cap {
             let meta_payload_len = 16384usize;
-            to rejects_the_push_with_invalid_argument { metadata_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { metadata_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                metadata_cap_rejects(),
+                metadata_cap_persists_nothing()
+            }
         }
     }
 
-    expect(run_run_at_cap(run_at).await) {
+    expect(run_run_at_cap(run_at).await) as enqueue_schedule {
         let run_at = u64::MAX;
 
         when the_run_at_timestamp_is_one_second_over_i64_max {
             // 9223372036854775808 — the first value `i64::try_from` rejects, so
             // it pins the exact rejecting boundary of the strict guard.
             let run_at = (i64::MAX as u64) + 1;
-            to rejects_the_push_with_invalid_argument { run_at_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { run_at_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                run_at_cap_rejects(),
+                run_at_cap_persists_nothing()
+            }
         }
 
         when the_run_at_timestamp_exceeds_i64_max_seconds {
-            to rejects_the_push_with_invalid_argument { run_at_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { run_at_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                run_at_cap_rejects(),
+                run_at_cap_persists_nothing()
+            }
         }
     }
 
-    expect(run_idempotency_cap(key_len).await) {
+    expect(run_idempotency_cap(key_len).await) as enqueue_key {
         let key_len = 36usize; // typical UUID length
 
         when the_idempotency_key_is_a_typical_short_uuid {
@@ -2787,18 +2775,22 @@ lets_expect! { #tokio_test
         when the_idempotency_key_is_one_byte_over_the_one_kib_cap {
             // First value the strict `key.len() > 1024` guard must reject.
             let key_len = 1025usize;
-            to rejects_the_push_with_invalid_argument { idempotency_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { idempotency_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                idempotency_cap_rejects(),
+                idempotency_cap_persists_nothing()
+            }
         }
 
         when the_idempotency_key_exceeds_the_one_kib_cap {
             let key_len = 4096usize;
-            to rejects_the_push_with_invalid_argument { idempotency_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { idempotency_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                idempotency_cap_rejects(),
+                idempotency_cap_persists_nothing()
+            }
         }
     }
 
-    expect(run_queue_name_cap(name_len).await) {
+    expect(run_queue_name_cap(name_len).await) as enqueue_queue {
         let name_len = 64usize; // realistic namespaced queue length
 
         when the_queue_name_is_a_typical_namespaced_identifier {
@@ -2813,27 +2805,33 @@ lets_expect! { #tokio_test
         when the_queue_name_is_one_byte_over_the_two_hundred_fifty_five_byte_cap {
             // First value the strict `job_type.len() > 255` guard must reject.
             let name_len = 256usize;
-            to rejects_the_push_with_invalid_argument { queue_name_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { queue_name_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                queue_name_cap_rejects(),
+                queue_name_cap_persists_nothing()
+            }
         }
 
         when the_queue_name_exceeds_the_two_hundred_fifty_five_byte_cap {
             let name_len = 1024usize;
-            to rejects_the_push_with_invalid_argument { queue_name_cap_rejects() }
-            to does_not_persist_the_apalis_jobs_row { queue_name_cap_persists_nothing() }
+            to rejects_the_input_without_persisting_rows {
+                queue_name_cap_rejects(),
+                queue_name_cap_persists_nothing()
+            }
         }
     }
 
     // ack predicate matrix: enumerate every WHERE-clause arm in `ack_task`.
     // Default `setup = ACK_OK` is the no-token happy path (already covered by
     // `postgres_queries::ack_boundary`, repeated here as the matrix anchor).
-    expect(run_ack_predicate(setup).await) {
+    expect(run_ack_predicate(setup).await) as acknowledgement {
         let setup = ACK_OK;
 
         when called_without_a_lease_token_on_a_matching_running_row {
-            to marks_the_row_done { ack_writes_done() }
-            to persists_the_serialized_result { ack_persists_result() }
-            to returns_ok { ack_succeeds() }
+            to acknowledges_with_the_expected_state_and_result {
+                ack_writes_done(),
+                ack_persists_result(),
+                ack_succeeds()
+            }
         }
 
         when called_without_a_lease_token_while_the_workers_row_carries_one {
@@ -2850,9 +2848,11 @@ lets_expect! { #tokio_test
                 workers_token: Some("stored-token"),
                 ..ACK_OK
             };
-            to marks_the_row_done { ack_writes_done() }
-            to persists_the_serialized_result { ack_persists_result() }
-            to returns_ok { ack_succeeds() }
+            to acknowledges_with_the_expected_state_and_result {
+                ack_writes_done(),
+                ack_persists_result(),
+                ack_succeeds()
+            }
         }
 
         when called_with_a_lease_token_that_matches_the_workers_row {
@@ -2861,9 +2861,11 @@ lets_expect! { #tokio_test
                 workers_token: Some("matching-token"),
                 ..ACK_OK
             };
-            to marks_the_row_done { ack_writes_done() }
-            to persists_the_serialized_result { ack_persists_result() }
-            to returns_ok { ack_succeeds() }
+            to acknowledges_with_the_expected_state_and_result {
+                ack_writes_done(),
+                ack_persists_result(),
+                ack_succeeds()
+            }
         }
 
         when called_with_a_lease_token_that_does_not_match_the_workers_row {

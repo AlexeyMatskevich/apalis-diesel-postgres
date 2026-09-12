@@ -65,12 +65,18 @@ CREATE OR REPLACE FUNCTION apalis.get_jobs(
     v_job_count INTEGER DEFAULT 5
 ) RETURNS SETOF apalis.jobs AS $$
 BEGIN
+    -- Match native claim/recovery ordering even for this trusted, token-free API.
+    -- The FK's implicit worker KEY SHARE would otherwise happen after job locks.
+    PERFORM 1 FROM apalis.workers AS worker
+    WHERE worker.id = worker_id AND worker.worker_type = v_job_type
+    FOR SHARE;
+
     RETURN QUERY
     WITH next_jobs AS (
         SELECT id
         FROM apalis.jobs
-        WHERE (status = 'Pending' OR (status = 'Failed' AND attempts < max_attempts))
-            AND run_at <= now()
+        WHERE (status IN ('Pending', 'Failed') AND attempts < max_attempts)
+            AND run_at <= statement_timestamp()
             AND job_type = v_job_type
         ORDER BY priority DESC, run_at ASC
         LIMIT v_job_count
@@ -79,19 +85,22 @@ BEGIN
     UPDATE apalis.jobs
     SET status = 'Queued',
         lock_by = worker_id,
-        lock_at = date_trunc('second', now())
+        lock_at = date_trunc('second', statement_timestamp()),
+        done_at = NULL
     FROM next_jobs
     WHERE apalis.jobs.id = next_jobs.id
     RETURNING apalis.jobs.*;
 END;
-$$ LANGUAGE plpgsql VOLATILE;
+$$ LANGUAGE plpgsql VOLATILE
+   SECURITY INVOKER
+   SET search_path = pg_catalog, apalis, pg_temp;
 
 DROP TRIGGER IF EXISTS notify_workers ON apalis.jobs;
 DROP FUNCTION IF EXISTS apalis.notify_new_jobs;
 
 CREATE FUNCTION apalis.notify_new_jobs() RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.run_at <= now() THEN
+    IF NEW.run_at <= statement_timestamp() THEN
         PERFORM pg_notify(
             'apalis::job::insert',
             json_build_object(

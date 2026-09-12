@@ -13,11 +13,11 @@
 
 CREATE OR REPLACE FUNCTION apalis.notify_new_jobs() RETURNS TRIGGER
 SECURITY INVOKER
-SET search_path = pg_catalog, apalis
+SET search_path = pg_catalog, apalis, pg_temp
 AS $$
 DECLARE
     rec RECORD;
-    cutoff TIMESTAMPTZ := now();
+    cutoff TIMESTAMPTZ := statement_timestamp();
     single_row apalis.jobs;
     new_jobs_count INTEGER;
 BEGIN

@@ -26,6 +26,19 @@ pub enum Error {
     #[error("blocking task failed: {0}")]
     Blocking(#[source] BoxDynError),
 
+    /// A claim produced runnable tasks, but its commit was not confirmed.
+    /// The tasks may be Running even though their rows were not delivered.
+    #[error(
+        "claim outcome is unknown while {operation}: {source}; retire this worker and allow orphan recovery before restarting with fresh storage"
+    )]
+    ClaimOutcomeUnknown {
+        /// Claim operation whose commit could not be confirmed.
+        operation: &'static str,
+        /// Original database or blocking-runtime failure.
+        #[source]
+        source: Box<Error>,
+    },
+
     /// Database migrations failed.
     #[error("failed to run embedded migrations: {0}")]
     Migration(#[source] BoxDynError),
@@ -145,6 +158,24 @@ pub enum Error {
     /// A sink producer attempted to send without observing backpressure.
     #[error("sink buffer is full; call poll_ready before start_send (capacity: {0})")]
     SinkBufferFull(usize),
+
+    /// A custom polling strategy ended or its single-use Config was reused.
+    #[error(
+        "polling strategy for queue `{queue}` ended; use with_poll_strategy_factory for independent workers or provide a fresh Config; no automatic polling is started"
+    )]
+    PollStrategyExhausted {
+        /// Queue whose strategy no longer grants polling permits.
+        queue: String,
+    },
+
+    /// This local worker lease was retired after losing a completion obligation.
+    #[error(
+        "worker `{worker_id}` has retired its local lease; claims and heartbeats have stopped so orphan recovery can proceed; create fresh storage with a fresh Config or poll strategy factory to restart"
+    )]
+    WorkerRetired {
+        /// Worker whose local lease can no longer acquire tasks.
+        worker_id: String,
+    },
 }
 
 // `diesel::Connection::transaction` requires the closure error type to be
@@ -447,48 +478,48 @@ mod tests {
     }
 
     lets_expect! {
-        expect(database_error()) {
+        expect(database_error()) as database_error_details {
             to displays_the_operation_context { displays_as("database error while fetching jobs: Record not found") }
             to exposes_the_database_error_as_the_source { has_source_containing("Record not found") }
         }
 
-        expect(database_error_with_setup_hint()) {
+        expect(database_error_with_setup_hint()) as database_setup_hint {
             to displays_the_operation_context_with_the_setup_hint_appended {
                 displays_as("database error while locking task: relation \"apalis.jobs\" does not exist; run apalis_diesel_postgres::setup(&pool).await before using the storage")
             }
         }
 
-        expect(Error::Blocking(boxed_error("join cancelled"))) {
+        expect(Error::Blocking(boxed_error("join cancelled"))) as blocking_error_details {
             to displays_the_blocking_error { displays_as("blocking task failed: join cancelled") }
             to exposes_the_blocking_error_as_the_source { has_source_containing("join cancelled") }
         }
 
-        expect(Error::Migration(boxed_error("missing migration"))) {
+        expect(Error::Migration(boxed_error("missing migration"))) as migration_error_details {
             to displays_the_migration_error { displays_as("failed to run embedded migrations: missing migration") }
             to exposes_the_migration_error_as_the_source { has_source_containing("missing migration") }
         }
 
-        expect(Error::Row(boxed_error("bad task row"))) {
+        expect(Error::Row(boxed_error("bad task row"))) as row_conversion_error_details {
             to displays_the_row_conversion_error { displays_as("failed to convert database row into an Apalis task: bad task row") }
             to exposes_the_row_error_as_the_source { has_source_containing("bad task row") }
         }
 
-        expect(Error::Decode(boxed_error("bad payload"))) {
+        expect(Error::Decode(boxed_error("bad payload"))) as codec_error_details {
             to displays_the_decode_error { displays_as("failed to decode task payload or result with the configured codec: bad payload") }
             to exposes_the_decode_error_as_the_source { has_source_containing("bad payload") }
         }
 
-        expect(Error::Json(json_error())) {
+        expect(Error::Json(json_error())) as json_error_details {
             to displays_the_json_error { displays_as("json error: expected ident at line 1 column 2") }
             to exposes_the_json_error_as_the_source { has_source_containing("expected ident") }
         }
 
-        expect(Error::MissingField("run_at")) {
+        expect(Error::MissingField("run_at")) as missing_field_error {
             to displays_the_missing_field_error { displays_as("task metadata is missing required field `run_at`; this usually means the task did not go through the expected poll/lock/ack lifecycle") }
             to has_no_error_source { has_no_source }
         }
 
-        expect(Error::already_registered("worker-1", "emails")) {
+        expect(Error::already_registered("worker-1", "emails")) as duplicate_worker_registration {
             to displays_the_registration_error_with_worker_and_queue {
                 displays_as("worker `worker-1` is already registered for queue `emails`, or is being registered concurrently")
             }
@@ -499,7 +530,7 @@ mod tests {
             "emails",
             vec!["k-1".to_owned(), "k-2".to_owned()],
             3,
-        )) {
+        )) as conflicting_enqueue_details {
             to identifies_the_conflicting_queue_and_keys { is_idempotency_conflict }
             to displays_the_conflict_and_rollback_semantics { displays_as("idempotency_key conflict in queue `emails`: keys [\"k-1\", \"k-2\"] collided with the unique constraint; 3 task(s) in the batch were all rolled back") }
             to has_no_error_source { has_no_source }
@@ -509,7 +540,7 @@ mod tests {
         // this state is effectively unreachable (only keyed submissions can
         // collide), so this leaf pins the pure Display rendering of the `[]`
         // branch rather than a reachable conflict.
-        expect(Error::idempotency_conflict("emails", vec![], 0)) {
+        expect(Error::idempotency_conflict("emails", vec![], 0)) as empty_conflict_details {
             to displays_an_empty_conflict_batch {
                 displays_as("idempotency_key conflict in queue `emails`: keys [] collided with the unique constraint; 0 task(s) in the batch were all rolled back")
             }
@@ -521,7 +552,7 @@ mod tests {
             "task-1",
             Some("queue-1".to_owned()),
             "the task may be delayed, already locked by another worker, completed, or in another queue",
-        )) {
+        )) as scoped_missing_task {
             to returns_a_contextual_task_not_found_error { is_task_not_found }
             to displays_the_next_step { displays_as("task not found while locking task (task_id: task-1, queue: queue-1); the task may be delayed, already locked by another worker, completed, or in another queue") }
             to has_no_error_source { has_no_source }
@@ -532,7 +563,7 @@ mod tests {
             "task-1",
             None,
             "the task may be delayed, already locked by another worker, or completed",
-        )) {
+        )) as unscoped_missing_task {
             when queue_is_not_constrained {
                 // Mirrors the unscoped `lock_task` path (queries/fetch.rs):
                 // a `None` queue both renders the `<not constrained>` placeholder
@@ -544,7 +575,7 @@ mod tests {
             }
         }
 
-        expect(Error::stale_acknowledgement("task-1", "queue-1", "worker-1")) {
+        expect(Error::stale_acknowledgement("task-1", "queue-1", "worker-1")) as stale_acknowledgement_details {
             to displays_the_ack_conflict { displays_as("stale acknowledgement for task task-1 in queue queue-1 by worker worker-1; the task is no longer Running with the same lock owner, attempt, and lock timestamp") }
             to has_no_error_source { has_no_source }
         }
@@ -554,42 +585,56 @@ mod tests {
             "worker-1",
             "queue-1",
             "recreate the worker stream so registration can run again",
-        )) {
+        )) as unregistered_worker_details {
             to displays_the_worker_registration_problem { displays_as("worker not registered while updating worker heartbeat (worker_id: worker-1, queue: queue-1); recreate the worker stream so registration can run again") }
             to has_no_error_source { has_no_source }
         }
 
-        expect(Error::NotifyListener("LISTEN failed".to_owned())) {
+        expect(Error::NotifyListener("LISTEN failed".to_owned())) as notification_listener_failure {
             to displays_the_notify_degradation { displays_as("PostgreSQL notification listener failed: LISTEN failed; polling fallback can still fetch jobs, but LISTEN/NOTIFY wakeups are disabled until the stream is recreated") }
             to has_no_error_source { has_no_source }
         }
 
-        expect(Error::SinkBufferFull(1)) {
+        expect(Error::PollStrategyExhausted { queue: "emails".into() }) as exhausted_polling_strategy {
+            to identifies_the_queue_and_explains_independent_strategy_construction {
+                displays_as("polling strategy for queue `emails` ended; use with_poll_strategy_factory for independent workers or provide a fresh Config; no automatic polling is started"),
+                has_no_source
+            }
+        }
+
+        expect(Error::WorkerRetired { worker_id: "worker-1".into() }) as retired_worker_lease {
+            to identifies_the_worker_and_explains_how_to_restart {
+                displays_as("worker `worker-1` has retired its local lease; claims and heartbeats have stopped so orphan recovery can proceed; create fresh storage with a fresh Config or poll strategy factory to restart"),
+                has_no_source
+            }
+        }
+
+        expect(Error::SinkBufferFull(1)) as sink_backpressure_error {
             to displays_the_sink_buffer_error { displays_as("sink buffer is full; call poll_ready before start_send (capacity: 1)") }
             to has_no_error_source { has_no_source }
         }
 
-        expect(Error::InvalidArgument("limit 99 exceeds i32::MAX".to_owned())) {
+        expect(Error::InvalidArgument("limit 99 exceeds i32::MAX".to_owned())) as invalid_argument_details {
             to displays_the_invalid_argument_error {
                 displays_as("invalid argument: limit 99 exceeds i32::MAX")
             }
             to has_no_error_source { has_no_source }
         }
 
-        expect(Error::from(diesel::result::Error::NotFound)) {
+        expect(Error::from(diesel::result::Error::NotFound)) as transaction_error_context {
             to labels_the_unlabeled_transaction_path {
                 displays_as("database error while diesel transaction begin/commit/rollback (unlabeled — use map_err inside the closure): Record not found")
             }
             to exposes_the_diesel_error_as_the_source { has_source_containing("Record not found") }
         }
 
-        expect(non_database_hint()) {
+        expect(non_database_hint()) as non_database_error_hint {
             when diesel_error_is_not_a_database_variant {
                 to returns_no_hint { equal("") }
             }
         }
 
-        expect(hint_for(message, table_name, constraint_name)) {
+        expect(hint_for(message, table_name, constraint_name)) as postgres_error_hint {
             let message = "irrelevant";
             let table_name: Option<&'static str> = None;
             let constraint_name: Option<&'static str> = None;
@@ -601,6 +646,15 @@ mod tests {
                     equal(
                         "; register the worker for this queue before locking or acknowledging jobs",
                     )
+                }
+
+                when the_message_also_reports_a_missing_jobs_table {
+                    let message = "relation \"apalis.jobs\" does not exist";
+                    to prefers_the_structured_foreign_key_over_the_message {
+                        equal(
+                            "; register the worker for this queue before locking or acknowledging jobs",
+                        )
+                    }
                 }
             }
 
@@ -620,6 +674,15 @@ mod tests {
                     equal(
                         "; run apalis_diesel_postgres::setup(&pool).await before using the storage",
                     )
+                }
+
+                when the_message_also_mentions_a_foreign_key {
+                    let message = "relation \"apalis.jobs\" does not exist; foreign key constraint violated";
+                    to reports_the_missing_table_before_the_foreign_key {
+                        equal(
+                            "; run apalis_diesel_postgres::setup(&pool).await before using the storage",
+                        )
+                    }
                 }
             }
 
@@ -677,7 +740,7 @@ mod tests {
             }
 
             when message_signals_a_missing_relation_for_a_different_table {
-                let message = "relation \"audit_log\" does not exist";
+                let message = "relation \"business_events\" does not exist";
                 to returns_no_hint { equal("") }
             }
 

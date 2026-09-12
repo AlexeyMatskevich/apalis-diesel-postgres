@@ -1,28 +1,8 @@
-//! Exhaustive specification for `src/queries/worker.rs`.
-//!
-//! The functions in `queries::worker` are `pub(crate)`, so an integration
-//! test crate cannot call them directly. Instead, each spec below issues the
-//! *same SQL statement* as the production function and pins the resulting
-//! row-level behaviour. Any production-side SQL drift will desync these
-//! contracts from the source and the spec must be updated in lock-step.
-//!
-//! The driver SQL is centralised in the helper functions
-//! `reenqueue_orphaned_sql_on`, `register_worker_sql`, and `keep_alive_sql` —
-//! keep them semantically identical to the SQL in `src/queries/worker.rs`
-//! (only SQL comments and indentation may differ).
-//!
-//! Behaviour already covered elsewhere is not re-tested here:
-//!   - `mark_worker_stale` + `register_worker` admin path → `postgres_specs::run_concurrent_admin_register`
-//!   - orphan re-enqueue Pending/Killed terminal split → `postgres_queries::run_orphan_reenqueue`
-//!   - `AlreadyRegistered` surfaces on the poll stream → `postgres_specs::run_registration_gate_blocks_fetcher`
-//!   - lease-token rotation lifecycle (caller-token vs workers_token) → `postgres_specs::run_ack_predicate`
-//!
-//! Tests gate on `DATABASE_URL`; without it every scenario resolves to
-//! `Outcome::Skipped` and the assertions pass.
+//! Production-bound database specifications; SQL is used only for fixtures and observations.
 
 #![cfg(feature = "tokio")]
 
-mod support;
+use crate::test_support as support;
 
 use support::{Outcome, observe, with_conn};
 
@@ -229,62 +209,23 @@ async fn worker_row(
 }
 
 // --------------------------------------------------------------------------
-// SQL mirrors of the private functions in src/queries/worker.rs.
+// Calls to the private production functions in src/queries/worker.rs.
 //
-// IMPORTANT: keep these semantically identical to the production SQL —
-// same statements, predicates, and bind order; only SQL comments and
-// indentation may differ. If `src/queries/worker.rs` changes, update these
-// helpers in lock-step.
 // --------------------------------------------------------------------------
 
-/// Mirror of `reenqueue_orphaned_blocking`, connection-bound so the
+/// Adapter for `reenqueue_orphaned_blocking`, connection-bound so the
 /// concurrency scenarios below can interleave two sweeps on two connections.
 fn reenqueue_orphaned_sql_on(
     conn: &mut PgConnection,
     threshold_secs: i32,
     queue: &str,
-) -> Result<usize, diesel::result::Error> {
-    sql_query(
-        "UPDATE apalis.jobs
-             SET status = CASE
-                     WHEN attempts::bigint + 1 >= max_attempts THEN 'Killed'
-                     ELSE 'Pending'
-                 END,
-                 done_at = CASE
-                     WHEN attempts::bigint + 1 >= max_attempts THEN now()
-                     ELSE NULL
-                 END,
-                 lock_by = NULL,
-                 lock_at = NULL,
-                 attempts = LEAST(attempts::bigint + 1, max_attempts),
-                 last_result = CASE
-                     WHEN attempts::bigint + 1 >= max_attempts
-                         THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
-                     WHEN last_result IS NULL
-                         THEN '{\"Err\": \"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb
-                     ELSE last_result
-                 END
-             WHERE (status = 'Running' OR status = 'Queued')
-               AND id IN (
-                 SELECT jobs.id
-                 FROM apalis.jobs
-                 INNER JOIN apalis.workers
-                     ON jobs.lock_by = workers.id
-                     AND jobs.job_type = workers.worker_type
-                 WHERE (status = 'Running' OR status = 'Queued')
-                     AND now() - apalis.workers.last_seen >= ($1 * INTERVAL '1 second')
-                     AND jobs.job_type = $2
-                 LIMIT $3
-                 FOR UPDATE OF jobs SKIP LOCKED
-             )",
-    )
-    .bind::<Integer, _>(threshold_secs)
-    .bind::<Text, _>(queue.to_owned())
-    .bind::<Integer, _>(SWEEP_LIMIT)
-    .execute(conn)
+) -> Result<usize, crate::Error> {
+    let config = crate::Config::new(queue)
+        .set_reenqueue_orphaned_after(std::time::Duration::from_secs(threshold_secs as u64));
+    crate::queries::worker::reenqueue_orphaned_blocking(conn, &config)
 }
 
-/// Mirror of `reenqueue_orphaned_blocking`.
+/// Adapter for `reenqueue_orphaned_blocking`.
 async fn reenqueue_orphaned_sql(
     pool: PgPool,
     threshold_secs: i32,
@@ -296,45 +237,34 @@ async fn reenqueue_orphaned_sql(
     .await
 }
 
-/// Mirror of `register_worker_blocking`, connection-bound so the advisory-lock
+/// Adapter for `register_worker_blocking`, connection-bound so the advisory-lock
 /// contention scenario below can run the register on a second connection while
 /// a first connection holds the `(worker_id, worker_type)` xact-scoped lock.
 fn register_worker_sql_on(
     conn: &mut PgConnection,
     worker_id: &str,
     queue: &str,
-    storage_name: &str,
-    layers: &str,
+    _storage_name: &str,
+    _layers: &str,
     lease_token: &str,
     stale_after_secs: i32,
-) -> Result<usize, diesel::result::Error> {
-    sql_query(
-        "WITH registration_lock AS (
-                 SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired
-             )
-             INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at, lease_token)
-             SELECT $1, $2, $3, $4, now(), now(), $5
-             FROM registration_lock
-             WHERE acquired
-             ON CONFLICT (id, worker_type) DO UPDATE
-             SET storage_name = EXCLUDED.storage_name,
-                 layers = EXCLUDED.layers,
-                 last_seen = now(),
-                 lease_token = EXCLUDED.lease_token
-             WHERE apalis.workers.lease_token IS NULL
-                OR apalis.workers.lease_token = EXCLUDED.lease_token
-                OR now() - apalis.workers.last_seen >= ($6 * INTERVAL '1 second')",
-    )
-    .bind::<Text, _>(worker_id)
-    .bind::<Text, _>(queue)
-    .bind::<Text, _>(storage_name)
-    .bind::<Text, _>(layers)
-    .bind::<Text, _>(lease_token)
-    .bind::<Integer, _>(stale_after_secs)
-    .execute(conn)
+) -> Result<usize, crate::Error> {
+    let worker = apalis_core::worker::context::WorkerContext::new::<()>(worker_id);
+    match crate::queries::worker::register_worker_blocking(
+        conn,
+        queue,
+        &worker,
+        "PostgresStorage",
+        lease_token,
+        std::time::Duration::from_secs(stale_after_secs as u64),
+    ) {
+        Ok(()) => Ok(1),
+        Err(crate::Error::AlreadyRegistered { .. }) => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
-/// Mirror of `register_worker_blocking`. Returns affected row count (0 means
+/// Adapter for `register_worker_blocking`. Returns affected row count (0 means
 /// production would raise `Error::AlreadyRegistered`).
 async fn register_worker_sql(
     pool: PgPool,
@@ -360,7 +290,7 @@ async fn register_worker_sql(
     .await
 }
 
-/// Mirror of `keep_alive`. Returns affected row count (0 means production
+/// Adapter for `keep_alive`. Returns affected row count (0 means production
 /// would raise `Error::WorkerNotRegistered`).
 async fn keep_alive_sql(
     pool: PgPool,
@@ -368,19 +298,19 @@ async fn keep_alive_sql(
     queue: String,
     lease_token: String,
 ) -> Result<usize, String> {
-    with_conn(pool, move |conn| {
-        sql_query(
-            "UPDATE apalis.workers
-             SET last_seen = now()
-             WHERE id = $1 AND worker_type = $2 AND lease_token = $3",
-        )
-        .bind::<Text, _>(&worker_id)
-        .bind::<Text, _>(&queue)
-        .bind::<Text, _>(&lease_token)
-        .execute(conn)
-        .map_err(|e| e.to_string())
-    })
+    let worker = apalis_core::worker::context::WorkerContext::new::<()>(&worker_id);
+    match crate::queries::worker::keep_alive(
+        pool,
+        crate::Config::new(&queue),
+        worker,
+        lease_token.into(),
+    )
     .await
+    {
+        Ok(()) => Ok(1),
+        Err(crate::Error::WorkerNotRegistered { .. }) => Ok(0),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -403,15 +333,6 @@ struct ReenqueueSetup {
     /// re-enqueue runs against.
     other_queue: bool,
 }
-
-const REENQUEUE_DEFAULT: ReenqueueSetup = ReenqueueSetup {
-    status: "Running",
-    attempts: 0,
-    max_attempts: 3,
-    has_last_result: false,
-    worker_last_seen_age_secs: 10,
-    other_queue: false,
-};
 
 #[derive(Debug)]
 struct ReenqueueRun {
@@ -619,7 +540,7 @@ fn reenqueue_writes_heartbeat_marker()
 // --------------------------------------------------------------------------
 // reenqueue_orphaned: concurrent sweeps apply exactly once
 //
-// Regression for the round-11 audit fix. The production UPDATE repeats the
+// Concurrent sweeps must consume at most one lost attempt. The UPDATE repeats the
 // status predicate outside the candidate sub-select (EvalPlanQual re-check)
 // and the sub-select claims rows with `FOR UPDATE OF jobs SKIP LOCKED`.
 // Without both, a sweep racing another sweep on the same stale row would
@@ -698,19 +619,18 @@ async fn run_concurrent_reenqueue(
             // of skipping them) fails fast with a lock-timeout error instead
             // of stalling the suite; LOCAL scoping resets it at COMMIT so the
             // pooled connection returns clean.
-            let competing_sweep =
-                |conn: &mut PgConnection| -> Result<usize, diesel::result::Error> {
-                    conn.transaction(|tx| {
-                        sql_query("SET LOCAL lock_timeout = '2s'").execute(tx)?;
-                        reenqueue_orphaned_sql_on(tx, 1, &sweep_queue)
-                    })
-                };
+            let competing_sweep = |conn: &mut PgConnection| -> Result<usize, crate::Error> {
+                conn.transaction(|tx| {
+                    sql_query("SET LOCAL lock_timeout = '2s'").execute(tx)?;
+                    reenqueue_orphaned_sql_on(tx, 1, &sweep_queue)
+                })
+            };
             match timing {
                 CompetingSweep::WhileFirstHoldsRowLocks => {
                     let mut first_affected = 0;
                     let mut competing_affected = 0;
                     first_conn
-                        .transaction::<_, diesel::result::Error, _>(|tx| {
+                        .transaction::<_, crate::Error, _>(|tx| {
                             first_affected = reenqueue_orphaned_sql_on(tx, 1, &sweep_queue)?;
                             competing_affected = competing_sweep(&mut competing_conn)?;
                             Ok(())
@@ -902,14 +822,14 @@ fn register_stored_token_equals(
 // --------------------------------------------------------------------------
 // register_worker_blocking: advisory-lock contention drives affected=0
 //
-// The production statement wraps the INSERT in a CTE that calls
-// `pg_try_advisory_xact_lock(hashtext($1), hashtext($2))` and gates the
-// INSERT-SELECT on `WHERE acquired`. When a *peer* transaction already holds
-// that xact-scoped lock for the same `(worker_id, worker_type)` pair, the
-// try-lock returns FALSE, the INSERT-SELECT produces no row, and affected=0 —
-// which production maps to `Error::AlreadyRegistered`. This is a distinct path
-// to affected=0 from the incumbent-token-mismatch case in the matrix above:
-// here there is *no* incumbent row at all, so the block is attributable solely
+// Registration first calls
+// `pg_try_advisory_xact_lock(hashtext($1), hashtext($2))` inside its transaction.
+// When a peer already holds that lock for the same
+// `(worker_id, worker_type)` pair, the try-lock returns FALSE.
+// Production returns `Error::AlreadyRegistered` before reading or inserting
+// the worker row; the test adapter maps this error to affected=0.
+// This differs from rejection by an incumbent token in the matrix above:
+// here no incumbent row exists, so the rejection is attributable solely
 // to the advisory lock.
 // --------------------------------------------------------------------------
 
@@ -967,8 +887,8 @@ async fn run_register_under_advisory_contention() -> Result<Outcome<RegisterRun>
         }
 
         // B: run the production register path with a fresh lease token while A
-        // still holds the lock. The try-lock inside the statement must return
-        // FALSE, gating out the INSERT-SELECT → affected=0.
+        // still holds the lock. The first try-lock statement must return
+        // FALSE; the adapter reports AlreadyRegistered as affected=0.
         let affected = register_worker_sql_on(
             &mut registrar,
             &work_worker_id,
@@ -1242,8 +1162,8 @@ fn overflow_sweep_clamps_attempts_to_max()
 // --------------------------------------------------------------------------
 
 /// Per-sweep row cap. MUST match `REENQUEUE_ORPHANED_BATCH_LIMIT` in
-/// `src/queries/worker.rs`: the mirror binds it as the subselect `LIMIT`, just
-/// like the production statement.
+/// `src/queries/worker.rs`: this independently stated expectation checks the
+/// production recovery call through the test adapter.
 const SWEEP_LIMIT: i32 = 1000;
 
 /// Bulk-insert `count` orphaned `Running` rows locked by `worker_id` in one
@@ -1276,9 +1196,76 @@ struct BoundedSweepRun {
     total_orphans: i32,
     first_sweep: usize,
     second_sweep: usize,
+    after_first: SweepRows,
+    after_second: SweepRows,
 }
 
-async fn run_bounded_sweep() -> Result<Outcome<BoundedSweepRun>, String> {
+#[derive(Debug, QueryableByName)]
+struct SweepRows {
+    #[diesel(sql_type = BigInt)]
+    total: i64,
+    #[diesel(sql_type = BigInt)]
+    recovered: i64,
+    #[diesel(sql_type = BigInt)]
+    remaining: i64,
+}
+
+async fn observe_sweep_rows(
+    pool: PgPool,
+    queue: String,
+    worker_id: String,
+) -> Result<SweepRows, String> {
+    with_conn(pool, move |conn| {
+        sql_query(
+            "SELECT count(*) AS total,
+                count(*) FILTER(WHERE status='Pending' AND attempts=1
+                    AND lock_by IS NULL AND lock_at IS NULL AND done_at IS NULL
+                    AND last_result = '{\"Err\":\"Re-enqueued due to worker heartbeat timeout.\"}'::jsonb) AS recovered,
+                count(*) FILTER(WHERE status='Running' AND attempts=0
+                    AND lock_by=$2 AND lock_at IS NOT NULL AND done_at IS NULL
+                    AND last_result IS NULL) AS remaining
+             FROM apalis.jobs WHERE job_type=$1",
+        )
+        .bind::<Text, _>(&queue)
+        .bind::<Text, _>(&worker_id)
+        .get_result::<SweepRows>(conn)
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+async fn bounded_sweep_with_strategy(
+    pool: PgPool,
+    queue: String,
+    prefer_repeated_scans: bool,
+) -> Result<usize, String> {
+    with_conn(pool, move |conn| {
+        conn.transaction::<_, crate::Error, _>(|tx| {
+            if prefer_repeated_scans {
+                // These are session-local planner preferences, not changes to
+                // the recovery contract. They expose a legal rescan-prone plan.
+                for setting in [
+                    "SET LOCAL enable_hashagg=off",
+                    "SET LOCAL enable_hashjoin=off",
+                    "SET LOCAL enable_mergejoin=off",
+                    "SET LOCAL enable_material=off",
+                    "SET LOCAL enable_sort=off",
+                ] {
+                    sql_query(setting)
+                        .execute(tx)
+                        .map_err(crate::Error::database("setting sweep test plan"))?;
+                }
+            }
+            reenqueue_orphaned_sql_on(tx, 1, &queue)
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+async fn run_bounded_sweep(
+    prefer_repeated_scans: bool,
+) -> Result<Outcome<BoundedSweepRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
@@ -1301,15 +1288,27 @@ async fn run_bounded_sweep() -> Result<Outcome<BoundedSweepRun>, String> {
     let total = SWEEP_LIMIT + 5;
     bulk_insert_orphans(pool.clone(), queue.clone(), worker_id.clone(), total).await?;
 
-    let first_sweep = reenqueue_orphaned_sql(pool.clone(), 1, queue.clone()).await?;
-    let second_sweep = reenqueue_orphaned_sql(pool.clone(), 1, queue.clone()).await?;
-
+    let result = async {
+        let first_sweep =
+            bounded_sweep_with_strategy(pool.clone(), queue.clone(), prefer_repeated_scans).await?;
+        // Each observation runs after the sweep's transaction has committed.
+        let after_first =
+            observe_sweep_rows(pool.clone(), queue.clone(), worker_id.clone()).await?;
+        let second_sweep =
+            bounded_sweep_with_strategy(pool.clone(), queue.clone(), prefer_repeated_scans).await?;
+        let after_second =
+            observe_sweep_rows(pool.clone(), queue.clone(), worker_id.clone()).await?;
+        Ok(Outcome::Completed(BoundedSweepRun {
+            total_orphans: total,
+            first_sweep,
+            second_sweep,
+            after_first,
+            after_second,
+        }))
+    }
+    .await;
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    Ok(Outcome::Completed(BoundedSweepRun {
-        total_orphans: total,
-        first_sweep,
-        second_sweep,
-    }))
+    result
 }
 
 fn bounded_first_sweep_hits_the_cap()
@@ -1321,6 +1320,28 @@ fn bounded_first_sweep_hits_the_cap()
             Err(format!(
                 "expected the first sweep to reclaim exactly the {SWEEP_LIMIT}-row cap, got {} (of {} orphans)",
                 run.first_sweep, run.total_orphans
+            ))
+        }
+    })
+}
+
+fn bounded_sweep_preserves_committed_rows()
+-> impl Fn(&Result<Outcome<BoundedSweepRun>, String>) -> AssertionResult {
+    observe::<BoundedSweepRun, _>("bounded committed recovery", |run| {
+        let total = i64::from(run.total_orphans);
+        let limit = i64::from(SWEEP_LIMIT);
+        if run.after_first.total == total
+            && run.after_first.recovered == limit
+            && run.after_first.remaining == total - limit
+            && run.after_second.total == total
+            && run.after_second.recovered == total
+            && run.after_second.remaining == 0
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "unexpected durable rows after first/second sweep: {:?} / {:?}",
+                run.after_first, run.after_second
             ))
         }
     })
@@ -1343,221 +1364,265 @@ fn bounded_second_sweep_drains_the_remainder()
 
 lets_expect! { #tokio_test
     // ----- reenqueue_orphaned: i32::MAX attempts do not overflow -----------
-    expect(run_overflow_sweep().await) {
+    expect(run_overflow_sweep().await) as overflow_sweep {
         when a_corrupt_row_sits_at_the_i32_max_attempt_count {
-            to sweeps_without_an_integer_overflow { overflow_sweep_does_not_overflow() }
-            to marks_the_exhausted_row_killed { overflow_sweep_kills_the_row() }
-            to clamps_attempts_back_to_max_attempts { overflow_sweep_clamps_attempts_to_max() }
+            to sweeps_without_an_integer_overflow {
+                overflow_sweep_does_not_overflow(),
+                overflow_sweep_kills_the_row(),
+                overflow_sweep_clamps_attempts_to_max()
+            }
         }
     }
 
     // ----- reenqueue_orphaned matrix --------------------------------------
-    expect(run_reenqueue(setup).await) {
-        let setup = REENQUEUE_DEFAULT;
-
-        when a_running_row_with_a_stale_worker_has_attempts_left {
-            to is_touched_by_the_orphan_sweep { reenqueue_touched_one_row() }
-            to transitions_to_pending { reenqueue_row_status("Pending") }
-            to increments_attempts { reenqueue_row_attempts(1) }
-            to clears_the_lock_by_column { reenqueue_clears_lock_by() }
-            to leaves_done_at_null_on_the_retry_branch { reenqueue_left_done_at_null() }
-            to stamps_the_heartbeat_timeout_marker { reenqueue_writes_heartbeat_marker() }
+    expect(run_reenqueue(setup).await) as orphan_recovery {
+        let status="Running";
+        let attempts=0;
+        let max_attempts=3;
+        let has_last_result=false;
+        let worker_last_seen_age_secs=10;
+        let other_queue=false;
+        let setup=ReenqueueSetup{status,attempts,max_attempts,has_last_result,worker_last_seen_age_secs,other_queue};
+        to requeues_the_task_and_records_the_lost_attempt {
+            reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(1),
+            reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_writes_heartbeat_marker()
         }
-
-        when a_queued_row_with_a_stale_worker_has_attempts_left {
-            let setup = ReenqueueSetup {
-                status: "Queued",
-                ..REENQUEUE_DEFAULT
-            };
-            to is_also_touched_because_queued_is_in_the_predicate {
-                reenqueue_touched_one_row()
-            }
-            to transitions_to_pending { reenqueue_row_status("Pending") }
-        }
-
-        when the_pending_branch_already_carries_a_last_result {
-            // Preserves a prior successful ack visible to observers while still
-            // re-enqueuing the row — see comment block in
-            // `reenqueue_orphaned_blocking` SQL.
-            let setup = ReenqueueSetup {
-                has_last_result: true,
-                ..REENQUEUE_DEFAULT
-            };
-            to is_still_re_enqueued { reenqueue_touched_one_row() }
-            to does_not_clobber_the_existing_last_result {
-                reenqueue_preserves_last_result()
+        when a_previous_result_exists {
+            let has_last_result=true;
+            to preserves_the_previous_result_while_requeuing {
+                reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(1),
+                reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_preserves_last_result()
             }
         }
-
-        when the_kill_branch_unconditionally_overwrites_last_result {
-            // attempts+1 (=2) >= max_attempts (=2) → terminal Killed branch,
-            // which stamps the marker even if last_result was non-NULL.
-            let setup = ReenqueueSetup {
-                attempts: 1,
-                max_attempts: 2,
-                has_last_result: true,
-                ..REENQUEUE_DEFAULT
-            };
-            to transitions_to_killed { reenqueue_row_status("Killed") }
-            to overwrites_last_result_with_the_marker {
-                reenqueue_writes_heartbeat_marker()
+        when the_lost_attempt_exhausts_the_budget {
+            let attempts=2;
+            to exhausts_the_budget_and_records_the_lost_attempt {
+                reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
             }
-            to stamps_the_completion_timestamp {
-                reenqueue_stamped_completion_timestamp()
+            when a_previous_result_exists {
+                let has_last_result=true;
+                to replaces_the_previous_result_with_the_terminal_timeout {
+                    reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                    reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                }
             }
         }
-
-        when the_owning_worker_heartbeat_is_still_fresh {
-            // Threshold is 1s; worker is 0s old → predicate `now() - last_seen
-            // >= threshold` is false, row stays put.
-            let setup = ReenqueueSetup {
-                worker_last_seen_age_secs: 0,
-                ..REENQUEUE_DEFAULT
-            };
-            to leaves_the_row_alone { reenqueue_left_row_untouched() }
-            to keeps_status_running { reenqueue_row_status("Running") }
-            to preserves_lock_by { reenqueue_preserves_lock_by() }
+        when the_attempt_budget_is_already_exhausted {
+            let attempts=3;
+            to exhausts_the_budget_and_records_the_lost_attempt {
+                reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+            }
+            when a_previous_result_exists {
+                let has_last_result=true;
+                to replaces_the_previous_result_with_the_terminal_timeout {
+                    reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                    reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                }
+            }
         }
-
-        when the_row_belongs_to_a_different_queue {
-            // `jobs.job_type = $2` clause scopes the sweep to one queue.
-            let setup = ReenqueueSetup {
-                other_queue: true,
-                ..REENQUEUE_DEFAULT
-            };
-            to leaves_the_other_queues_row_alone { reenqueue_left_row_untouched() }
-            to keeps_status_running { reenqueue_row_status("Running") }
+        when the_worker_heartbeat_is_fresh {
+            let worker_last_seen_age_secs=0;
+            to leaves_the_live_claim_unchanged { reenqueue_left_row_untouched(), reenqueue_row_status("Running"), reenqueue_preserves_lock_by() }
         }
-
-        when the_row_is_already_in_a_terminal_status {
-            // Done is neither Running nor Queued; the predicate filters it out.
-            let setup = ReenqueueSetup {
-                status: "Done",
-                ..REENQUEUE_DEFAULT
-            };
-            to leaves_the_terminal_row_alone { reenqueue_left_row_untouched() }
+        when the_task_is_queued {
+            let status="Queued";
+            to requeues_the_task_and_records_the_lost_attempt {
+                reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(1),
+                reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_writes_heartbeat_marker()
+            }
+            when a_previous_result_exists {
+                let has_last_result=true;
+                to preserves_the_previous_result_while_requeuing {
+                    reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(1),
+                    reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_preserves_last_result()
+                }
+            }
+            when the_lost_attempt_exhausts_the_budget {
+                let attempts=2;
+                to exhausts_the_budget_and_records_the_lost_attempt {
+                    reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                    reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                }
+                when a_previous_result_exists {
+                    let has_last_result=true;
+                    to replaces_the_previous_result_with_the_terminal_timeout {
+                        reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                        reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                    }
+                }
+            }
+            when the_attempt_budget_is_already_exhausted {
+                let attempts=3;
+                to exhausts_the_budget_and_records_the_lost_attempt {
+                    reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                    reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                }
+                when a_previous_result_exists {
+                    let has_last_result=true;
+                    to replaces_the_previous_result_with_the_terminal_timeout {
+                        reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
+                        reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                    }
+                }
+            }
+            when the_worker_heartbeat_is_fresh {
+                let worker_last_seen_age_secs=0;
+                to leaves_the_live_claim_unchanged { reenqueue_left_row_untouched(), reenqueue_row_status("Queued"), reenqueue_preserves_lock_by() }
+            }
+        }
+        when the_task_is_pending {
+            let status="Pending";
+            to preserves_the_inactive_task { reenqueue_left_row_untouched(), reenqueue_row_status("Pending") }
+        }
+        when the_task_is_failed {
+            let status="Failed";
+            to preserves_the_inactive_task { reenqueue_left_row_untouched(), reenqueue_row_status("Failed") }
+        }
+        when the_task_is_done {
+            let status="Done";
+            to preserves_the_inactive_task { reenqueue_left_row_untouched(), reenqueue_row_status("Done") }
+        }
+        when the_task_is_killed {
+            let status="Killed";
+            to preserves_the_inactive_task { reenqueue_left_row_untouched(), reenqueue_row_status("Killed") }
+        }
+        when the_task_belongs_to_another_queue {
+            let other_queue=true;
+            to preserves_the_other_queue { reenqueue_left_row_untouched(), reenqueue_row_status("Running") }
         }
     }
 
     // ----- reenqueue_orphaned: bounded per-statement sweep ----------------
-    expect(run_bounded_sweep().await) {
+    expect(run_bounded_sweep(prefer_repeated_scans).await) as bounded_sweep {
+        let prefer_repeated_scans = false;
         when more_orphans_exist_than_a_single_sweep_may_reclaim {
-            to caps_the_first_sweep_at_the_batch_limit { bounded_first_sweep_hits_the_cap() }
-            to drains_the_remainder_on_the_next_sweep {
-                bounded_second_sweep_drains_the_remainder()
+            to caps_the_first_sweep_at_the_batch_limit {
+                bounded_first_sweep_hits_the_cap(),
+                bounded_second_sweep_drains_the_remainder(),
+                bounded_sweep_preserves_committed_rows()
+            }
+            when the_database_prefers_repeated_candidate_scans {
+                let prefer_repeated_scans = true;
+                to caps_each_sweep_and_preserves_the_remaining_attempts {
+                    bounded_first_sweep_hits_the_cap(),
+                    bounded_second_sweep_drains_the_remainder(),
+                    bounded_sweep_preserves_committed_rows()
+                }
             }
         }
     }
 
     // ----- reenqueue_orphaned: concurrent sweeps apply exactly once -------
-    expect(run_concurrent_reenqueue(timing).await) {
+    expect(run_concurrent_reenqueue(timing).await) as concurrent_reenqueue {
         let timing = CompetingSweep::WhileFirstHoldsRowLocks;
 
         when a_competing_sweep_runs_while_the_first_holds_row_locks {
-            to the_first_sweep_claims_the_row { concurrent_first_sweep_claimed_the_row() }
-            to the_competing_sweep_skips_the_locked_row {
-                concurrent_competing_sweep_touched_nothing()
+            to claims_the_row_on_the_first_sweep {
+                concurrent_first_sweep_claimed_the_row(),
+                concurrent_competing_sweep_touched_nothing(),
+                concurrent_attempts_incremented_exactly_once(),
+                concurrent_row_landed_in_pending()
             }
-            to attempts_increment_exactly_once {
-                concurrent_attempts_incremented_exactly_once()
-            }
-            to the_row_lands_in_pending { concurrent_row_landed_in_pending() }
         }
 
         when the_sweep_reruns_after_the_first_committed {
             let timing = CompetingSweep::AfterFirstCommitted;
-            to the_first_sweep_claims_the_row { concurrent_first_sweep_claimed_the_row() }
-            to the_rerun_finds_no_eligible_row {
-                concurrent_competing_sweep_touched_nothing()
+            to claims_the_row_on_the_first_sweep {
+                concurrent_first_sweep_claimed_the_row(),
+                concurrent_competing_sweep_touched_nothing(),
+                concurrent_attempts_incremented_exactly_once(),
+                concurrent_row_landed_in_pending()
             }
-            to attempts_increment_exactly_once {
-                concurrent_attempts_incremented_exactly_once()
-            }
-            to the_row_lands_in_pending { concurrent_row_landed_in_pending() }
         }
     }
 
     // ----- register_worker_blocking matrix --------------------------------
-    expect(run_register(setup).await) {
+    expect(run_register(setup).await) as register {
         let setup = REGISTER_DEFAULT;
 
         when no_incumbent_row_exists_for_the_worker_id {
-            to inserts_a_fresh_row { register_inserted_one_row() }
-            to stores_the_new_lease_token {
+            to inserts_a_fresh_row {
+                register_inserted_one_row(),
                 register_stored_token_equals("new-token")
             }
         }
 
         when an_incumbent_row_exists_with_null_lease_token {
-            // Legacy / dashboard-side row; the UPSERT WHERE clause unblocks via
-            // `lease_token IS NULL` and rotates the token in.
+            // Legacy / dashboard-side row: `lease_token IS NULL` allows
+            // registration to recover prior claims and bind the new token.
             let setup = RegisterSetup {
                 incumbent_lease_token: Some(None),
                 ..REGISTER_DEFAULT
             };
-            to upserts_and_binds_the_lease { register_inserted_one_row() }
-            to rotates_the_token_into_the_row {
+            to upserts_and_binds_the_lease {
+                register_inserted_one_row(),
                 register_stored_token_equals("new-token")
             }
         }
 
         when an_incumbent_row_carries_the_same_lease_token {
             // Same-process reregistration (e.g. retry after transient error)
-            // refreshes the row through the `lease_token = EXCLUDED` arm.
+            // passes the same-token guard and refreshes the row.
             let setup = RegisterSetup {
                 incumbent_lease_token: Some(Some("new-token")),
                 ..REGISTER_DEFAULT
             };
-            to refreshes_the_existing_row { register_inserted_one_row() }
-            to keeps_the_same_lease_token {
+            to refreshes_the_existing_row {
+                register_inserted_one_row(),
                 register_stored_token_equals("new-token")
             }
         }
 
         when an_incumbent_row_is_alive_with_a_different_lease_token {
-            // Live-hijack guard: row is fresh, token differs → UPDATE WHERE
-            // clause filters it out and INSERT also fails ON CONFLICT, so
-            // affected=0 → production raises AlreadyRegistered.
+            // A fresh row with another token fails the allowed guard.
+            // Production returns AlreadyRegistered before the UPSERT;
+            // the adapter maps this rejection to affected=0.
             let setup = RegisterSetup {
                 incumbent_lease_token: Some(Some("incumbent-token")),
                 incumbent_age_secs: 0,
                 ..REGISTER_DEFAULT
             };
-            to refuses_to_overwrite_the_incumbent { register_was_blocked() }
-            to leaves_the_incumbent_token_in_place {
+            to refuses_to_overwrite_the_incumbent {
+                register_was_blocked(),
                 register_stored_token_equals("incumbent-token")
             }
         }
 
         when an_incumbent_row_is_stale_past_the_threshold_with_a_different_token {
-            // Legitimate restart after orphan window: the third WHERE arm
-            // `now() - last_seen >= threshold` lets the takeover through.
+            // After the orphan window, the age guard allows takeover.
+            // Prior owned claims are recovered before the token is replaced.
             let setup = RegisterSetup {
                 incumbent_lease_token: Some(Some("dead-incumbent")),
                 incumbent_age_secs: 120,
                 stale_after_secs: 30,
                 ..REGISTER_DEFAULT
             };
-            to allows_the_takeover { register_inserted_one_row() }
-            to rotates_the_lease_token { register_stored_token_equals("new-token") }
+            to allows_the_takeover {
+                register_inserted_one_row(),
+                register_stored_token_equals("new-token")
+            }
         }
     }
 
     // ----- register_worker_blocking: advisory-lock contention -------------
-    // The `WHERE acquired` CTE gate is a second, distinct path to affected=0
-    // (→ AlreadyRegistered): a peer transaction holding the xact-scoped
-    // `(worker_id, worker_type)` advisory lock makes the in-statement
-    // `pg_try_advisory_xact_lock` return FALSE, so the INSERT-SELECT yields no
-    // row even though no incumbent workers row exists.
-    expect(run_register_under_advisory_contention().await) {
+    // Advisory contention is a second path to AlreadyRegistered, which the
+    // adapter maps to affected=0: a peer holding the xact-scoped
+    // `(worker_id, worker_type)` advisory lock makes the initial
+    // `pg_try_advisory_xact_lock` return FALSE, so registration returns
+    // before reading a worker row or issuing its UPSERT.
+    expect(run_register_under_advisory_contention().await) as register_under_advisory_contention {
         when a_peer_holds_the_registration_advisory_lock {
-            to refuses_to_register_while_the_lock_is_held { register_was_blocked() }
-            to inserts_no_workers_row { register_left_no_row() }
+            to refuses_to_register_while_the_lock_is_held {
+                register_was_blocked(),
+                register_left_no_row()
+            }
         }
     }
 
     // ----- keep_alive matrix ----------------------------------------------
-    expect(run_keep_alive(setup).await) {
+    expect(run_keep_alive(setup).await) as keep_alive {
         let setup = KEEPALIVE_OK;
 
         when the_id_queue_and_lease_token_all_match {
@@ -1581,9 +1646,9 @@ lets_expect! { #tokio_test
                 ..KEEPALIVE_OK
             };
             to is_rejected_because_null_never_equals_a_supplied_token {
-                keep_alive_no_match()
+                keep_alive_no_match(),
+                keep_alive_did_not_refresh()
             }
-            to does_not_refresh_last_seen { keep_alive_did_not_refresh() }
         }
 
         when the_caller_presents_a_different_lease_token {
@@ -1592,9 +1657,9 @@ lets_expect! { #tokio_test
                 ..KEEPALIVE_OK
             };
             to is_rejected_because_the_token_does_not_match {
-                keep_alive_no_match()
+                keep_alive_no_match(),
+                keep_alive_did_not_refresh()
             }
-            to does_not_refresh_last_seen { keep_alive_did_not_refresh() }
         }
 
         when the_caller_targets_a_different_queue {
@@ -1603,9 +1668,9 @@ lets_expect! { #tokio_test
                 ..KEEPALIVE_OK
             };
             to is_rejected_because_worker_type_does_not_match {
-                keep_alive_no_match()
+                keep_alive_no_match(),
+                keep_alive_did_not_refresh()
             }
-            to does_not_refresh_last_seen { keep_alive_did_not_refresh() }
         }
 
         when the_caller_targets_an_unknown_worker_id {
@@ -1613,8 +1678,10 @@ lets_expect! { #tokio_test
                 fabricate_unknown_worker_id: true,
                 ..KEEPALIVE_OK
             };
-            to is_rejected_because_id_does_not_match { keep_alive_no_match() }
-            to does_not_refresh_last_seen { keep_alive_did_not_refresh() }
+            to is_rejected_because_id_does_not_match {
+                keep_alive_no_match(),
+                keep_alive_did_not_refresh()
+            }
         }
     }
 }

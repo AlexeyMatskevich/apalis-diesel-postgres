@@ -36,9 +36,23 @@ use crate::sink::PgSink;
 
 mod ack;
 mod admin;
+#[cfg(all(test, feature = "tokio"))]
+mod async_specs;
 mod error;
 mod fetcher;
+mod lease;
 mod lifecycle;
+#[cfg(all(test, feature = "tokio"))]
+mod query_specs;
+
+#[cfg(all(test, feature = "tokio"))]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+#[cfg(test)]
+#[path = "../tests/support/unreachable.rs"]
+mod unreachable;
+#[cfg(test)]
+extern crate self as apalis_diesel_postgres;
 mod models;
 mod notify_event;
 mod pool;
@@ -95,12 +109,12 @@ pub struct PostgresStorage<
     pub(crate) config: Config,
     pub(crate) fetcher: Fetcher,
     pub(crate) sink: PgSink<Args, Codec>,
-    /// Per-process lease token. Generated at construction (and shared by
-    /// clones via `Arc`) so that the `keep_alive` heartbeat can only be
-    /// refreshed by code holding this storage handle — even if a third party
-    /// learns the `(worker_id, queue)` pair, they cannot extend the heartbeat
-    /// without also possessing the token.
+    /// Registration token generated per storage instance and shared by clones.
+    /// Managed operations check it to fence older registrations. This is not an
+    /// authorization boundary against callers with direct table/pool access.
     pub(crate) lease_token: std::sync::Arc<str>,
+    pub(crate) leases: crate::lease::LeaseRegistry,
+    pub(crate) poll_factory: Option<crate::fetcher::PollStrategyFactory>,
 }
 
 // Manual Unpin requires Fetcher: Unpin so pinning guarantees from a
@@ -127,6 +141,8 @@ impl<Args, Codec, Fetcher: Clone> Clone for PostgresStorage<Args, Codec, Fetcher
             fetcher: self.fetcher.clone(),
             sink: self.sink.clone(),
             lease_token: self.lease_token.clone(),
+            leases: self.leases.clone(),
+            poll_factory: self.poll_factory.clone(),
         }
     }
 }
@@ -135,9 +151,9 @@ impl<Args> PostgresStorage<Args> {
     /// Create storage for the queue named after `Args`.
     ///
     /// **Do not share `pool` with HTTP request handlers or other unrelated
-    /// workloads.** Apalis holds long-lived connections (fetcher, lifecycle
-    /// keep-alive, listener) and a backend that exhausts a shared pool will
-    /// stall the worker, causing heartbeat loss and orphan reenqueue
+    /// workloads.** A notification listener holds one connection for its
+    /// lifetime. Fetch, heartbeat, and ack borrow a connection per operation.
+    /// Exhausting a shared pool can stall these operations and cause orphan reenqueue
     /// cascades. See the README section "Connection pool isolation" for the
     /// recommended sizing and the [`Self::push_with_conn`] outbox API for the
     /// supported way to enqueue from a backend transaction.
@@ -145,9 +161,14 @@ impl<Args> PostgresStorage<Args> {
     pub fn new(pool: &PgPool) -> Self {
         let config = Config::new(std::any::type_name::<Args>());
         Self::new_with_config(pool, &config)
+            .with_poll_strategy_factory(|| Config::default().poll_strategy().clone())
     }
 
     /// Create storage with an explicit Apalis SQL config.
+    ///
+    /// The config carries a single-use polling strategy, shared by its clones.
+    /// Before creating multiple worker streams from this config or storage, set
+    /// [`Self::with_poll_strategy_factory`] to build a fresh strategy per stream.
     ///
     /// **Do not share `pool` with HTTP request handlers or other unrelated
     /// workloads** — see [`Self::new`] for the rationale.
@@ -160,15 +181,22 @@ impl<Args> PostgresStorage<Args> {
             fetcher: PgFetcher::default(),
             sink: PgSink::new(pool, config),
             lease_token: queries::worker::mint_lease_token().into(),
+            leases: Default::default(),
+            poll_factory: None,
         }
     }
 
     /// Create storage that also listens for PostgreSQL notifications.
     ///
+    /// The config carries a single-use polling strategy, shared by its clones.
+    /// Before creating multiple worker streams from this config or storage, set
+    /// [`Self::with_poll_strategy_factory`] to build a fresh strategy per stream.
+    ///
     /// Notify mode uses a dedicated pooled connection for `LISTEN
-    /// "apalis::job::insert"` while the polling stream is alive. **Each
-    /// `new_with_notify` storage spawns one listener thread and pins one
-    /// pool connection.** If you need notify-driven dequeue across many
+    /// "apalis::job::insert"` while the polling stream is alive. **Each active
+    /// worker stream spawns one listener thread and pins one pool connection.**
+    /// Construction alone does not acquire that connection.
+    /// If you need notify-driven dequeue across many
     /// queues, prefer [`crate::SharedPostgresStorage`] — it spawns a single
     /// listener thread shared by all queues registered with it, so the
     /// thread/connection cost stays at one regardless of queue count.
@@ -187,6 +215,8 @@ impl<Args> PostgresStorage<Args> {
             fetcher: PgNotify,
             sink: PgSink::new(pool, config),
             lease_token: queries::worker::mint_lease_token().into(),
+            leases: Default::default(),
+            poll_factory: None,
         }
     }
 
@@ -217,7 +247,35 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
             config: self.config,
             fetcher: self.fetcher,
             lease_token: self.lease_token,
+            leases: self.leases,
+            poll_factory: self.poll_factory,
         }
+    }
+
+    /// Build an independent polling strategy for each worker stream.
+    ///
+    /// Apalis SQL `Config` carries a single-use strategy even when cloned.
+    /// Supply a factory when reusing a configured storage for multiple workers.
+    /// The factory is called once per stream with its own polling context.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use apalis_core::backend::poll_strategy::IntervalStrategy;
+    /// # use apalis_diesel_postgres::{PostgresStorage, PgPool};
+    /// # fn example(pool: &PgPool) {
+    /// let storage = PostgresStorage::<String>::new(pool)
+    ///     .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_secs(1)));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_poll_strategy_factory<F, S>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> S + Send + Sync + 'static,
+        S: apalis_core::backend::poll_strategy::PollStrategy + 'static,
+        S::Stream: Send + 'static,
+    {
+        self.poll_factory = Some(crate::fetcher::PollStrategyFactory::new(factory));
+        self
     }
 
     /// Compose the keep-alive + reenqueue heartbeat stream shared by every
@@ -235,7 +293,12 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
         );
         let reenqueue = queries::reenqueue_orphaned_stream(self.pool.clone(), self.config.clone())
             .map_ok(|_| ());
-        futures::stream::select(keep_alive, reenqueue).boxed()
+        crate::fetcher::LeaseStream::new(
+            futures::stream::select(keep_alive, reenqueue),
+            self.leases.for_worker(worker.name()),
+            false,
+        )
+        .boxed()
     }
 }
 
@@ -259,7 +322,7 @@ where
     /// only see tasks that were actually committed. No manual `pg_notify` is
     /// needed.
     ///
-    /// This is the only synchronous public method in the crate. From an async
+    /// This operation executes synchronous SQL. From an async
     /// context, invoke it on the selected runtime's blocking pool —
     /// `tokio::task::spawn_blocking` with the `tokio` feature, or
     /// `ntex_rt::spawn_blocking` with the `ntex` feature — together with your
@@ -329,7 +392,7 @@ where
     ///
     /// The batch form of [`Self::push_with_conn`]: identical transaction /
     /// NOTIFY contract, but the whole batch is inserted with one statement (one
-    /// round-trip, one NOTIFY) instead of one INSERT per task. Returns the
+    /// round-trip, with bounded NOTIFY chunks) instead of one INSERT per task. Returns the
     /// generated [`PgTaskId`]s in submission order. An empty batch is a no-op
     /// that returns an empty vector.
     ///
@@ -424,10 +487,11 @@ where
     }
 
     fn middleware(&self) -> Self::Layer {
-        PgMiddleware::with_lease_token(
+        PgMiddleware::with_lease_registry(
             &self.pool,
             self.config.ack(),
             std::sync::Arc::clone(&self.lease_token),
+            self.leases.clone(),
         )
     }
 
@@ -436,16 +500,20 @@ where
         // worker's id) so it can fail rows whose payload does not decode —
         // see `queries::fail_undecodable_task`.
         let pool = self.pool.clone();
+        let lease_token = self.lease_token.clone();
+        let lease = self.leases.for_worker(worker.name());
         let compact = self.fetcher.into_compact_stream(
             self.pool,
             self.config,
             worker.clone(),
             self.lease_token,
+            self.poll_factory,
         );
         crate::fetcher::decode_task_stream::<Args, Decode>(
-            compact,
+            crate::fetcher::LeaseStream::new(compact, lease, true).boxed(),
             pool,
             std::sync::Arc::from(worker.name().as_str()),
+            Some(lease_token),
         )
     }
 }
@@ -466,8 +534,15 @@ where
     }
 
     fn poll_compact(self, worker: &WorkerContext) -> Self::CompactStream {
-        self.fetcher
-            .into_compact_stream(self.pool, self.config, worker.clone(), self.lease_token)
+        let lease = self.leases.for_worker(worker.name());
+        let compact = self.fetcher.into_compact_stream(
+            self.pool,
+            self.config,
+            worker.clone(),
+            self.lease_token,
+            self.poll_factory,
+        );
+        crate::fetcher::LeaseStream::new(compact, lease, true).boxed()
     }
 }
 
@@ -478,13 +553,10 @@ mod tests {
         task::status::Status,
     };
     use apalis_sql::{DateTime, DateTimeExt, from_row::FromRowError};
-    use diesel::{
-        PgConnection,
-        r2d2::{ConnectionManager, Pool},
-    };
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
+    use crate::unreachable::unreachable_pool;
 
     fn row(
         id: &str,
@@ -566,14 +638,6 @@ mod tests {
         }
     }
 
-    fn unchecked_pool() -> PgPool {
-        let manager = ConnectionManager::<PgConnection>::new("postgres://127.0.0.1:1/not-used");
-        Pool::builder()
-            .max_size(1)
-            .connection_timeout(std::time::Duration::from_millis(10))
-            .build_unchecked(manager)
-    }
-
     fn storage_uses_queue_and_buffer<Args, Codec, Fetcher>(
         queue: &'static str,
         buffer_size: usize,
@@ -607,12 +671,12 @@ mod tests {
     }
 
     fn storage_for_type_name() -> PostgresStorage<String> {
-        let pool = unchecked_pool();
+        let pool = unreachable_pool();
         PostgresStorage::<String>::new(&pool)
     }
 
     fn storage_for_config(queue: &'static str, buffer_size: usize) -> PostgresStorage<String> {
-        let pool = unchecked_pool();
+        let pool = unreachable_pool();
         let config = Config::new(queue).set_buffer_size(buffer_size);
         PostgresStorage::<String>::new_with_config(&pool, &config)
     }
@@ -621,7 +685,7 @@ mod tests {
         queue: &'static str,
         buffer_size: usize,
     ) -> PostgresStorage<String, JsonCodec<CompactType>, PgNotify> {
-        let pool = unchecked_pool();
+        let pool = unreachable_pool();
         let config = Config::new(queue).set_buffer_size(buffer_size);
         PostgresStorage::<String>::new_with_notify(&pool, &config)
     }
@@ -643,7 +707,7 @@ mod tests {
             Ok(())
         } else {
             Err(AssertionError::new(vec![
-                "clone did not share the per-process lease token".to_owned(),
+                "clone did not share the storage registration lease token".to_owned(),
             ]))
         }
     }
@@ -670,7 +734,7 @@ mod tests {
     fn pin_unit_codec<Fetcher>(_storage: &PostgresStorage<String, (), Fetcher>) {}
 
     fn with_codec_swaps_to_unit_codec() -> String {
-        let pool = unchecked_pool();
+        let pool = unreachable_pool();
         let storage = PostgresStorage::<String>::new(&pool).with_codec::<()>();
         // Compile-time check: this fails to compile if `with_codec::<()>` no
         // longer yields a `()` codec slot, independent of `type_name` formatting.
@@ -769,7 +833,7 @@ mod tests {
             to returns_the_crate_name { equal("apalis-diesel-postgres") }
         }
 
-        expect(row(id, status, run_at, idempotency_key).try_into_task_compact::<Ulid, PgPool>()) {
+        expect(row(id, status, run_at, idempotency_key).try_into_task_compact::<Ulid, PgPool>()) as compact_task_record {
             let id = &Ulid::new().to_string();
             let status = "Pending";
             let run_at = Some(DateTime::now());
@@ -800,7 +864,7 @@ mod tests {
             }
         }
 
-        expect(storage) {
+        expect(storage) as storage_configuration {
             let storage = storage_for_type_name();
 
             when storage_is_built_from_the_task_type {
@@ -821,16 +885,18 @@ mod tests {
 
             when storage_is_cloned {
                 let storage = cloned_storage_for_config("clone-api", 4);
-                to keeps_the_queue_configuration { cloned_storage }
-                to shares_the_per_process_lease_token { shares_lease_token }
+                to preserves_the_configuration_and_registration_identity {
+                    cloned_storage,
+                    shares_lease_token
+                }
             }
         }
 
-        expect(debug_storage()) {
+        expect(debug_storage()) as storage_description {
             to describes_the_storage_without_exposing_the_pool { debug_mentions_public_type }
         }
 
-        expect(storage_with_changed_codec()) {
+        expect(storage_with_changed_codec()) as configured_codec {
             to preserves_the_supplied_config { storage_uses_queue_and_buffer("codec-api", 6) }
         }
 
@@ -838,25 +904,25 @@ mod tests {
         // `PostgresStorage<String, ()>` annotation in the helper; this leaf
         // additionally confirms the swapped storage still constructs with the
         // task-type-derived queue.
-        expect(with_codec_swaps_to_unit_codec()) {
+        expect(with_codec_swaps_to_unit_codec()) as replacement_codec {
             to builds_a_unit_codec_storage_with_the_default_queue {
                 equal(std::any::type_name::<String>().to_owned())
             }
         }
 
-        expect(storage_accessors()) {
+        expect(storage_accessors()) as storage_configuration_access {
             to exposes_the_queue_and_buffer_config { exposes_accessors }
         }
 
-        expect(basic_get_queue()) {
+        expect(basic_get_queue()) as polling_queue {
             to returns_the_basic_queue { equal("basic-queue-api".to_owned()) }
         }
 
-        expect(notify_get_queue()) {
+        expect(notify_get_queue()) as notification_queue {
             to returns_the_notify_queue { equal("notify-queue-api".to_owned()) }
         }
 
-        expect(backend_trait_surfaces(notify)) {
+        expect(backend_trait_surfaces(notify)) as backend_components {
             let notify = false;
 
             when basic_polling_storage {

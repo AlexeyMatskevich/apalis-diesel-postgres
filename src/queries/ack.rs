@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use apalis_core::task::status::Status;
 use diesel::{
-    RunQueryDsl, sql_query,
+    Connection, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text},
 };
 
@@ -24,7 +24,7 @@ pub(crate) struct AckTaskUpdate {
     /// worker_id, lock_at, attempts)`. When `None`, ack falls back to the
     /// pre-lease-token predicate (callers without a token, e.g. admin).
     ///
-    /// Held as `Arc<str>` (the storage's per-process token) so the ack path
+    /// Held as `Arc<str>` (the storage's registration token) so the ack path
     /// forwards a cheap refcount clone rather than allocating a fresh `String`
     /// on every acknowledgement; it is bound to SQL by reference below.
     pub(crate) lease_token: Option<Arc<str>>,
@@ -35,46 +35,51 @@ pub(crate) fn ack_task(
     update: AckTaskUpdate,
 ) -> impl Future<Output = Result<(), Error>> + Send {
     with_conn(pool, move |conn| {
-        let task_id = update.task_id.to_string();
-        let queue = update.queue;
-        let worker_id = update.worker_id;
-        // `$9::text IS NULL` short-circuits the EXISTS check for callers that
-        // didn't supply a token; passing a token therefore adds defense in
-        // depth without breaking pre-token call sites (tests, admin tooling).
-        let count = sql_query(
-            "UPDATE apalis.jobs
-             SET status = $1, attempts = $2, last_result = $3, done_at = now()
+        conn.transaction(|conn| {
+            if update.lease_token.is_some()
+                && !super::worker::lock_current_worker(
+                    conn,
+                    &update.worker_id,
+                    &update.queue,
+                    update.lease_token.as_deref(),
+                )?
+            {
+                return Err(Error::stale_acknowledgement(
+                    update.task_id.to_string(),
+                    update.queue,
+                    update.worker_id,
+                ));
+            }
+            let task_id = update.task_id.to_string();
+            let queue = update.queue;
+            let worker_id = update.worker_id;
+            // The worker lock above remains held until this update commits.
+            let count = sql_query(
+                "UPDATE apalis.jobs
+             SET status = $1, attempts = $2, last_result = $3, done_at = clock_timestamp()
              WHERE id = $4
                  AND job_type = $5
                  AND lock_by = $6
                  AND lock_at = to_timestamp($7::double precision)
                  AND attempts = $8
                  AND status = 'Running'
-                 AND (
-                     $9::text IS NULL
-                     OR EXISTS (
-                         SELECT 1 FROM apalis.workers
-                         WHERE id = $6 AND worker_type = $5
-                             AND lease_token = $9
-                         FOR SHARE
-                     )
-                 )",
-        )
-        .bind::<Text, _>(update.status.to_string())
-        .bind::<Integer, _>(update.attempts)
-        .bind::<Nullable<Jsonb>, _>(update.result)
-        .bind::<Text, _>(&task_id)
-        .bind::<Text, _>(&queue)
-        .bind::<Text, _>(&worker_id)
-        .bind::<BigInt, _>(update.lock_at)
-        .bind::<Integer, _>(update.started_attempts)
-        .bind::<Nullable<Text>, _>(update.lease_token.as_deref())
-        .execute(conn)
-        .map_err(Error::database("acknowledging task"))?;
-        if count == 0 {
-            Err(Error::stale_acknowledgement(task_id, queue, worker_id))
-        } else {
-            Ok(())
-        }
+                 ",
+            )
+            .bind::<Text, _>(update.status.to_string())
+            .bind::<Integer, _>(update.attempts)
+            .bind::<Nullable<Jsonb>, _>(update.result)
+            .bind::<Text, _>(&task_id)
+            .bind::<Text, _>(&queue)
+            .bind::<Text, _>(&worker_id)
+            .bind::<BigInt, _>(update.lock_at)
+            .bind::<Integer, _>(update.started_attempts)
+            .execute(conn)
+            .map_err(Error::database("acknowledging task"))?;
+            if count == 0 {
+                Err(Error::stale_acknowledgement(task_id, queue, worker_id))
+            } else {
+                Ok(())
+            }
+        })
     })
 }

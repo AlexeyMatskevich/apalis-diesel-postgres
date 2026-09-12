@@ -1,63 +1,8 @@
-//! Exhaustive specification for `src/queries/fetch.rs::fetch_next`.
-//!
-//! `fetch_next` is `pub(crate)`, so this integration test crate cannot call it
-//! directly. Instead, the helper `fetch_next_sql` below *mirrors* the
-//! production function's claim/update CTE — the same `CLAIMABLE_PREDICATE`,
-//! `run_at <= now()` filter, `ORDER BY priority DESC, run_at ASC`, `LIMIT`, and
-//! `FOR UPDATE SKIP LOCKED` — and pins the resulting row-level behaviour. It is
-//! deliberately *not* byte-equal to production: `fetch_next` returns `RETURNING
-//! apalis.jobs.*` into a full `JobRow`, whereas this mirror projects only the
-//! derived columns under assertion. Any drift in the production claim/update SQL
-//! must be reflected here in lock-step.
-//!
-//! Behaviour already covered elsewhere is not re-tested here:
-//!   - basic push → poll ordering (oldest first, delayed deferred) →
-//!     `postgres_queries::run_push_fetch`
-//!   - priority DESC then run_at ASC → `postgres_queries::run_priority_ordering`
-//!   - FOR UPDATE SKIP LOCKED concurrency → `postgres_queries::run_skip_locked_concurrency`
-//!   - `buffer_size = 0` clamped to 1 → `postgres_queries::run_zero_buffer_fetch`
-//!   - `fetch_by_id` cross-queue isolation → `postgres_queries::run_fetch_by_id_cross_queue`
-//!   - `lock_task` per-status matrix → `postgres_queries::run_lock_status_scenario`
-//!   - failed retryable round-trip via poll → `postgres_specs::run_failed_retry`
-//!
-//! The characteristics pinned in this file are those *not* covered above and
-//! that follow directly from the `fetch_next` SQL:
-//!   1. Empty queue → empty Vec.
-//!   2. `buffer_size > available` → returns all available, no padding.
-//!   3. LIMIT clamps when `buffer_size < available`.
-//!   4. Cross-queue isolation: a sibling queue's claimable rows are invisible.
-//!   5. A `run_at` at-or-just-before `now()` is claimable — the inclusive
-//!      (`run_at <= now()`) boundary direction. Exact `run_at = now()` equality
-//!      is not asserted: insert-time `now()` is already slightly in the past by
-//!      the time fetch runs (see `run_run_at_boundary`).
-//!   6. Tie-break on equal priority falls back to `run_at ASC`.
-//!   7. Per-status predicate matrix for *fetch* (distinct from `lock_task`):
-//!      Pending claimable; Failed retryable claimable; Failed exhausted, Queued,
-//!      Running, Done, Killed all rejected.
-//!   8. H4 invariant: a successfully claimed row transitions to `Running` with
-//!      `lock_by = worker`, `lock_at` set, and `done_at = NULL` — straight from
-//!      the production CTE.
-//!   9. `fail_undecodable_task` claim-epoch predicate: the decode-failure
-//!      release applies only to the caller's own live claim; rows that were
-//!      acked, swept, or re-claimed (other worker / later epoch / advanced
-//!      attempts) in the meantime are untouched. `postgres_queries`'s
-//!      decode_release specs also drive the positive direction through the
-//!      public poll API, but the claim-epoch negatives cannot be reached
-//!      deterministically from there.
-//!  10. `fail_undecodable_task` retry-budget CASE and overflow-safe
-//!      arithmetic, pinned directly against this SQL because the epoch harness
-//!      above fixes `max_attempts = 25` and so can only ever reach the `Failed`
-//!      arm: the `attempts::bigint + 1 >= max_attempts` boundary flips the row
-//!      to `Killed`, `LEAST(attempts::bigint + 1, max_attempts)` clamps the
-//!      stored attempts to the budget, and an `attempts = i32::MAX` row is
-//!      released without an "integer out of range" overflow.
-//!
-//! Tests gate on `DATABASE_URL`; without it every scenario resolves to
-//! `Outcome::Skipped` and the assertions pass.
+//! Production-bound database specifications; SQL is used only for fixtures and observations.
 
 #![cfg(feature = "tokio")]
 
-mod support;
+use crate::test_support as support;
 
 use support::{Outcome, observe, with_conn};
 
@@ -67,7 +12,7 @@ use apalis_core::task::task_id::TaskId;
 use apalis_diesel_postgres::{PgPool, PgTaskId};
 use diesel::{
     QueryableByName, RunQueryDsl, sql_query,
-    sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text},
+    sql_types::{BigInt, Integer, Jsonb, Nullable, Text},
 };
 use lets_expect::{AssertionResult, *};
 use ulid::Ulid;
@@ -108,8 +53,8 @@ async fn insert_worker(pool: PgPool, queue: String, worker_id: String) -> Result
 }
 
 /// Insert a fully-described row, including offsets for `run_at` (seconds
-/// relative to `now()`) and an optional priority. `lock_by` is left NULL so the
-/// FK does not require a workers row for these inserts.
+/// relative to `now()`) and a priority. Active rows belong to a registered
+/// fixture worker; other states retain their unowned setup.
 #[allow(clippy::too_many_arguments)]
 async fn insert_row(
     pool: PgPool,
@@ -124,11 +69,19 @@ async fn insert_row(
     let id = Ulid::new();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
+    let owner = if matches!(status, "Queued" | "Running") {
+        let owner = format!("seeded-owner-{id}");
+        insert_worker(pool.clone(), queue.clone(), owner.clone()).await?;
+        Some(owner)
+    } else {
+        None
+    };
     with_conn(pool, move |conn| {
         sql_query(
             "INSERT INTO apalis.jobs (
-                id, job_type, job, status, attempts, max_attempts, run_at, priority
-            ) VALUES ($1, $2, $3, $4, $5, $6, now() + ($7 * INTERVAL '1 second'), $8)",
+                id, job_type, job, status, attempts, max_attempts, run_at, priority, lock_by, lock_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, now() + ($7 * INTERVAL '1 second'), $8, $9,
+                CASE WHEN $9 IS NOT NULL THEN date_trunc('second', clock_timestamp()) ELSE NULL END)",
         )
         .bind::<Text, _>(id.to_string())
         .bind::<Text, _>(queue)
@@ -138,6 +91,7 @@ async fn insert_row(
         .bind::<Integer, _>(max_attempts)
         .bind::<Integer, _>(run_at_offset_secs as i32)
         .bind::<Integer, _>(priority)
+        .bind::<Nullable<Text>, _>(owner)
         .execute(conn)
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -164,63 +118,29 @@ struct FetchedRow {
 }
 
 // --------------------------------------------------------------------------
-// SQL mirror of `src/queries/fetch.rs::fetch_next`.
-//
-// IMPORTANT: keep the claim/update CTE — predicate, `run_at <= now()` filter,
-// ordering, `LIMIT`, and `FOR UPDATE SKIP LOCKED` — in lock-step with the
-// production SQL. The final SELECT intentionally projects only the derived
-// columns under assertion, so this helper is NOT byte-equal to production's
-// `RETURNING apalis.jobs.*`. `CLAIMABLE_PREDICATE` is inlined here since it is
-// `pub(crate)` in production.
-// --------------------------------------------------------------------------
-
-const CLAIMABLE_PREDICATE: &str =
-    "(status = 'Pending' OR (status = 'Failed' AND attempts < max_attempts))";
-
+// Production query adapters: observe returned tasks without copying SQL.
 async fn fetch_next_sql(
     pool: PgPool,
     queue: String,
     worker_id: String,
     buffer_size: i32,
 ) -> Result<Vec<FetchedRow>, String> {
-    with_conn(pool, move |conn| {
-        sql_query(format!(
-            "WITH next_jobs AS (
-                 SELECT id
-                 FROM apalis.jobs
-                 WHERE {CLAIMABLE_PREDICATE}
-                     AND run_at <= now()
-                     AND job_type = $2
-                 ORDER BY priority DESC, run_at ASC
-                 LIMIT $3
-                 FOR UPDATE SKIP LOCKED
-             ),
-             updated AS (
-                 UPDATE apalis.jobs
-                 SET status = 'Running',
-                     lock_by = $1,
-                     lock_at = date_trunc('second', now()),
-                     done_at = NULL
-                 FROM next_jobs
-                 WHERE apalis.jobs.id = next_jobs.id
-                 RETURNING apalis.jobs.*
-             )
-             SELECT id::text AS id,
-                    status,
-                    lock_by,
-                    (lock_at IS NOT NULL) AS lock_at_present,
-                    (done_at IS NULL) AS done_at_null,
-                    priority
-             FROM updated
-             ORDER BY priority DESC, run_at ASC"
-        ))
-        .bind::<Text, _>(&worker_id)
-        .bind::<Text, _>(&queue)
-        .bind::<Integer, _>(buffer_size)
-        .load::<FetchedRow>(conn)
-        .map_err(|e| e.to_string())
-    })
-    .await
+    let worker = apalis_core::worker::context::WorkerContext::new::<()>(&worker_id);
+    let config = crate::Config::new(&queue).set_buffer_size(buffer_size as usize);
+    crate::queries::fetch_next(pool, config, worker, None)
+        .await
+        .map(|tasks| tasks.into_iter().map(observe_fetched).collect())
+        .map_err(|error| error.to_string())
+}
+fn observe_fetched(task: crate::PgTask<crate::CompactType>) -> FetchedRow {
+    FetchedRow {
+        id: task.parts.task_id.unwrap().to_string(),
+        status: task.parts.status.load().to_string(),
+        lock_by: task.parts.ctx.lock_by().clone(),
+        lock_at_present: task.parts.ctx.lock_at().is_some(),
+        done_at_null: task.parts.ctx.done_at().is_none(),
+        priority: task.parts.ctx.priority(),
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -431,13 +351,6 @@ struct StatusSetup {
     run_at_offset_secs: i64,
 }
 
-const STATUS_PENDING_DUE: StatusSetup = StatusSetup {
-    status: "Pending",
-    attempts: 0,
-    max_attempts: 25,
-    run_at_offset_secs: -1,
-};
-
 async fn run_status_matrix(setup: StatusSetup) -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
@@ -577,21 +490,21 @@ fn claimed_row_transitioned_to_running()
 
 lets_expect! { #tokio_test
     // ----- 1. empty queue --------------------------------------------------
-    expect(run_empty_queue().await) {
+    expect(run_empty_queue().await) as empty_queue {
         when the_queue_holds_no_rows {
             to returns_an_empty_vec { fetched_no_rows() }
         }
     }
 
     // ----- 2./3. buffer vs available --------------------------------------
-    expect(run_buffer_sizes(buffer_size, seed_count).await) {
+    expect(run_buffer_sizes(buffer_size, seed_count).await) as buffer_sizes {
         let buffer_size = 5_i32;
         let seed_count = 2_usize;
 
         when the_buffer_is_larger_than_the_available_rows {
-            to returns_all_available_rows_without_padding { fetched_row_count(2) }
-            to returns_every_seeded_id { all_seeded_ids_returned() }
-            to leaves_each_claimed_row_in_running_state {
+            to returns_all_available_rows_without_padding {
+                fetched_row_count(2),
+                all_seeded_ids_returned(),
                 claimed_row_transitioned_to_running()
             }
         }
@@ -604,25 +517,29 @@ lets_expect! { #tokio_test
     }
 
     // ----- 4. cross-queue isolation ---------------------------------------
-    expect(run_cross_queue_isolation().await) {
+    expect(run_cross_queue_isolation().await) as cross_queue_isolation {
         when a_sibling_queue_holds_its_own_claimable_pending_row {
-            to returns_only_the_target_queues_row { fetched_row_count(1) }
-            to does_not_leak_the_sibling_queues_id { no_foreign_ids_returned() }
-            to returns_the_target_queues_seeded_id { all_seeded_ids_returned() }
+            to returns_only_the_target_queues_row {
+                fetched_row_count(1),
+                no_foreign_ids_returned(),
+                all_seeded_ids_returned()
+            }
         }
     }
 
     // ----- 5. run_at boundary ---------------------------------------------
-    expect(run_run_at_boundary().await) {
+    expect(run_run_at_boundary().await) as run_at_boundary {
         when run_at_is_already_past_due {
             // run_at is slightly in the past by fetch time — the <= now() (past-due) direction; exact equality is not pinned (see module docstring lines 30-32).
-            to claims_the_row { fetched_row_count(1) }
-            to returns_the_seeded_id { all_seeded_ids_returned() }
+            to claims_the_row {
+                fetched_row_count(1),
+                all_seeded_ids_returned()
+            }
         }
     }
 
     // ----- 6. equal priority tie-break ------------------------------------
-    expect(run_equal_priority_tie_break().await) {
+    expect(run_equal_priority_tie_break().await) as equal_priority_tie_break {
         when two_pending_rows_share_the_same_priority {
             // seeded_ids is built as [older, newer] in the harness; this is
             // the canonical priority-DESC, run_at-ASC ordering.
@@ -633,82 +550,55 @@ lets_expect! { #tokio_test
     }
 
     // ----- 7. status predicate matrix -------------------------------------
-    expect(run_status_matrix(setup).await) {
-        let setup = STATUS_PENDING_DUE;
-
-        when the_row_is_pending_with_a_past_run_at {
-            to claims_the_row { fetched_row_count(1) }
-            to writes_the_h4_running_invariant {
-                claimed_row_transitioned_to_running()
+    expect(run_status_matrix(setup).await) as polled_task_eligibility {
+        let status="Pending";
+        let attempts=0;
+        let run_at_offset_secs=-10;
+        let setup=StatusSetup{status,attempts,max_attempts:3,run_at_offset_secs};
+        to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+        when exactly_one_attempt_remains {
+            let attempts=2;
+            to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+        }
+        when the_attempt_budget_is_exhausted {
+            let attempts=3;
+            to refuses_a_new_execution { fetched_no_rows() }
+        }
+        when the_task_is_scheduled_for_the_future {
+            let run_at_offset_secs=3600;
+            to leaves_the_task_scheduled { fetched_no_rows() }
+        }
+        when the_task_failed_previously {
+            let status="Failed";
+            to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            when exactly_one_attempt_remains {
+                let attempts=2;
+                to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            }
+            when the_attempt_budget_is_exhausted {
+                let attempts=3;
+                to refuses_a_new_execution { fetched_no_rows() }
+            }
+            when the_task_is_scheduled_for_the_future {
+                let run_at_offset_secs=3600;
+                to leaves_the_task_scheduled { fetched_no_rows() }
             }
         }
-
-        when the_row_is_pending_but_scheduled_in_the_future {
-            let setup = StatusSetup { run_at_offset_secs: 3600, ..STATUS_PENDING_DUE };
-            to leaves_the_row_alone { fetched_no_rows() }
+        when the_task_is_queued {
+            let status="Queued";
+            to refuses_a_new_execution { fetched_no_rows() }
         }
-
-        when the_row_is_failed_with_retries_left {
-            let setup = StatusSetup {
-                status: "Failed",
-                attempts: 1,
-                max_attempts: 3,
-                ..STATUS_PENDING_DUE
-            };
-            to is_picked_up_for_a_retry { fetched_row_count(1) }
-            to writes_the_h4_running_invariant {
-                claimed_row_transitioned_to_running()
-            }
+        when the_task_is_running {
+            let status="Running";
+            to refuses_a_new_execution { fetched_no_rows() }
         }
-
-        when the_row_is_failed_with_exactly_one_retry_left {
-            // Boundary-Value-Analysis of `attempts < max_attempts` (fetch.rs):
-            // attempts == max_attempts - 1 is the last claimable value. A
-            // `< max_attempts - 1` off-by-one would refuse this row while
-            // leaving the inside (1/3) and outside (3/3) leaves green, so pin
-            // the boundary explicitly. (Verified to fail under that mutant.)
-            let setup = StatusSetup {
-                status: "Failed",
-                attempts: 2,
-                max_attempts: 3,
-                ..STATUS_PENDING_DUE
-            };
-            to is_picked_up_for_a_retry { fetched_row_count(1) }
-            to writes_the_h4_running_invariant {
-                claimed_row_transitioned_to_running()
-            }
+        when the_task_is_done {
+            let status="Done";
+            to refuses_a_new_execution { fetched_no_rows() }
         }
-
-        when the_row_is_failed_with_the_retry_budget_exhausted {
-            let setup = StatusSetup {
-                status: "Failed",
-                attempts: 3,
-                max_attempts: 3,
-                ..STATUS_PENDING_DUE
-            };
-            to refuses_to_reclaim_it { fetched_no_rows() }
-        }
-
-        when the_row_is_already_queued {
-            // Queued is outside `fetch_next`'s narrower predicate; only
-            // `lock_task` re-locks Queued rows owned by the same worker.
-            let setup = StatusSetup { status: "Queued", ..STATUS_PENDING_DUE };
-            to refuses_to_reclaim_it { fetched_no_rows() }
-        }
-
-        when the_row_is_already_running {
-            let setup = StatusSetup { status: "Running", ..STATUS_PENDING_DUE };
-            to refuses_to_reclaim_it { fetched_no_rows() }
-        }
-
-        when the_row_is_done {
-            let setup = StatusSetup { status: "Done", ..STATUS_PENDING_DUE };
-            to refuses_to_reclaim_it { fetched_no_rows() }
-        }
-
-        when the_row_is_killed {
-            let setup = StatusSetup { status: "Killed", ..STATUS_PENDING_DUE };
-            to refuses_to_reclaim_it { fetched_no_rows() }
+        when the_task_is_killed {
+            let status="Killed";
+            to refuses_a_new_execution { fetched_no_rows() }
         }
     }
 }
@@ -735,44 +625,10 @@ async fn queue_by_id_sql(
     worker_id: String,
     ids: Vec<String>,
 ) -> Result<Vec<FetchedRow>, String> {
-    with_conn(pool, move |conn| {
-        sql_query(format!(
-            "WITH candidates AS (
-                 SELECT id
-                 FROM apalis.jobs
-                 WHERE {CLAIMABLE_PREDICATE}
-                     AND run_at <= now()
-                     AND job_type = $2
-                     AND id = ANY($3)
-                 ORDER BY priority DESC, run_at ASC
-                 FOR UPDATE SKIP LOCKED
-             ),
-             updated AS (
-                 UPDATE apalis.jobs
-                 SET status = 'Running',
-                     lock_at = date_trunc('second', now()),
-                     lock_by = $1,
-                     done_at = NULL
-                 FROM candidates
-                 WHERE apalis.jobs.id = candidates.id
-                 RETURNING apalis.jobs.*
-             )
-             SELECT id::text AS id,
-                    status,
-                    lock_by,
-                    (lock_at IS NOT NULL) AS lock_at_present,
-                    (done_at IS NULL) AS done_at_null,
-                    priority
-             FROM updated
-             ORDER BY priority DESC, run_at ASC"
-        ))
-        .bind::<Text, _>(&worker_id)
-        .bind::<Text, _>(&queue)
-        .bind::<Array<Text>, _>(ids)
-        .load::<FetchedRow>(conn)
-        .map_err(|e| e.to_string())
-    })
-    .await
+    crate::queries::fetch::queue_by_id(pool, queue, ids, worker_id, None)
+        .await
+        .map(|tasks| tasks.into_iter().map(observe_fetched).collect())
+        .map_err(|error| error.to_string())
 }
 
 async fn run_queue_by_id_eligibility(setup: StatusSetup) -> Result<Outcome<FetchRun>, String> {
@@ -1023,69 +879,91 @@ async fn run_queue_by_id_partial_claim() -> Result<Outcome<FetchRun>, String> {
 
 lets_expect! { #tokio_test
     // ----- eligibility predicate is wired into the id-path ------------------
-    expect(run_queue_by_id_eligibility(setup).await) {
-        let setup = STATUS_PENDING_DUE;
-
-        when a_listed_id_is_pending_and_due {
-            to claims_the_row { fetched_row_count(1) }
-            to writes_the_h4_running_invariant { claimed_row_transitioned_to_running() }
+    expect(run_queue_by_id_eligibility(setup).await) as notified_task_eligibility {
+        let status="Pending";
+        let attempts=0;
+        let run_at_offset_secs=-10;
+        let setup=StatusSetup{status,attempts,max_attempts:3,run_at_offset_secs};
+        to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+        when exactly_one_attempt_remains {
+            let attempts=2;
+            to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
         }
-
-        when a_listed_id_is_failed_with_retries_left {
-            let setup = StatusSetup {
-                status: "Failed",
-                attempts: 1,
-                max_attempts: 3,
-                ..STATUS_PENDING_DUE
-            };
-            to claims_the_row_for_a_retry { fetched_row_count(1) }
+        when the_attempt_budget_is_exhausted {
+            let attempts=3;
+            to refuses_a_new_execution { fetched_no_rows() }
         }
-
-        when a_listed_id_is_failed_with_the_retry_budget_exhausted {
-            let setup = StatusSetup {
-                status: "Failed",
-                attempts: 3,
-                max_attempts: 3,
-                ..STATUS_PENDING_DUE
-            };
-            to refuses_to_claim_it { fetched_no_rows() }
+        when the_task_is_scheduled_for_the_future {
+            let run_at_offset_secs=3600;
+            to leaves_the_task_scheduled { fetched_no_rows() }
         }
-
-        when a_listed_id_is_scheduled_in_the_future {
-            let setup = StatusSetup { run_at_offset_secs: 3600, ..STATUS_PENDING_DUE };
-            to refuses_to_claim_it { fetched_no_rows() }
+        when the_task_failed_previously {
+            let status="Failed";
+            to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            when exactly_one_attempt_remains {
+                let attempts=2;
+                to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            }
+            when the_attempt_budget_is_exhausted {
+                let attempts=3;
+                to refuses_a_new_execution { fetched_no_rows() }
+            }
+            when the_task_is_scheduled_for_the_future {
+                let run_at_offset_secs=3600;
+                to leaves_the_task_scheduled { fetched_no_rows() }
+            }
+        }
+        when the_task_is_queued {
+            let status="Queued";
+            to refuses_a_new_execution { fetched_no_rows() }
+        }
+        when the_task_is_running {
+            let status="Running";
+            to refuses_a_new_execution { fetched_no_rows() }
+        }
+        when the_task_is_done {
+            let status="Done";
+            to refuses_a_new_execution { fetched_no_rows() }
+        }
+        when the_task_is_killed {
+            let status="Killed";
+            to refuses_a_new_execution { fetched_no_rows() }
         }
     }
 
     // ----- the id-membership filter ($3) ------------------------------------
-    expect(run_queue_by_id_skips_unlisted().await) {
+    expect(run_queue_by_id_skips_unlisted().await) as queue_by_id_skips_unlisted {
         when an_eligible_row_in_the_queue_is_absent_from_the_id_list {
-            to claims_only_the_listed_id { fetched_row_count(1) }
-            to returns_the_listed_id { all_seeded_ids_returned() }
-            to leaves_the_unlisted_row_unclaimed { no_foreign_ids_returned() }
+            to claims_only_the_listed_id {
+                fetched_row_count(1),
+                all_seeded_ids_returned(),
+                no_foreign_ids_returned()
+            }
         }
     }
 
     // ----- queue scope at the claim layer -----------------------------------
-    expect(run_queue_by_id_cross_queue().await) {
+    expect(run_queue_by_id_cross_queue().await) as queue_by_id_cross_queue {
         when a_listed_id_belongs_to_a_different_queue {
             to refuses_to_claim_across_the_queue_boundary { fetched_no_rows() }
         }
     }
 
     // ----- ordering across listed ids ---------------------------------------
-    expect(run_queue_by_id_ordering().await) {
+    expect(run_queue_by_id_ordering().await) as queue_by_id_ordering {
         when several_listed_ids_carry_different_priorities {
             to returns_them_priority_desc_then_run_at_asc { returned_ids_match_seeded_order() }
         }
     }
 
     // ----- partial claim ----------------------------------------------------
-    expect(run_queue_by_id_partial_claim().await) {
+    expect(run_queue_by_id_partial_claim().await) as queue_by_id_partial_claim {
         when the_id_list_mixes_claimable_and_terminal_rows {
-            to claims_only_the_claimable_subset { fetched_row_count(2) }
-            to returns_both_claimable_ids { all_seeded_ids_returned() }
-            to skips_the_terminal_row { no_foreign_ids_returned() }
+            to claims_only_the_claimable_subset {
+                fetched_row_count(2),
+                all_seeded_ids_returned(),
+                no_foreign_ids_returned()
+            }
         }
     }
 }
@@ -1120,31 +998,17 @@ async fn fail_undecodable_sql(
     attempts: i32,
     error_json: serde_json::Value,
 ) -> Result<usize, String> {
-    with_conn(pool, move |conn| {
-        sql_query(
-            "UPDATE apalis.jobs
-             SET status = CASE
-                     WHEN attempts::bigint + 1 >= max_attempts THEN 'Killed'
-                     ELSE 'Failed'
-                 END,
-                 attempts = LEAST(attempts::bigint + 1, max_attempts),
-                 done_at = now(),
-                 last_result = $3
-             WHERE id = $1
-                 AND status = 'Running'
-                 AND lock_by = $2
-                 AND lock_at = to_timestamp($4::double precision)
-                 AND attempts = $5",
-        )
-        .bind::<Text, _>(&task_id)
-        .bind::<Text, _>(&worker_id)
-        .bind::<Jsonb, _>(error_json)
-        .bind::<BigInt, _>(lock_at_epoch)
-        .bind::<Integer, _>(attempts)
-        .execute(conn)
-        .map_err(|e| e.to_string())
-    })
+    crate::queries::fail_undecodable_task(
+        pool,
+        PgTaskId::new(task_id.parse::<ulid::Ulid>().map_err(|e| e.to_string())?),
+        worker_id,
+        lock_at_epoch,
+        attempts,
+        error_json["Err"].as_str().unwrap().to_owned(),
+        None,
+    )
     .await
+    .map_err(|e| e.to_string())
 }
 
 /// Insert a row in an arbitrary lock state. `max_attempts` is fixed at 25:
@@ -1475,7 +1339,7 @@ fn release_skips_the_row(
 }
 
 lets_expect! { #tokio_test
-    expect(run_fail_undecodable(setup).await) {
+    expect(run_fail_undecodable(setup).await) as fail_undecodable {
         let setup = "live_claim";
 
         when the_release_matches_the_callers_live_claim {
@@ -1523,7 +1387,7 @@ lets_expect! { #tokio_test
 
 lets_expect! { #tokio_test
     // ----- retry-budget CASE + LEAST clamp + overflow safety ----------------
-    expect(run_fail_undecodable_budget(setup).await) {
+    expect(run_fail_undecodable_budget(setup).await) as fail_undecodable_budget {
         let setup = BudgetSetup { attempts: 0, max_attempts: 3 };
 
         when the_incremented_attempt_stays_below_the_budget {

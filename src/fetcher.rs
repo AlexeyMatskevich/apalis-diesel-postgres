@@ -14,7 +14,7 @@ use apalis_core::{
     backend::{
         TaskStream,
         codec::Codec,
-        poll_strategy::{PollContext, PollStrategyExt},
+        poll_strategy::{PollContext, PollStrategy, PollStrategyExt},
     },
     task::Task,
     timer::Delay,
@@ -69,71 +69,96 @@ where
 ///
 /// Decode runs *after* the dequeue SQL has already claimed the row as
 /// `Running`, so a decode failure must not just surface the error: it also
-/// fails the claimed row (best-effort) via `fail_undecodable_task`, otherwise
+/// fails the claimed row via `fail_undecodable_task`, otherwise
 /// the row would stay `Running` for as long as this worker keeps heartbeating
 /// — unackable (ack needs a decoded task) and invisible to orphan recovery
 /// (which only reclaims rows of stale workers).
+/// A failed release remains owned by this stream. Database errors are yielded
+/// with bounded retry pacing; only a successful or stale release discharges the
+/// obligation and emits the original codec error before continuing the batch.
 pub(crate) fn decode_task_stream<Args, Decode>(
     compact: TaskStream<PgTask<CompactType>, Error>,
     pool: PgPool,
     worker_id: Arc<str>,
+    lease_token: Option<Arc<str>>,
 ) -> TaskStream<PgTask<Args>, Error>
 where
     Args: Send + 'static,
     Decode: Codec<Args, Compact = CompactType> + 'static,
     Decode::Error: std::error::Error + Send + Sync + 'static,
 {
-    compact
-        .then(move |row| {
-            // Both handles are only consumed on the rare decode-error path, but
-            // each yielded future needs its own copy. `PgPool` is Arc-backed and
-            // `worker_id` is `Arc<str>`, so these per-row clones are refcount
-            // bumps — the previous `String` `worker_id` allocated on every row.
+    struct ReleaseObligation {
+        task_id: PgTaskId,
+        lock_at: i64,
+        attempts: i32,
+        decode_error: Error,
+        retry: bool,
+    }
+
+    stream::unfold(
+        (compact, None::<ReleaseObligation>),
+        move |(mut compact, mut release)| {
             let pool = pool.clone();
-            let worker_id = Arc::clone(&worker_id);
+            let worker_id = worker_id.clone();
+            let lease_token = lease_token.clone();
             async move {
-                match row {
-                    Ok(Some(task)) => {
-                        // Claim-epoch identity for the release predicate: the
-                        // decode stage runs before the worker increments the
-                        // attempt counter, so `attempt.current()` still holds
-                        // the row's stored value from the claim.
-                        let task_id = task.parts.task_id;
-                        let lock_at = *task.parts.ctx.lock_at();
-                        let attempts = i32::try_from(task.parts.attempt.current());
-                        match task
-                            .try_map(|t| Decode::decode(&t).map_err(|e| Error::Decode(e.into())))
+                loop {
+                    if let Some(mut obligation) = release.take() {
+                        if obligation.retry {
+                            Delay::new(Duration::from_millis(100)).await;
+                        }
+                        match queries::fail_undecodable_task(
+                            pool.clone(),
+                            obligation.task_id,
+                            worker_id.to_string(),
+                            obligation.lock_at,
+                            obligation.attempts,
+                            obligation.decode_error.to_string(),
+                            lease_token,
+                        )
+                        .await
                         {
-                            Ok(decoded) => Ok(Some(decoded)),
+                            Ok(_) => return Some((Err(obligation.decode_error), (compact, None))),
                             Err(error) => {
-                                // Best-effort: the decode error is the primary
-                                // signal and must surface either way; a missing
-                                // claim identity or a failed UPDATE falls back
-                                // to the pre-release behaviour (stranded until
-                                // the worker stops heartbeating).
-                                if let (Some(task_id), Some(lock_at), Ok(attempts)) =
-                                    (task_id, lock_at, attempts)
-                                {
-                                    let _ = queries::fail_undecodable_task(
-                                        pool,
-                                        task_id,
-                                        worker_id.to_string(),
-                                        lock_at,
-                                        attempts,
-                                        error.to_string(),
-                                    )
-                                    .await;
-                                }
-                                Err(error)
+                                obligation.retry = true;
+                                return Some((Err(error), (compact, Some(obligation))));
                             }
                         }
                     }
-                    Ok(None) => Ok(None),
-                    Err(error) => Err(error),
+                    let row = compact.next().await?;
+                    match row {
+                        Ok(Some(task)) => {
+                            let identity = (
+                                task.parts.task_id,
+                                *task.parts.ctx.lock_at(),
+                                i32::try_from(task.parts.attempt.current()),
+                            );
+                            match task.try_map(|t| {
+                                Decode::decode(&t).map_err(|e| Error::Decode(e.into()))
+                            }) {
+                                Ok(decoded) => return Some((Ok(Some(decoded)), (compact, None))),
+                                Err(decode_error) => match identity {
+                                    (Some(task_id), Some(lock_at), Ok(attempts)) => {
+                                        release = Some(ReleaseObligation {
+                                            task_id,
+                                            lock_at,
+                                            attempts,
+                                            decode_error,
+                                            retry: false,
+                                        });
+                                    }
+                                    _ => return Some((Err(decode_error), (compact, None))),
+                                },
+                            }
+                        }
+                        Ok(None) => return Some((Ok(None), (compact, None))),
+                        Err(error) => return Some((Err(error), (compact, None))),
+                    }
                 }
             }
-        })
-        .boxed()
+        },
+    )
+    .boxed()
 }
 
 impl PgFetcherSource for PgNotify {
@@ -145,13 +170,22 @@ impl PgFetcherSource for PgNotify {
         config: Config,
         worker: WorkerContext,
         lease_token: Arc<str>,
+        factory: Option<PollStrategyFactory>,
     ) -> TaskStream<PgTask<CompactType>, Error> {
         let ids = queries::notify_task_ids(
             pool.clone(),
             config.queue().to_string(),
             config.buffer_size().max(1),
         );
-        notify_backed_compact_stream(Self::STORAGE_NAME, ids, pool, config, worker, lease_token)
+        notify_backed_compact_stream(
+            Self::STORAGE_NAME,
+            ids,
+            pool,
+            config,
+            worker,
+            lease_token,
+            factory,
+        )
     }
 }
 
@@ -174,6 +208,7 @@ pub(crate) fn notify_backed_compact_stream<Ids>(
     config: Config,
     worker: WorkerContext,
     lease_token: Arc<str>,
+    factory: Option<PollStrategyFactory>,
 ) -> TaskStream<PgTask<CompactType>, Error>
 where
     Ids: Stream<Item = Result<PgTaskId, Error>> + Send + 'static,
@@ -183,7 +218,7 @@ where
         config.clone(),
         worker.clone(),
         storage_name,
-        lease_token,
+        lease_token.clone(),
     )
     .map_ok(|_| None);
 
@@ -193,10 +228,17 @@ where
         worker.name().to_owned(),
         config.buffer_size().max(1),
         ids,
+        Some(lease_token.clone()),
     )
     .boxed();
 
-    let eager_fetcher = PgPollFetcher::<CompactType>::new(&pool, &config, &worker);
+    let eager_fetcher = PgPollFetcher::<CompactType>::with_factory(
+        &pool,
+        &config,
+        &worker,
+        factory,
+        Some(lease_token),
+    );
     let combined = futures::stream::select(lazy_fetcher, eager_fetcher);
     register_then_stream(register_worker, combined)
 }
@@ -216,6 +258,7 @@ pub(crate) trait PgFetcherSource: Sized + Send + 'static {
         config: Config,
         worker: apalis_core::worker::context::WorkerContext,
         lease_token: Arc<str>,
+        factory: Option<PollStrategyFactory>,
     ) -> TaskStream<PgTask<CompactType>, Error>;
 }
 
@@ -231,21 +274,102 @@ where
         config: Config,
         worker: apalis_core::worker::context::WorkerContext,
         lease_token: Arc<str>,
+        factory: Option<PollStrategyFactory>,
     ) -> TaskStream<PgTask<CompactType>, Error> {
         let register_worker = queries::initial_heartbeat(
             pool.clone(),
             config.clone(),
             worker.clone(),
             Self::STORAGE_NAME,
-            lease_token,
+            lease_token.clone(),
         )
         .map_ok(|_| None);
-        let fetcher = PgPollFetcher::<CompactType>::new(&pool, &config, &worker);
+        let fetcher = PgPollFetcher::<CompactType>::with_factory(
+            &pool,
+            &config,
+            &worker,
+            factory,
+            Some(lease_token),
+        );
         register_then_stream(register_worker, fetcher)
     }
 }
 
 type Poller = Pin<Box<dyn Stream<Item = ()> + Send>>;
+
+#[derive(Clone)]
+pub(crate) struct PollStrategyFactory(Arc<dyn Fn(&PollContext) -> Poller + Send + Sync>);
+
+impl PollStrategyFactory {
+    pub(crate) fn new<F, S>(factory: F) -> Self
+    where
+        F: Fn() -> S + Send + Sync + 'static,
+        S: PollStrategy + 'static,
+        S::Stream: Send + 'static,
+    {
+        Self(Arc::new(move |context| factory().build_stream(context)))
+    }
+}
+
+/// Checks a local lease before polling either SQL work or heartbeat work. The
+/// optional guard belongs to the stream itself, so cancelling `next()` merely
+/// stops waiting; dropping a polled task stream retires its worker's claims.
+pub(crate) struct LeaseStream<S> {
+    stream: Pin<Box<S>>,
+    lease: Arc<crate::lease::WorkerLease>,
+    _guard: Option<crate::lease::LeaseGuard>,
+    retire_on_drop: bool,
+    ended: bool,
+}
+
+impl<S> LeaseStream<S> {
+    pub(crate) fn new(
+        stream: S,
+        lease: Arc<crate::lease::WorkerLease>,
+        retire_on_drop: bool,
+    ) -> Self {
+        Self {
+            stream: Box::pin(stream),
+            lease,
+            _guard: None,
+            retire_on_drop,
+            ended: false,
+        }
+    }
+}
+
+impl<S, T> Stream for LeaseStream<S>
+where
+    S: Stream<Item = Result<T, Error>>,
+{
+    type Item = Result<T, Error>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.ended {
+            return Poll::Ready(None);
+        }
+        if let Err(error) = this.lease.ensure_active() {
+            this.ended = true;
+            return Poll::Ready(Some(Err(error)));
+        }
+        // Only polling can dispatch registration/claim SQL. Arm before the
+        // inner poll, including Pending: a queued SQL operation may commit
+        // after its waiter is cancelled. Construction alone owns no claim.
+        if this.retire_on_drop && this._guard.is_none() {
+            this._guard = Some(this.lease.guard());
+        }
+        let result = this.stream.as_mut().poll_next(cx);
+        if matches!(
+            &result,
+            Poll::Ready(Some(Err(Error::ClaimOutcomeUnknown { .. })))
+        ) {
+            // SQL may already have committed a claim that was never delivered.
+            // Stop this registration's heartbeats so those tasks can recover.
+            this.lease.retire();
+        }
+        result
+    }
+}
 
 /// The configured poll strategy, built exactly once per fetcher and then polled
 /// for the fetcher's whole lifetime. `Fuse` keeps it safe to poll past
@@ -257,7 +381,7 @@ enum StreamState<Args> {
     /// Waiting for the persistent `poller` (see [`PgPollFetcher::poller`]) to
     /// signal that the next fetch should run.
     WaitForPoll,
-    StrategyEnded(Delay),
+    Ended,
     Fetch(BoxFuture<'static, Result<Vec<PgTask<Args>>, Error>>),
     Buffered(VecDeque<PgTask<Args>>),
 }
@@ -282,49 +406,52 @@ pub(crate) struct PgPollFetcher<Compact> {
     poller: FusedPoller,
     state: StreamState<Compact>,
     previous_task_count: Arc<AtomicUsize>,
-}
-
-impl<Compact> Clone for PgPollFetcher<Compact> {
-    fn clone(&self) -> Self {
-        let previous_task_count = Arc::new(AtomicUsize::new(0));
-        Self {
-            pool: self.pool.clone(),
-            config: self.config.clone(),
-            worker: self.worker.clone(),
-            poller: build_poller(&self.config, &self.worker, previous_task_count.clone()),
-            state: StreamState::WaitForPoll,
-            previous_task_count,
-        }
-    }
+    lease_token: Option<Arc<str>>,
 }
 
 impl PgPollFetcher<CompactType> {
     /// Create a polling fetcher.
     #[must_use]
+    #[cfg(test)]
     pub fn new(pool: &PgPool, config: &Config, worker: &WorkerContext) -> Self {
+        Self::with_factory(pool, config, worker, None, None)
+    }
+
+    fn with_factory(
+        pool: &PgPool,
+        config: &Config,
+        worker: &WorkerContext,
+        factory: Option<PollStrategyFactory>,
+        lease_token: Option<Arc<str>>,
+    ) -> Self {
         let previous_task_count = Arc::new(AtomicUsize::new(0));
         Self {
             pool: pool.clone(),
             config: config.clone(),
             worker: worker.clone(),
-            poller: build_poller(config, worker, previous_task_count.clone()),
+            poller: build_poller(
+                config,
+                worker,
+                previous_task_count.clone(),
+                factory.as_ref(),
+            ),
             state: StreamState::WaitForPoll,
             previous_task_count,
+            lease_token,
         }
     }
 }
 
-/// Delay applied after the configured `PollStrategy` reports exhaustion, before
-/// re-issuing a fetch. Hard-coded rather than configurable because the stream
-/// already self-tunes via `previous_task_count`; the value just smooths a
-/// single edge case (strategy returns `Ready(None)`).
-const STRATEGY_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(100);
-
 impl PgPollFetcher<CompactType> {
     fn start_fetch(&self) -> StreamState<CompactType> {
         StreamState::Fetch(
-            queries::fetch_next(self.pool.clone(), self.config.clone(), self.worker.clone())
-                .boxed(),
+            queries::fetch_next(
+                self.pool.clone(),
+                self.config.clone(),
+                self.worker.clone(),
+                self.lease_token.clone(),
+            )
+            .boxed(),
         )
     }
 }
@@ -359,16 +486,13 @@ impl Stream for PgPollFetcher<CompactType> {
                         this.state = this.start_fetch();
                     }
                     Poll::Ready(None) => {
-                        this.state =
-                            StreamState::StrategyEnded(Delay::new(STRATEGY_EXHAUSTED_BACKOFF));
+                        this.state = StreamState::Ended;
+                        return Poll::Ready(Some(Err(Error::PollStrategyExhausted {
+                            queue: this.config.queue().to_string(),
+                        })));
                     }
                 },
-                StreamState::StrategyEnded(delay) => match Pin::new(delay).poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(()) => {
-                        this.state = this.start_fetch();
-                    }
-                },
+                StreamState::Ended => return Poll::Ready(None),
                 StreamState::Fetch(fetch) => match fetch.poll_unpin(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(tasks)) if tasks.is_empty() => {
@@ -421,13 +545,17 @@ fn build_poller(
     config: &Config,
     worker: &WorkerContext,
     previous_task_count: Arc<AtomicUsize>,
+    factory: Option<&PollStrategyFactory>,
 ) -> FusedPoller {
     let context = PollContext::new(worker.clone(), previous_task_count);
     // `build_stream` consumes the `MultiStrategy` — its `poll_strategy` drains
     // the shared `Arc<Mutex<Vec<_>>>` — so this must run exactly once per
     // fetcher. The resulting stream reads `previous_task_count` live through the
     // `PollContext` Arc, so backoff keeps adapting without a rebuild.
-    config.poll_strategy().clone().build_stream(&context).fuse()
+    match factory {
+        Some(factory) => (factory.0)(&context).fuse(),
+        None => config.poll_strategy().clone().build_stream(&context).fuse(),
+    }
 }
 
 #[cfg(test)]
@@ -440,31 +568,19 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
-        time::Duration,
     };
 
     use apalis_core::{task::builder::TaskBuilder, worker::context::WorkerContext};
-    use diesel::{
-        PgConnection,
-        r2d2::{ConnectionManager, Pool},
-    };
     use futures::{FutureExt, StreamExt, future, stream, task::noop_waker_ref};
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
+    use crate::unreachable::unreachable_pool;
 
     struct PollObservation {
         poll: &'static str,
         state: &'static str,
         previous_task_count: usize,
-    }
-
-    fn unchecked_pool() -> PgPool {
-        let manager = ConnectionManager::<PgConnection>::new("postgres://127.0.0.1:1/not-used");
-        Pool::builder()
-            .max_size(1)
-            .connection_timeout(Duration::from_millis(10))
-            .build_unchecked(manager)
     }
 
     /// A poll-strategy stream that never yields, used as a placeholder poller
@@ -477,19 +593,20 @@ mod tests {
 
     fn buffered_fetcher() -> PgPollFetcher<CompactType> {
         PgPollFetcher {
-            pool: unchecked_pool(),
+            pool: unreachable_pool(),
             config: Config::new("fetcher-test"),
             worker: WorkerContext::new::<()>("fetcher-worker"),
             poller: pending_poller(),
             state: StreamState::Buffered(VecDeque::new()),
             previous_task_count: Arc::new(AtomicUsize::new(12)),
+            lease_token: None,
         }
     }
 
     fn state_name(fetcher: &PgPollFetcher<CompactType>) -> &'static str {
         match &fetcher.state {
             StreamState::WaitForPoll => "wait_for_poll",
-            StreamState::StrategyEnded(_) => "strategy_ended",
+            StreamState::Ended => "strategy_ended",
             StreamState::Fetch(_) => "fetch",
             StreamState::Buffered(_) => "buffered",
         }
@@ -520,9 +637,7 @@ mod tests {
     }
 
     fn exhausted_poll_strategy_observation() -> PollObservation {
-        // A poller that yields `Ready(None)` must transition the fetcher into
-        // `StrategyEnded` — the only way out of WaitForPoll besides starting a
-        // fetch.
+        // EOF is a terminal strategy outcome, not permission to query.
         let mut fetcher = buffered_fetcher();
         let poller: Poller = Box::pin(stream::empty::<()>());
         fetcher.poller = poller.fuse();
@@ -532,13 +647,10 @@ mod tests {
 
     fn observed_strategy_exhaustion(result: &PollObservation) -> AssertionResult {
         match (result.poll, result.state) {
-            // After the strategy ends, the fetcher enters StrategyEnded and
-            // its Delay (STRATEGY_EXHAUSTED_BACKOFF, 100 ms) has not yet
-            // elapsed in this synchronous test — so the outer poll returns
-            // Pending.
-            ("pending", "strategy_ended") => Ok(()),
+            // The exhausted strategy reports its contract error once.
+            ("error", "strategy_ended") => Ok(()),
             other => Err(AssertionError::new(vec![format!(
-                "expected exhausted strategy to transition into strategy_ended/pending, got {other:?}"
+                "expected exhausted strategy to report an error and terminate, got {other:?}"
             )])),
         }
     }
@@ -568,19 +680,6 @@ mod tests {
         let mut fetcher = buffered_fetcher();
         fetcher.state = StreamState::Fetch(future::pending().boxed());
         poll_observation(&mut fetcher)
-    }
-
-    fn cloned_state(fetcher: &PgPollFetcher<CompactType>) -> &'static str {
-        match &fetcher.clone().state {
-            StreamState::WaitForPoll => "wait_for_poll",
-            StreamState::StrategyEnded(_) => "strategy_ended",
-            StreamState::Fetch(_) => "fetch",
-            StreamState::Buffered(_) => "buffered",
-        }
-    }
-
-    fn cloned_previous_task_count(fetcher: &PgPollFetcher<CompactType>) -> usize {
-        fetcher.clone().previous_task_count.load(Ordering::Relaxed)
     }
 
     fn observed_fetch_error(result: &PollObservation) -> AssertionResult {
@@ -662,7 +761,7 @@ mod tests {
             }
             "strategy_ended" => {
                 let mut fetcher = buffered_fetcher();
-                fetcher.state = StreamState::StrategyEnded(Delay::new(Duration::from_secs(60)));
+                fetcher.state = StreamState::Ended;
                 fetcher
             }
             other => panic!("unknown state kind: {other}"),
@@ -761,7 +860,7 @@ mod tests {
     /// after a single cycle. Parking back in `wait_for_poll` proves the
     /// configured strategy still drives polling.
     fn state_after_one_empty_fetch_cycle() -> &'static str {
-        let pool = unchecked_pool();
+        let pool = unreachable_pool();
         let config = Config::new("poll-strategy-drain");
         let worker = WorkerContext::new::<()>("poll-strategy-drain-worker");
         let mut fetcher = PgPollFetcher::new(&pool, &config, &worker);
@@ -773,62 +872,204 @@ mod tests {
         state_name(&fetcher)
     }
 
+    fn independent_pollers(factory_enabled: bool) -> (&'static str, &'static str) {
+        use apalis_core::backend::poll_strategy::{StrategyBuilder, StreamStrategy};
+        let config = Config::new("independent-strategies").with_poll_interval(
+            StrategyBuilder::new()
+                .apply(StreamStrategy::new(stream::pending::<()>()))
+                .build(),
+        );
+        let factory = factory_enabled
+            .then(|| PollStrategyFactory::new(|| StreamStrategy::new(stream::pending::<()>())));
+        let pool = unreachable_pool();
+        let worker = WorkerContext::new::<()>("factory-worker");
+        let mut first = PgPollFetcher::with_factory(&pool, &config, &worker, factory.clone(), None);
+        let mut second = PgPollFetcher::with_factory(&pool, &config, &worker, factory, None);
+        (
+            poll_observation(&mut first).poll,
+            poll_observation(&mut second).poll,
+        )
+    }
+
+    fn strategy_reports_eof_once() -> (bool, bool) {
+        let mut fetcher = buffered_fetcher();
+        let poller: Poller = Box::pin(stream::empty::<()>());
+        fetcher.poller = poller.fuse();
+        fetcher.state = StreamState::WaitForPoll;
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let error = matches!(Pin::new(&mut fetcher).poll_next(&mut cx), Poll::Ready(Some(Err(Error::PollStrategyExhausted { queue }))) if queue == "fetcher-test");
+        let ended = matches!(Pin::new(&mut fetcher).poll_next(&mut cx), Poll::Ready(None));
+        (error, ended)
+    }
+
+    fn lease_stream_lifetime(
+        drop_whole_stream: bool,
+        first_poll: bool,
+        retire_on_drop: bool,
+    ) -> (bool, bool) {
+        let leases = crate::lease::LeaseRegistry::default();
+        let lease = leases.for_worker("claiming-worker");
+        let other = leases.for_worker("unrelated-worker");
+        let compact = stream::pending::<Result<(), Error>>();
+        let mut stream = LeaseStream::new(compact, lease.clone(), retire_on_drop);
+        // Dropping only the temporary next future leaves stream-owned work alive.
+        if first_poll {
+            let _ = stream.next().now_or_never();
+        }
+        if drop_whole_stream {
+            drop(stream);
+        }
+        (!lease.is_retired(), !other.is_retired())
+    }
+
+    fn retired_stream_ends_without_polling_inner() -> (bool, bool, usize) {
+        let lease = crate::lease::LeaseRegistry::default().for_worker("retired-worker");
+        lease.retire();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let inner = stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(None::<Result<(), Error>>)
+        });
+        let mut stream = LeaseStream::new(inner, lease, true);
+        let error = matches!(stream.next().now_or_never(), Some(Some(Err(Error::WorkerRetired { worker_id }))) if worker_id == "retired-worker");
+        let ended = matches!(stream.next().now_or_never(), Some(None));
+        (error, ended, polls.load(Ordering::Relaxed))
+    }
+
+    fn claim_error_lifetime(uncertain: bool) -> (bool, bool, bool) {
+        let leases = crate::lease::LeaseRegistry::default();
+        let lease = leases.for_worker("claim-worker");
+        let error = Error::InvalidArgument("controlled non-claim error".to_owned());
+        let error = if uncertain {
+            Error::ClaimOutcomeUnknown {
+                operation: "test claim",
+                source: Box::new(error),
+            }
+        } else {
+            error
+        };
+        let mut stream = LeaseStream::new(stream::iter([Err::<(), _>(error)]), lease.clone(), true);
+        let first = stream.next().now_or_never();
+        let preserved = if uncertain {
+            matches!(first,Some(Some(Err(Error::ClaimOutcomeUnknown{operation:"test claim",source}))) if matches!(*source,Error::InvalidArgument(ref message) if message=="controlled non-claim error"))
+        } else {
+            matches!(first,Some(Some(Err(Error::InvalidArgument(message)))) if message=="controlled non-claim error")
+        };
+        let retired = lease.is_retired();
+        let ended = if uncertain {
+            matches!(stream.next().now_or_never(),Some(Some(Err(Error::WorkerRetired{worker_id}))) if worker_id=="claim-worker")
+                && matches!(stream.next().now_or_never(), Some(None))
+        } else {
+            matches!(stream.next().now_or_never(), Some(None))
+        };
+        (preserved, retired, ended)
+    }
+
     lets_expect! {
-        expect(cloned_state(&fetcher)) {
-            let fetcher = buffered_fetcher();
-
-            when original_stream_has_buffered_state {
-                to resets_the_clone_to_poll_strategy { equal("wait_for_poll") }
+        expect(claim_error_lifetime(uncertain)) as claim_stream_error {
+            let uncertain=false;
+            to preserves_an_ordinary_error_without_retiring_the_worker {equal((true,false,true))}
+            when the_error_leaves_a_claim_commit_unconfirmed {
+                let uncertain=true;
+                to preserves_the_cause_retires_the_worker_and_ends_following_work {equal((true,true,true))}
             }
         }
+    }
 
-        expect(cloned_previous_task_count(&fetcher)) {
-            let fetcher = buffered_fetcher();
-
-            when original_stream_remembers_a_previous_batch {
-                to starts_the_clone_with_no_previous_count { equal(0) }
+    lets_expect! {
+        expect(independent_pollers(factory_enabled)) as independent_polling_strategies {
+            let factory_enabled = true;
+            to gives_each_worker_an_independent_pending_strategy { equal(("pending", "pending")) }
+            when a_legacy_config_is_reused_without_a_factory {
+                let factory_enabled = false;
+                to reports_the_consumed_strategy_instead_of_bypassing_its_gate { equal(("pending", "error")) }
             }
         }
+        expect(strategy_reports_eof_once()) as exhausted_polling_strategy {
+            when the_strategy_has_ended {
+                to reports_the_queue_once_then_finishes_without_querying { equal((true, true)) }
+            }
+        }
+        expect(lease_stream_lifetime(drop_whole_stream, first_poll, retire_on_drop)) as worker_stream_lifetime {
+            let drop_whole_stream = false;
+            let first_poll = true;
+            let retire_on_drop = true;
+            to keeps_both_workers_active_after_cancelling_only_next { equal((true, true)) }
+            when the_whole_claim_stream_is_dropped {
+                let drop_whole_stream = true;
+                to retires_only_the_streams_worker { equal((false, true)) }
+            }
+            when the_stream_was_never_polled {
+                let first_poll = false;
+                to leaves_both_workers_active { equal((true, true)) }
+                when the_whole_stream_is_dropped {
+                    let drop_whole_stream = true;
+                    to leaves_both_workers_active { equal((true, true)) }
+                }
+            }
+            when the_stream_only_renews_heartbeats {
+                let retire_on_drop = false;
+                to leaves_both_workers_active { equal((true, true)) }
+                when the_whole_stream_is_dropped {
+                    let drop_whole_stream = true;
+                    to leaves_both_workers_active { equal((true, true)) }
+                }
+                when the_stream_was_never_polled {
+                    let first_poll = false;
+                    to leaves_both_workers_active { equal((true, true)) }
+                    when the_whole_stream_is_dropped {
+                        let drop_whole_stream = true;
+                        to leaves_both_workers_active { equal((true, true)) }
+                    }
+                }
+            }
+        }
+        expect(retired_stream_ends_without_polling_inner()) as an_already_retired_worker_stream {
+            to reports_the_worker_once_and_ends_without_dispatching_work { equal((true, true, 0)) }
+        }
+    }
 
-        expect(pending_poll_strategy_observation()) {
+    lets_expect! {
+        expect(pending_poll_strategy_observation()) as pending_polling_permission {
             when the_configured_poll_strategy_is_not_ready {
                 to does_not_start_a_fetch { observed_pending_strategy }
             }
         }
 
-        expect(exhausted_poll_strategy_observation()) {
+        expect(exhausted_poll_strategy_observation()) as exhausted_polling_permission {
             when the_configured_poll_strategy_returns_ready_none {
-                to transitions_into_strategy_ended_and_waits_for_the_delay {
+                to reports_exhaustion_without_starting_a_fetch {
                     observed_strategy_exhaustion
                 }
             }
         }
 
-        expect(fetch_error_observation()) {
+        expect(fetch_error_observation()) as failed_task_fetch {
             when fetch_query_fails {
                 to yields_the_error_and_waits_for_the_next_poll_signal { observed_fetch_error }
             }
         }
 
-        expect(empty_fetch_observation()) {
+        expect(empty_fetch_observation()) as empty_task_fetch {
             when fetch_returns_no_tasks {
                 to waits_for_the_next_configured_poll_signal { observed_empty_fetch }
             }
         }
 
-        expect(successful_fetch_observation()) {
+        expect(successful_fetch_observation()) as successful_task_fetch {
             when fetch_returns_tasks {
                 to yields_a_task_and_records_the_batch_size { observed_successful_fetch }
             }
         }
 
-        expect(fetch_pending_observation()) {
+        expect(fetch_pending_observation()) as pending_task_fetch {
             when fetch_query_is_still_in_flight {
                 to waits_without_touching_the_batch_count { observed_pending_fetch }
             }
         }
 
-        expect(take_pending_count(state_kind)) {
+        expect(take_pending_count(state_kind)) as buffered_task_collection {
             let state_kind = "buffered_two";
 
             when fetcher_is_in_buffered_state_with_two_tasks {
@@ -856,7 +1097,7 @@ mod tests {
             }
         }
 
-        expect(take_pending_drains_then_reports_empty()) {
+        expect(take_pending_drains_then_reports_empty()) as drained_task_collection {
             when buffered_state_is_drained_via_take_pending {
                 to leaves_the_fetcher_in_the_buffered_state_with_zero_tasks {
                     equal((2, 0, "buffered"))
@@ -864,13 +1105,13 @@ mod tests {
             }
         }
 
-        expect(buffered_pop_front_observation()) {
+        expect(buffered_pop_front_observation()) as buffered_task_delivery {
             when buffer_holds_multiple_tasks {
                 to pops_a_task_and_stays_in_buffered { observed_buffered_pop_front }
             }
         }
 
-        expect(buffered_drain_observation(previous_task_count)) {
+        expect(buffered_drain_observation(previous_task_count)) as polling_after_batch_delivery {
             let previous_task_count = 10; // == default buffer_size: the batch filled the limit
 
             when the_drained_batch_had_filled_the_fetch_limit {
@@ -883,7 +1124,7 @@ mod tests {
             }
         }
 
-        expect(full_batch_respects_a_spent_poll_strategy()) {
+        expect(full_batch_respects_a_spent_poll_strategy()) as polling_permission_after_full_batch {
             when a_limit_filling_batch_is_drained_and_the_strategy_has_no_further_permit {
                 to returns_to_the_strategy_and_stays_pending_without_fetching {
                     equal(("wait_for_poll", "pending"))
@@ -891,7 +1132,7 @@ mod tests {
             }
         }
 
-        expect(state_after_one_empty_fetch_cycle()) {
+        expect(state_after_one_empty_fetch_cycle()) as polling_permission_after_empty_batch {
             when a_fetch_cycle_completes_and_the_next_poll_is_scheduled {
                 to keeps_being_governed_by_the_configured_poll_strategy {
                     equal("wait_for_poll")
@@ -939,19 +1180,8 @@ mod tests {
             fetcher.next().await
         }
 
-        /// A `StrategyEnded` state whose backoff `Delay` is already due. Once it
-        /// elapses the fetcher must leave `StrategyEnded` and start a fetch; a
-        /// broken arm that never transitioned would spin on the ready delay or
-        /// hang instead of yielding the connection error.
-        async fn strategy_ended_delay_elapses_into_fetch()
-        -> Option<Result<Option<Task<CompactType, PgContext, ulid::Ulid>>, Error>> {
-            let mut fetcher = buffered_fetcher();
-            fetcher.state = StreamState::StrategyEnded(Delay::new(Duration::ZERO));
-            fetcher.next().await
-        }
-
         lets_expect! { #tokio_test
-            expect(wait_for_poll_permit_launches_fetch().await) {
+            expect(wait_for_poll_permit_launches_fetch().await) as permitted_task_fetch {
                 when the_poll_strategy_grants_a_permit {
                     to starts_a_fetch_that_reports_the_connection_failure {
                         poll_error_mentions_connection_failure
@@ -959,13 +1189,7 @@ mod tests {
                 }
             }
 
-            expect(strategy_ended_delay_elapses_into_fetch().await) {
-                when the_strategy_exhausted_backoff_delay_elapses {
-                    to starts_a_fetch_that_reports_the_connection_failure {
-                        poll_error_mentions_connection_failure
-                    }
-                }
-            }
+
         }
     }
 }

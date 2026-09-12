@@ -7,7 +7,7 @@
 -- `apalis.get_jobs` and document the intent. Bodies remain unchanged.
 CREATE OR REPLACE FUNCTION apalis.notify_new_jobs() RETURNS TRIGGER
 SECURITY INVOKER
-SET search_path = pg_catalog, apalis
+SET search_path = pg_catalog, apalis, pg_temp
 AS $$
 DECLARE
     rec RECORD;
@@ -21,7 +21,7 @@ BEGIN
                 (row_number() OVER (PARTITION BY job_type ORDER BY id) - 1) / 100
                     AS chunk
             FROM new_jobs
-            WHERE run_at <= now()
+            WHERE run_at <= statement_timestamp()
         ) sub
         GROUP BY job_type, chunk
     LOOP

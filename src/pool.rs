@@ -48,6 +48,7 @@ mod tests {
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
+    use crate::unreachable::UNREACHABLE_DATABASE_URL;
 
     /// Build a pool without eagerly opening connections so the unit tests can
     /// inspect the builder configuration without a reachable server.
@@ -138,32 +139,52 @@ mod tests {
         }
     }
 
+    // Borrow the returned result for every assertion in the same leaf.
+    // Repeating be_ok_and/be_err_and would move its non-Copy pool/error value.
+    fn successful_pool<A>(assertion: A) -> impl Fn(&Result<PgPool, Error>) -> AssertionResult
+    where
+        A: Fn(&PgPool) -> AssertionResult,
+    {
+        move |result| match result {
+            Ok(pool) => assertion(pool),
+            Err(error) => Err(AssertionError::new(vec![format!(
+                "expected a pool, got {error:?}"
+            )])),
+        }
+    }
+
+    fn failed_pool<A>(assertion: A) -> impl Fn(&Result<PgPool, Error>) -> AssertionResult
+    where
+        A: Fn(&Error) -> AssertionResult,
+    {
+        move |result| match result {
+            Err(error @ Error::Pool(_)) => assertion(error),
+            other => Err(AssertionError::new(vec![format!(
+                "expected Error::Pool, got {other:?}"
+            )])),
+        }
+    }
+
     lets_expect! {
-        expect(default_pool(url)) {
-            let url = "postgres://127.0.0.1:1/unused";
+        expect(default_pool(url)) as default_connection_pool {
+            let url = UNREACHABLE_DATABASE_URL;
 
             when build_pool_with_uses_the_r2d2_defaults {
-                to returns_a_pool_with_the_r2d2_default_capacity {
-                    be_ok_and equals_max_size(10)
-                }
-
-                to returns_a_pool_with_the_r2d2_default_connection_timeout {
-                    be_ok_and equals_connection_timeout(Duration::from_secs(30))
+                to preserves_the_default_capacity_and_timeout {
+                    successful_pool(equals_max_size(10)),
+                    successful_pool(equals_connection_timeout(Duration::from_secs(30)))
                 }
             }
         }
 
-        expect(pool_with_max_size(url, max_size)) {
-            let url = "postgres://127.0.0.1:1/unused";
+        expect(pool_with_max_size(url, max_size)) as configured_connection_pool {
+            let url = UNREACHABLE_DATABASE_URL;
             let max_size = 4;
 
             when build_pool_with_applies_a_custom_max_size_and_timeout {
-                to honours_the_supplied_max_size {
-                    be_ok_and equals_max_size(4)
-                }
-
-                to honours_the_supplied_connection_timeout {
-                    be_ok_and equals_connection_timeout(Duration::from_millis(5))
+                to preserves_the_configured_capacity_and_timeout {
+                    successful_pool(equals_max_size(4)),
+                    successful_pool(equals_connection_timeout(Duration::from_millis(5)))
                 }
             }
 
@@ -180,20 +201,13 @@ mod tests {
         // an EAGER build: with default `min_idle`, r2d2 establishes its initial
         // connection during `build()`, so an unreachable server surfaces the
         // `Err(Error::Pool(_))` path — otherwise unreachable in a unit test.
-        expect(eager_pool(url)) {
-            let url = "postgres://127.0.0.1:1/unused";
+        expect(eager_pool(url)) as initial_connection_check {
+            let url = UNREACHABLE_DATABASE_URL;
 
             when the_server_is_unreachable_and_initialization_is_eager {
-                to returns_a_pool_error {
-                    be_err_and match_pattern!(Error::Pool(_))
-                }
-
-                to displays_the_pool_acquisition_failure {
-                    be_err_and displays_pool_acquisition_failure
-                }
-
-                to exposes_the_pool_error_as_the_source {
-                    be_err_and exposes_pool_error_as_source
+                to reports_the_pool_failure_with_its_cause_and_guidance {
+                    failed_pool(displays_pool_acquisition_failure),
+                    failed_pool(exposes_pool_error_as_source)
                 }
             }
         }

@@ -22,9 +22,7 @@ use lets_expect::{AssertionError, AssertionResult, *};
 use ulid::Ulid;
 
 /// Observations from running the push → poll → lock → ack → fetch pipeline.
-/// Each field is asserted by a dedicated `to` block; `lets_expect` re-runs the
-/// subject once per block, so the (idempotent, freshly-queued, self-cleaning)
-/// pipeline executes once per asserted observable.
+/// All observations are asserted together from one execution of the pipeline.
 #[derive(Debug)]
 struct LifecycleRun {
     polled_payload: String,
@@ -287,24 +285,14 @@ fn fetched_task_has_done_status() -> impl Fn(&Result<LifecycleOutcome, String>) 
 }
 
 lets_expect! { #tokio_test
-    expect(lifecycle_outcome().await) {
+    expect(lifecycle_outcome().await) as lifecycle_outcome {
         when database_is_available_and_a_task_completes_one_full_pass {
             to polls_the_pushed_payload {
-                polled_payload_matches_pushed()
-            }
-            to returns_none_when_fetch_by_id_is_given_an_absent_id {
-                fetch_by_id_misses_an_absent_id()
-            }
-            to acquires_a_row_lock_for_the_worker {
-                lock_task_acquires_the_row()
-            }
-            to acknowledges_and_persists_the_completed_result {
-                ack_succeeds_and_persists_the_result()
-            }
-            to fetches_the_acked_task_back_by_id {
-                fetch_by_id_returns_the_task()
-            }
-            to records_the_terminal_done_status {
+                polled_payload_matches_pushed(),
+                fetch_by_id_misses_an_absent_id(),
+                lock_task_acquires_the_row(),
+                ack_succeeds_and_persists_the_result(),
+                fetch_by_id_returns_the_task(),
                 fetched_task_has_done_status()
             }
         }
