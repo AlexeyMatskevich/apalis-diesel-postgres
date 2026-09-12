@@ -57,6 +57,7 @@ ulid = { version = "1", features = ["serde"] }
 apalis = "=1.0.0-rc.9"
 lets_expect = { version = "0.5", features = ["tokio"] }
 ntex = { version = "3", default-features = false, features = ["neon-polling"] }
+scheduled-thread-pool = "0.2.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [features]

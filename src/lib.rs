@@ -51,6 +51,10 @@ mod test_support;
 #[cfg(test)]
 #[path = "../tests/support/unreachable.rs"]
 mod unreachable;
+
+#[cfg(test)]
+#[path = "../tests/support/unreachable_specs.rs"]
+mod unreachable_specs;
 #[cfg(test)]
 extern crate self as apalis_diesel_postgres;
 mod models;

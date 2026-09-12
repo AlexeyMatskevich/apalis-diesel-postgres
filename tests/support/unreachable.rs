@@ -8,7 +8,7 @@ use std::time::Duration;
 use apalis_diesel_postgres::PgPool;
 use diesel::{
     PgConnection,
-    r2d2::{ConnectionManager, Pool},
+    r2d2::{Builder, ConnectionManager, ManageConnection, Pool},
 };
 
 /// A connection string whose server refuses connections.
@@ -30,11 +30,17 @@ pub const UNREACHABLE_DATABASE_URL: &str = "postgres://127.0.0.1:1/not-used?gsse
 /// alive: r2d2 caps reconnect backoff at half this fixture's 10ms timeout.
 /// Laziness delays connection work; it does not cancel it after a timeout.
 pub fn unreachable_pool() -> PgPool {
-    Pool::builder()
+    pool_with_manager(
+        Pool::builder(),
+        ConnectionManager::<PgConnection>::new(UNREACHABLE_DATABASE_URL),
+    )
+}
+
+// Keep the fixture policy shared with the instrumented connection-manager tests.
+pub(crate) fn pool_with_manager<M: ManageConnection>(builder: Builder<M>, manager: M) -> Pool<M> {
+    builder
         .max_size(1)
         .min_idle(Some(0))
         .connection_timeout(Duration::from_millis(10))
-        .build_unchecked(ConnectionManager::<PgConnection>::new(
-            UNREACHABLE_DATABASE_URL,
-        ))
+        .build_unchecked(manager)
 }
