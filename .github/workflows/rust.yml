@@ -22,7 +22,7 @@ jobs:
         rust: ["1.88.0", "stable"]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
@@ -99,7 +99,7 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/apalis_diesel_postgres
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
@@ -127,7 +127,7 @@ jobs:
   dependencies:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: dtolnay/rust-toolchain@stable
     - name: Install the advisory checker
       run: cargo install cargo-audit --version 0.22.2 --locked
