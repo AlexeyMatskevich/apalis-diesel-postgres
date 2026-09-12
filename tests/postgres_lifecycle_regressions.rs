@@ -549,6 +549,14 @@ mod retirement {
                 .connection_timeout(Duration::from_millis(40))
         })
         .unwrap();
+        // A lazy pool has no connection yet. Prepare it independently from the
+        // short checkout timeout used to exercise the later acknowledgement.
+        let startup_pool = pool.clone();
+        tokio::task::spawn_blocking(move || {
+            drop(startup_pool.get_timeout(Duration::from_secs(30)).unwrap());
+        })
+        .await
+        .unwrap();
         setup(&pool).await.unwrap();
         let queue = format!("lifecycle_completion_{}", ulid::Ulid::new());
         let config = Config::new(&queue)
@@ -580,16 +588,24 @@ mod retirement {
             serialization_fails,
         };
         let mut service = storage.middleware().layer(handler);
-        let release = held.clone();
-        let releaser = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            release.lock().unwrap().take();
-        });
         futures::future::poll_fn(|cx| service.poll_ready(cx))
             .await
             .unwrap();
-        let failed = service.call(task).await.is_err();
-        releaser.await.unwrap();
+        let result = service.call(task).await;
+        // Keep the connection occupied until ack has actually failed, even if
+        // the executor delays the handler or the acknowledgement.
+        held.lock().unwrap().take();
+        let failed = matches!(
+            (
+                serialization_fails,
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<Error>())
+            ),
+            (false, Some(Error::Pool(_))) | (true, Some(Error::Json(_)))
+        );
+        assert!(failed, "unexpected acknowledgement result: {result:?}");
         assert_eq!(effects.load(Ordering::SeqCst), 1);
         let mut heartbeat = storage.heartbeat(&worker);
         let stopped_heartbeat = matches!(
@@ -597,7 +613,26 @@ mod retirement {
             Some(Err(Error::WorkerRetired { .. }))
         );
         let stopped_claim = matches!(tasks.next().await, Some(Err(Error::WorkerRetired { .. })));
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(stopped_heartbeat && stopped_claim);
+        // Model a stale registration after proving that its owner has stopped.
+        // Recovery itself must still reclaim the original job and retry it.
+        let aging_pool = pool.clone();
+        let aging_queue = queue.clone();
+        let aging_worker = worker.name().clone();
+        let aged = tokio::task::spawn_blocking(move || {
+            use diesel::{RunQueryDsl, sql_query, sql_types::Text};
+            sql_query(
+                "UPDATE apalis.workers SET last_seen=clock_timestamp()-interval '2 minutes' \
+                 WHERE worker_type=$1 AND id=$2",
+            )
+            .bind::<Text, _>(aging_queue)
+            .bind::<Text, _>(aging_worker)
+            .execute(&mut aging_pool.get().unwrap())
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(aged, 1);
         let replacement_config = Config::new(&queue)
             .set_buffer_size(1)
             .set_keep_alive(Duration::from_millis(10))
