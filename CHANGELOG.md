@@ -49,6 +49,9 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed
 
+- Updated Rust dependencies, including Diesel 2.3.13, Tokio 1.53.1,
+  ntex-rt 3.17.2, and ntex 3.12.3. Diesel 2.3.13 and ntex-rt 3.17.2 are
+  now the minimum supported versions; the crate's MSRV remains Rust 1.88.
 - Worker registration evaluates the locked row and current time in one query,
   reducing database reads while preserving takeover fencing and evaluation
   after any row-lock wait.
