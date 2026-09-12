@@ -6,6 +6,11 @@ use apalis_core::error::BoxDynError;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A previous flush failed; this sink cannot confirm completion or accept tasks.
+    #[error(
+        "the task sink previously failed to flush; use a fresh sink after reconciling the failed batch"
+    )]
+    SinkFailed,
     /// Diesel query failed while running a named backend operation.
     #[error("database error while {operation}: {source}{hint}", hint = database_hint(source))]
     Database {

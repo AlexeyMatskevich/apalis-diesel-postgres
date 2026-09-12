@@ -23,6 +23,7 @@ pub(crate) struct PgSink<Args, Codec = JsonCodec<CompactType>> {
     config: Config,
     buffer: Vec<PgTask<CompactType>>,
     flush_future: Mutex<Option<FlushFuture>>,
+    failed: bool,
     _marker: PhantomData<(Args, Codec)>,
 }
 
@@ -31,6 +32,7 @@ impl<Args, Codec> std::fmt::Debug for PgSink<Args, Codec> {
         f.debug_struct("PgSink")
             .field("config", &self.config)
             .field("buffer_len", &self.buffer.len())
+            .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
 }
@@ -48,6 +50,7 @@ impl<Args, Codec> Clone for PgSink<Args, Codec> {
             config: self.config.clone(),
             buffer: Vec::new(),
             flush_future: Mutex::new(None),
+            failed: false,
             _marker: PhantomData,
         }
     }
@@ -62,6 +65,7 @@ impl<Args, Codec> PgSink<Args, Codec> {
             config: config.clone(),
             buffer: Vec::new(),
             flush_future: Mutex::new(None),
+            failed: false,
             _marker: PhantomData,
         }
     }
@@ -79,6 +83,7 @@ impl<Args, Codec> PgSink<Args, Codec> {
             config: self.config,
             buffer: self.buffer,
             flush_future: self.flush_future,
+            failed: self.failed,
             _marker: PhantomData,
         }
     }
@@ -92,16 +97,21 @@ impl<Args, Codec> PgSink<Args, Codec> {
     /// Whether `poll_ready` must drive a flush before accepting more work —
     /// either a flush is already in flight, or the buffer is at capacity.
     fn needs_flush_before_ready(&mut self) -> bool {
-        self.flush_future
-            .get_mut()
-            .expect("flush_future mutex poisoned")
-            .is_some()
+        self.failed
+            || self
+                .flush_future
+                .get_mut()
+                .expect("flush_future mutex poisoned")
+                .is_some()
             || self.buffer.len() >= self.capacity()
     }
 
     /// Try to enqueue a single task into the buffer, returning
     /// `Error::SinkBufferFull` when capacity has been reached.
     fn try_push(&mut self, item: PgTask<CompactType>) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::SinkFailed);
+        }
         let cap = self.capacity();
         if self.buffer.len() >= cap {
             return Err(Error::SinkBufferFull(cap));
@@ -112,36 +122,43 @@ impl<Args, Codec> PgSink<Args, Codec> {
 
     /// Drive the buffered batch toward completion. Starts a new flush future
     /// when none is in flight and the buffer is non-empty; otherwise polls the
-    /// existing future and clears it once it resolves.
+    /// existing future. Successful completion covers any tasks accepted while
+    /// that future was pending; a failed write permanently fails this pipeline.
     fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        // `&mut self` makes `Mutex::get_mut` infallible-by-borrow — no lock
-        // acquisition, just unique-borrow projection. The mutex exists purely
-        // to satisfy `PgSink: Sync` when the inner future is not `Sync` (ntex).
-        let flush_future = self
-            .flush_future
-            .get_mut()
-            .expect("flush_future mutex poisoned");
-
-        if flush_future.is_none() && self.buffer.is_empty() {
-            return Poll::Ready(Ok(()));
+        if self.failed {
+            return Poll::Ready(Err(Error::SinkFailed));
         }
-
-        if flush_future.is_none() {
-            let pool = self.pool.clone();
-            let config = self.config.clone();
-            let buffer = std::mem::take(&mut self.buffer);
-            *flush_future = Some(Box::pin(queries::push_tasks(pool, config, buffer)));
-        }
-
-        let Some(future) = flush_future.as_mut() else {
-            return Poll::Ready(Ok(()));
-        };
-
-        match future.poll_unpin(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                *flush_future = None;
-                Poll::Ready(result)
+        // A readiness grant can be followed by an intermediate flush before
+        // start_send uses that grant. The active batch and the later buffer
+        // therefore both belong to this completion request.
+        loop {
+            // Unique field borrows keep this projection lock-free. The mutex
+            // only makes the stored Send future compatible with PgSink: Sync.
+            let flush_future = self
+                .flush_future
+                .get_mut()
+                .expect("flush_future mutex poisoned");
+            if flush_future.is_none() && self.buffer.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let future = flush_future.get_or_insert_with(|| {
+                let pool = self.pool.clone();
+                let config = self.config.clone();
+                let buffer = std::mem::take(&mut self.buffer);
+                Box::pin(queries::push_tasks(pool, config, buffer))
+            });
+            match future.poll_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => {
+                    self.failed = true;
+                    *flush_future = None;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Ok(())) => {
+                    *flush_future = None;
+                    // Revisit the buffer before promising completion. With
+                    // this exclusive borrow no new tasks enter the loop.
+                }
             }
         }
     }
@@ -182,22 +199,11 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use diesel::{
-        PgConnection,
-        r2d2::{ConnectionManager, Pool},
-    };
     use futures::{Sink, future, task::noop_waker_ref};
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
-
-    fn unchecked_pool() -> PgPool {
-        let manager = ConnectionManager::<PgConnection>::new("postgres://127.0.0.1:1/not-used");
-        Pool::builder()
-            .max_size(1)
-            .connection_timeout(std::time::Duration::from_millis(10))
-            .build_unchecked(manager)
-    }
+    use crate::unreachable::unreachable_pool;
 
     fn task() -> PgTask<CompactType> {
         PgTask::new(b"payload".to_vec())
@@ -205,13 +211,13 @@ mod tests {
 
     fn sink(buffer_size: usize) -> PgSink<Vec<u8>> {
         PgSink::new(
-            &unchecked_pool(),
+            &unreachable_pool(),
             &Config::new("sink-unit").set_buffer_size(buffer_size),
         )
     }
 
     fn storage(buffer_size: usize) -> PostgresStorage<Vec<u8>> {
-        let pool = unchecked_pool();
+        let pool = unreachable_pool();
         let config = Config::new("sink-unit").set_buffer_size(buffer_size);
         PostgresStorage::<Vec<u8>>::new_with_config(&pool, &config)
     }
@@ -557,55 +563,37 @@ mod tests {
     }
 
     lets_expect! {
-        expect(start_send_via_storage(buffer_size, existing_items)) {
+        expect(start_send_via_storage(buffer_size, existing_items)) as buffered_enqueue {
             let buffer_size = 2;
             let existing_items = 0;
-
-            when buffer_has_room_below_capacity {
-                to buffers_the_task { be_ok_and equal(1) }
-            }
-
-            when buffer_has_exactly_one_slot_left {
-                // len == capacity - 1: the boundary push that exactly fills the
-                // buffer must still be accepted (pins the `>= cap` guard, not
-                // `> cap` or `>= cap - 1`).
-                let buffer_size = 2;
+            to buffers_the_first_task { be_ok_and equal(1) }
+            when the_buffer_has_one_slot_left {
                 let existing_items = 1;
-                to accepts_the_final_task_and_fills_the_buffer { be_ok_and equal(2) }
+                to accepts_the_last_task { be_ok_and equal(2) }
             }
-
-            when buffer_is_at_capacity_already {
-                let buffer_size = 1;
-                let existing_items = 1;
-                to rejects_the_send_carrying_the_effective_capacity { sink_buffer_full_at(1) }
-            }
-
-            when buffer_is_at_a_non_minimum_capacity_already {
-                let buffer_size = 2;
+            when the_buffer_is_full {
                 let existing_items = 2;
-                to rejects_the_send_carrying_the_effective_capacity { sink_buffer_full_at(2) }
+                to rejects_the_task_with_the_effective_capacity { sink_buffer_full_at(2) }
             }
-
-            when configured_capacity_is_zero_and_minimum_one_is_full {
-                let buffer_size = 0;
-                let existing_items = 1;
-                to rejects_the_send_via_the_minimum_capacity { sink_buffer_full_at(1) }
+            when capacity_is_one {
+                let buffer_size = 1;
+                to buffers_the_first_task { be_ok_and equal(1) }
+                when the_buffer_is_full {
+                    let existing_items = 1;
+                    to rejects_the_task_with_the_effective_capacity { sink_buffer_full_at(1) }
+                }
             }
-
-            when configured_capacity_is_zero_and_the_buffer_is_empty {
-                // Positive side of the capacity clamp: `capacity()` raises a
-                // misconfigured `buffer_size(0)` to 1, so the very first task
-                // must still be buffered instead of deadlocking the sink. Pins
-                // the documented "zero-config still holds one task" guarantee
-                // against a regression to `min(buffer_size, 1)` (== 0) that
-                // would reject even the first push.
+            when configured_capacity_is_zero {
                 let buffer_size = 0;
-                let existing_items = 0;
-                to buffers_the_first_task_despite_zero_config { be_ok_and equal(1) }
+                to buffers_the_first_task_using_the_minimum_capacity { be_ok_and equal(1) }
+                when the_buffer_is_full {
+                    let existing_items = 1;
+                    to rejects_the_task_with_the_minimum_capacity { sink_buffer_full_at(1) }
+                }
             }
         }
 
-        expect(poll_ready_via_storage(buffer_size, existing_items)) {
+        expect(poll_ready_via_storage(buffer_size, existing_items)) as enqueue_readiness {
             let buffer_size = 2;
             let existing_items = 0;
 
@@ -635,13 +623,13 @@ mod tests {
             }
         }
 
-        expect(poll_ready_in_flight()) {
+        expect(poll_ready_in_flight()) as ongoing_enqueue_readiness {
             when an_earlier_flush_is_still_in_flight {
                 to waits_for_the_flush_to_complete { keeps_in_flight_flush }
             }
         }
 
-        expect(poll_flush_idle()) {
+        expect(poll_flush_idle()) as idle_enqueue_flush {
             when there_is_neither_a_pending_flush_nor_buffered_work {
                 to completes_immediately_without_touching_the_database {
                     observation_is_idle_ok
@@ -649,7 +637,7 @@ mod tests {
             }
         }
 
-        expect(poll_flush_in_flight_ready(result)) {
+        expect(poll_flush_in_flight_ready(result)) as completed_enqueue_flush {
             let result = Ok(());
 
             when the_in_flight_flush_resolves_successfully {
@@ -666,7 +654,7 @@ mod tests {
             }
         }
 
-        expect(poll_flush_in_flight_pending()) {
+        expect(poll_flush_in_flight_pending()) as ongoing_enqueue_flush {
             when the_in_flight_flush_is_still_pending {
                 to stays_pending_and_keeps_the_future {
                     observation_stays_pending
@@ -674,7 +662,7 @@ mod tests {
             }
         }
 
-        expect(poll_close_via_storage(buffered)) {
+        expect(poll_close_via_storage(buffered)) as enqueue_close {
             let buffered = 0;
 
             when the_sink_is_already_drained {
@@ -682,7 +670,7 @@ mod tests {
             }
         }
 
-        expect(cloned_sink_buffer_len(buffered_items)) {
+        expect(cloned_sink_buffer_len(buffered_items)) as cloned_enqueue_buffer {
             let buffered_items = 2;
 
             when the_original_sink_has_buffered_tasks {
@@ -690,13 +678,13 @@ mod tests {
             }
         }
 
-        expect(cloned_sink_state_drops_flush_future()) {
+        expect(cloned_sink_state_drops_flush_future()) as cloned_enqueue_operation {
             when the_original_sink_has_an_in_flight_flush {
                 to does_not_share_the_in_flight_flush_future { equal(true) }
             }
         }
 
-        expect(cloned_sink_buffer_size(buffer_size)) {
+        expect(cloned_sink_buffer_size(buffer_size)) as cloned_enqueue_capacity {
             let buffer_size = 4;
 
             when the_original_sink_has_custom_capacity {
@@ -704,7 +692,7 @@ mod tests {
             }
         }
 
-        expect(sink_debug(buffered_items)) {
+        expect(sink_debug(buffered_items)) as enqueue_description {
             let buffered_items = 2;
 
             when the_sink_has_buffered_items {
@@ -714,32 +702,37 @@ mod tests {
             }
         }
 
-        expect(with_codec_observation(buffered_items, flush_in_flight)) {
+        expect(with_codec_observation(buffered_items, flush_in_flight)) as storage_codec_change {
             let buffered_items = 1;
             let flush_in_flight = false;
-
-            when the_sink_holds_buffered_tasks {
-                to carries_the_buffer_into_the_retyped_storage { carried_buffer_len(1) }
-                to carries_the_exact_task_bytes { carried_the_exact_task_bytes }
+            to preserves_the_buffer_and_flush_ownership {
+                carried_buffer_len(1),
+                carried_the_exact_task_bytes,
+                have(kept_in_flight_flush) { be_false }
             }
-
             when a_flush_is_in_flight {
                 let flush_in_flight = true;
-                to keeps_the_in_flight_flush { kept_the_in_flight_flush }
+                to preserves_the_buffer_and_in_flight_flush {
+                    carried_buffer_len(1),
+                    carried_the_exact_task_bytes,
+                    kept_the_in_flight_flush
+                }
             }
-
-            when the_buffer_already_drained_into_an_in_flight_flush {
-                // Realistic mid-flush state: `poll_flush_inner` has taken the
-                // buffer into the future, nothing is left behind it.
+            when the_buffer_is_empty {
                 let buffered_items = 0;
-                let flush_in_flight = true;
-                to keeps_the_in_flight_flush { kept_the_in_flight_flush }
-                to has_no_buffered_tasks_left { carried_buffer_len(0) }
-            }
-
-            when the_sink_is_empty {
-                let buffered_items = 0;
-                to starts_the_retyped_storage_with_an_empty_buffer { carried_buffer_len(0) }
+                to preserves_the_empty_sink {
+                    carried_buffer_len(0),
+                    have(first_payload.as_ref()) { be_none },
+                    have(kept_in_flight_flush) { be_false }
+                }
+                when a_flush_is_in_flight {
+                    let flush_in_flight = true;
+                    to preserves_the_flush_after_its_buffer_was_drained {
+                        carried_buffer_len(0),
+                        have(first_payload.as_ref()) { be_none },
+                        kept_the_in_flight_flush
+                    }
+                }
             }
         }
     }
@@ -749,7 +742,7 @@ mod tests {
         use super::*;
 
         lets_expect! { #tokio_test
-            expect(poll_ready_via_storage(buffer_size, existing_items)) {
+            expect(poll_ready_via_storage(buffer_size, existing_items)) as enqueue_readiness {
                 let buffer_size = 1;
                 let existing_items = 1;
 
@@ -760,7 +753,7 @@ mod tests {
         }
 
         lets_expect! { #tokio_test
-            expect(poll_flush_sink_with_state(buffer_size, buffered, None).poll) {
+            expect(poll_flush_sink_with_state(buffer_size, buffered, None).poll) as buffered_enqueue_flush {
                 let buffer_size = 2;
                 let buffered = 1;
 
@@ -771,7 +764,7 @@ mod tests {
         }
 
         lets_expect! { #tokio_test
-            expect(poll_flush_creates_future()) {
+            expect(poll_flush_creates_future()) as new_enqueue_flush {
                 when there_is_no_in_flight_flush_but_the_buffer_has_work {
                     to drains_the_buffer_into_a_new_flush_future {
                         observation_drained_buffer_into_future
@@ -779,7 +772,7 @@ mod tests {
                 }
             }
 
-            expect(poll_close_via_storage(1)) {
+            expect(poll_close_via_storage(1)) as enqueue_close {
                 when there_is_buffered_work_to_flush_before_closing {
                     to starts_flushing_the_buffered_work_before_completing { poll_started_flush }
                 }
