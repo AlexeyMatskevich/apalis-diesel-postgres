@@ -278,7 +278,7 @@ fn list_tasks_rows(
         sql_query(
             "SELECT * FROM apalis.jobs
              WHERE status = $1 AND job_type = $2
-             ORDER BY done_at DESC, run_at DESC
+             ORDER BY done_at DESC, run_at DESC, id DESC
              LIMIT $3 OFFSET $4",
         )
         .bind::<Text, _>(status)
@@ -300,7 +300,7 @@ fn list_all_tasks_rows(
         sql_query(
             "SELECT * FROM apalis.jobs
              WHERE status = $1
-             ORDER BY done_at DESC, run_at DESC
+             ORDER BY done_at DESC, run_at DESC, id DESC
              LIMIT $2 OFFSET $3",
         )
         .bind::<Text, _>(status)
@@ -485,63 +485,63 @@ fn build_metrics_sql(by_queue: bool) -> String {
     };
     format!(
             "WITH job_rollup AS (
-                 SELECT COUNT(*) FILTER (WHERE status = 'Running')::REAL AS running_jobs,
-                        COUNT(*) FILTER (WHERE status = 'Pending')::REAL AS pending_jobs,
-                        COUNT(*) FILTER (WHERE status = 'Failed')::REAL AS failed_jobs,
-                        COUNT(*) FILTER (WHERE status IN ('Pending', 'Running', 'Queued'))::REAL AS active_jobs,
+                 SELECT COUNT(*) FILTER (WHERE status = 'Running')::TEXT AS running_jobs,
+                        COUNT(*) FILTER (WHERE status = 'Pending')::TEXT AS pending_jobs,
+                        COUNT(*) FILTER (WHERE status = 'Failed')::TEXT AS failed_jobs,
+                        COUNT(*) FILTER (WHERE status IN ('Pending', 'Running', 'Queued'))::TEXT AS active_jobs,
                         COUNT(*) FILTER (
                             WHERE status = 'Running'
                                 AND run_at < now() - INTERVAL '1 hour'
-                        )::REAL AS stale_running_jobs,
-                        ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'Killed') / NULLIF(COUNT(*), 0), 2)::REAL AS kill_rate,
-                        COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 hour')::REAL AS jobs_past_hour,
+                        )::TEXT AS stale_running_jobs,
+                        ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'Killed') / NULLIF(COUNT(*), 0), 2)::TEXT AS kill_rate,
+                        COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 hour')::TEXT AS jobs_past_hour,
                         COUNT(*) FILTER (
                             WHERE run_at >= CURRENT_DATE
                                 AND run_at < CURRENT_DATE + INTERVAL '1 day'
-                        )::REAL AS jobs_today,
+                        )::TEXT AS jobs_today,
                         COUNT(*) FILTER (
                             WHERE status = 'Killed'
                                 AND run_at >= CURRENT_DATE
                                 AND run_at < CURRENT_DATE + INTERVAL '1 day'
-                        )::REAL AS killed_jobs_today,
-                        ROUND(COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 hour') / 60.0, 2)::REAL AS avg_jobs_per_minute_past_hour,
-                        COUNT(*)::REAL AS total_jobs,
-                        COUNT(*) FILTER (WHERE status = 'Done')::REAL AS done_jobs,
-                        COUNT(*) FILTER (WHERE status IN ('Done', 'Failed', 'Killed'))::REAL AS completed_jobs,
-                        COUNT(*) FILTER (WHERE status = 'Killed')::REAL AS killed_jobs,
-                        ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'Done') / NULLIF(COUNT(*), 0), 2)::REAL AS success_rate,
+                        )::TEXT AS killed_jobs_today,
+                        ROUND(COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 hour') / 60.0, 2)::TEXT AS avg_jobs_per_minute_past_hour,
+                        COUNT(*)::TEXT AS total_jobs,
+                        COUNT(*) FILTER (WHERE status = 'Done')::TEXT AS done_jobs,
+                        COUNT(*) FILTER (WHERE status IN ('Done', 'Failed', 'Killed'))::TEXT AS completed_jobs,
+                        COUNT(*) FILTER (WHERE status = 'Killed')::TEXT AS killed_jobs,
+                        ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'Done') / NULLIF(COUNT(*), 0), 2)::TEXT AS success_rate,
                         ROUND(
                             AVG(EXTRACT(EPOCH FROM (done_at - run_at)) / 60.0)
                                 FILTER (WHERE status IN ('Done', 'Failed', 'Killed') AND done_at IS NOT NULL),
                             2
-                        )::REAL AS avg_job_duration_mins,
+                        )::TEXT AS avg_job_duration_mins,
                         ROUND(
                             COALESCE(MAX(EXTRACT(EPOCH FROM (now() - run_at)) / 60.0)
                                 FILTER (WHERE status = 'Running'), 0),
                             2
-                        )::REAL AS longest_running_job_mins,
-                        COUNT(*) FILTER (WHERE status = 'Pending' AND run_at <= now())::REAL AS queue_backlog,
-                        COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 day')::REAL AS jobs_past_24_hours,
-                        COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '7 days')::REAL AS jobs_past_7_days,
+                        )::TEXT AS longest_running_job_mins,
+                        COUNT(*) FILTER (WHERE status = 'Pending' AND run_at <= now())::TEXT AS queue_backlog,
+                        COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 day')::TEXT AS jobs_past_24_hours,
+                        COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '7 days')::TEXT AS jobs_past_7_days,
                         COUNT(*) FILTER (
                             WHERE status = 'Killed'
                                 AND run_at >= now() - INTERVAL '7 days'
-                        )::REAL AS killed_jobs_past_7_days,
+                        )::TEXT AS killed_jobs_past_7_days,
                         ROUND(
                             100.0 * COUNT(*) FILTER (
                                 WHERE status = 'Done'
                                     AND run_at >= now() - INTERVAL '1 day'
                             ) / NULLIF(COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 day'), 0),
                             2
-                        )::REAL AS success_rate_past_24h,
-                        ROUND(COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 day') / 24.0, 2)::REAL AS avg_jobs_per_hour_past_24h,
-                        ROUND(COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '7 days') / 7.0, 2)::REAL AS avg_jobs_per_day_past_7d,
-                        EXTRACT(EPOCH FROM MAX(run_at))::REAL AS most_recent_job,
-                        EXTRACT(EPOCH FROM (MIN(run_at) FILTER (WHERE status = 'Pending' AND run_at <= now())))::REAL AS oldest_pending_job
+                        )::TEXT AS success_rate_past_24h,
+                        ROUND(COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 day') / 24.0, 2)::TEXT AS avg_jobs_per_hour_past_24h,
+                        ROUND(COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '7 days') / 7.0, 2)::TEXT AS avg_jobs_per_day_past_7d,
+                        trim_scale(EXTRACT(EPOCH FROM MAX(run_at)))::TEXT AS most_recent_job,
+                        trim_scale(EXTRACT(EPOCH FROM (MIN(run_at) FILTER (WHERE status = 'Pending' AND run_at <= now()))))::TEXT AS oldest_pending_job
                  FROM apalis.jobs {scope}
              ),
              peak_hour AS (
-                 SELECT COALESCE(MAX(hourly_count), 0)::REAL AS value
+                 SELECT COALESCE(MAX(hourly_count), 0)::TEXT AS value
                  FROM (
                      SELECT COUNT(*) AS hourly_count
                      FROM apalis.jobs {where_past_day}
@@ -577,9 +577,9 @@ fn build_metrics_sql(by_queue: bool) -> String {
                  UNION ALL SELECT 8, 'Timestamp', 'MOST_RECENT_JOB', most_recent_job FROM job_rollup
                  UNION ALL SELECT 8, 'Timestamp', 'OLDEST_PENDING_JOB', oldest_pending_job FROM job_rollup
                  UNION ALL SELECT 8, 'Number', 'PEAK_HOUR_JOBS', value FROM peak_hour
-                 UNION ALL SELECT 9, 'Number', 'DB_PAGE_SIZE', current_setting('block_size')::INTEGER::REAL
-                 UNION ALL SELECT 9, 'Number', 'DB_PAGE_COUNT', (pg_total_relation_size('apalis.jobs') / current_setting('block_size')::INTEGER)::REAL
-                 UNION ALL SELECT 9, 'Number', 'DB_SIZE', pg_total_relation_size('apalis.jobs')::REAL
+                 UNION ALL SELECT 9, 'Number', 'DB_PAGE_SIZE', current_setting('block_size')::INTEGER::TEXT
+                 UNION ALL SELECT 9, 'Number', 'DB_PAGE_COUNT', (pg_total_relation_size('apalis.jobs') / current_setting('block_size')::INTEGER)::TEXT
+                 UNION ALL SELECT 9, 'Number', 'DB_SIZE', pg_total_relation_size('apalis.jobs')::TEXT
              ) metrics
              ORDER BY priority, statistic"
     )
@@ -681,7 +681,7 @@ mod tests {
     use super::*;
 
     lets_expect! {
-        expect(next_backoff(backoff, Duration::from_secs(2))) {
+        expect(next_backoff(backoff, Duration::from_secs(2))) as completion_polling_delay {
             let backoff = Duration::from_millis(100);
 
             to doubles_the_backoff { equal(Duration::from_millis(200)) }
@@ -697,7 +697,7 @@ mod tests {
             }
         }
 
-        expect(db_errors_exhausted(error_streak, 3)) {
+        expect(db_errors_exhausted(error_streak, 3)) as completion_database_error_budget {
             let error_streak = 0u32;
 
             to keeps_retrying_with_backoff { be_false }

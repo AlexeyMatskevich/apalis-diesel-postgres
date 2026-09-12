@@ -6,7 +6,7 @@ use apalis_core::{
 };
 use apalis_sql::{DateTime, DateTimeExt, TaskRow};
 use diesel::deserialize::QueryableByName;
-use diesel::sql_types::{Binary, Float4, Int4, Jsonb, Nullable, Text, Timestamptz};
+use diesel::sql_types::{Binary, Int4, Jsonb, Nullable, Text, Timestamptz};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use ulid::Ulid;
@@ -115,8 +115,8 @@ pub(crate) struct StatisticRow {
     pub(crate) r#type: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub(crate) statistic: Option<String>,
-    #[diesel(sql_type = Nullable<Float4>)]
-    pub(crate) value: Option<f32>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub(crate) value: Option<String>,
 }
 
 impl From<StatisticRow> for Statistic {
@@ -124,7 +124,7 @@ impl From<StatisticRow> for Statistic {
         Self {
             title: row.statistic.unwrap_or_default(),
             stat_type: apalis_sql::stat_type_from_string(&row.r#type.unwrap_or_default()),
-            value: row.value.unwrap_or_default().to_string(),
+            value: row.value.unwrap_or_else(|| "0".to_owned()),
             priority: Some(row.priority.unwrap_or_default().max(0) as u64),
         }
     }
@@ -237,7 +237,7 @@ mod tests {
     fn statistic_row(
         statistic: Option<String>,
         r#type: Option<String>,
-        value: Option<f32>,
+        value: Option<String>,
         priority: Option<i32>,
     ) -> StatisticRow {
         StatisticRow {
@@ -369,8 +369,53 @@ mod tests {
         serde_json::to_string(task.parts.ctx.meta()).map_err(|error| error.to_string())
     }
 
+    fn forwarded_task_record(has_completion: bool) -> TaskRow {
+        let mut row = job_row(
+            1,
+            3,
+            Some(9),
+            expected_metadata(),
+            expected_idempotency_key(),
+            None,
+        );
+        row.run_at = <DateTime as DateTimeExt>::from_unix_timestamp(123);
+        row.lock_at = has_completion.then(|| <DateTime as DateTimeExt>::from_unix_timestamp(456));
+        row.lock_by = has_completion.then(|| "worker-1".to_owned());
+        row.done_at = has_completion.then(|| <DateTime as DateTimeExt>::from_unix_timestamp(789));
+        TaskRow::from(row)
+    }
+
     lets_expect! {
-        expect(compact_metadata_json(metadata)) {
+        expect(forwarded_task_record(has_completion)) as forwarded_task_record {
+            let has_completion = true;
+            when ownership_and_completion_are_present {
+                to preserves_the_record_fields {
+                    have(job) equal(vec![1, 2, 3]),
+                    have(id) equal("task-1".to_owned()),
+                    have(job_type) equal("email".to_owned()),
+                    have(status) equal("pending".to_owned()),
+                    have(run_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(123))),
+                    have(lock_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(456))),
+                    have(lock_by) equal(Some("worker-1".to_owned())),
+                    have(done_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(789)))
+                }
+            }
+            when ownership_and_completion_are_absent {
+                let has_completion = false;
+                to preserves_the_unowned_record {
+                    have(job) equal(vec![1, 2, 3]),
+                    have(id) equal("task-1".to_owned()),
+                    have(job_type) equal("email".to_owned()),
+                    have(status) equal("pending".to_owned()),
+                    have(run_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(123))),
+                    have(lock_at) equal(None),
+                    have(lock_by) equal(None),
+                    have(done_at) equal(None)
+                }
+            }
+        }
+
+        expect(compact_metadata_json(metadata)) as compact_task_metadata {
             let metadata: Value = json!({"trace": "abc"});
 
             when metadata_is_a_json_object {
@@ -405,7 +450,7 @@ mod tests {
             }
         }
 
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) {
+        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_attempt_count {
             let attempts = 1;
             let max_attempts = 3;
             let priority = Some(9);
@@ -424,6 +469,15 @@ mod tests {
                 let attempts = -1;
                 to clamps_attempts_to_zero { have(attempts) equal(0) }
             }
+        }
+
+        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_attempt_budget {
+            let attempts = 1;
+            let max_attempts = 3;
+            let priority = Some(9);
+            let metadata = expected_metadata();
+            let idempotency_key = expected_idempotency_key();
+            let last_result: Option<Value> = Some(json!({"ok": true}));
 
             to preserves_the_positive_attempt_limit { have(max_attempts) equal(Some(3)) }
 
@@ -436,6 +490,15 @@ mod tests {
                 let max_attempts = -1;
                 to clamps_the_attempt_limit_to_zero { have(max_attempts) equal(Some(0)) }
             }
+        }
+
+        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_priority {
+            let attempts = 1;
+            let max_attempts = 3;
+            let priority = Some(9);
+            let metadata = expected_metadata();
+            let idempotency_key = expected_idempotency_key();
+            let last_result: Option<Value> = Some(json!({"ok": true}));
 
             when priority_is_absent {
                 let priority = None;
@@ -453,20 +516,45 @@ mod tests {
                 let priority = Some(-1);
                 to clamps_priority_to_zero { have(priority) equal(Some(0)) }
             }
+        }
 
-            to preserves_metadata_and_idempotency {
-                have(metadata) equal(expected_metadata()),
-                have(idempotency_key) equal(idempotency_key.clone())
-            }
+        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_metadata {
+            let attempts = 1;
+            let max_attempts = 3;
+            let priority = Some(9);
+            let metadata = expected_metadata();
+            let idempotency_key = expected_idempotency_key();
+            let last_result: Option<Value> = Some(json!({"ok": true}));
 
-            when metadata_and_idempotency_are_absent {
+            to preserves_present_metadata { have(metadata) equal(expected_metadata()) }
+            when metadata_is_absent {
                 let metadata = None;
-                let idempotency_key = None;
-                to leaves_metadata_and_idempotency_absent {
-                    have(metadata) equal(None),
-                    have(idempotency_key) equal(None)
-                }
+                to leaves_metadata_absent { have(metadata) equal(None) }
             }
+        }
+
+        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_deduplication_key {
+            let attempts = 1;
+            let max_attempts = 3;
+            let priority = Some(9);
+            let metadata = expected_metadata();
+            let idempotency_key = expected_idempotency_key();
+            let last_result: Option<Value> = Some(json!({"ok": true}));
+
+            to preserves_the_key { have(idempotency_key) equal(expected_idempotency_key()) }
+            when the_key_is_absent {
+                let idempotency_key = None;
+                to leaves_the_key_absent { have(idempotency_key) equal(None) }
+            }
+        }
+
+        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_last_result {
+            let attempts = 1;
+            let max_attempts = 3;
+            let priority = Some(9);
+            let metadata = expected_metadata();
+            let idempotency_key = expected_idempotency_key();
+            let last_result: Option<Value> = Some(json!({"ok": true}));
 
             to forwards_the_present_last_result { have(last_result) equal(Some(json!({"ok": true}))) }
 
@@ -482,7 +570,7 @@ mod tests {
             }
         }
 
-        expect(RunningWorker::from(worker_row(last_seen, started_at, layers))) {
+        expect(RunningWorker::from(worker_row(last_seen, started_at, layers))) as worker_heartbeat_time {
             let last_seen = <DateTime as DateTimeExt>::from_unix_timestamp(123);
             let started_at = Some(<DateTime as DateTimeExt>::from_unix_timestamp(456));
             let layers = Some("layer-a,layer-b".to_string());
@@ -503,12 +591,17 @@ mod tests {
             when last_seen_is_a_negative_unix_timestamp {
                 // Mirror of started_at below: `u64::try_from(negative).unwrap_or(0)`
                 // (src/models.rs:95) collapses a pre-epoch heartbeat to zero
-                // rather than surfacing an error. The DB schema never produces
-                // such values, but the clamp is asserted so any future change is
-                // intentional rather than accidental.
+                // rather than surfacing an error. The public unsigned timestamp
+                // cannot preserve pre-epoch values inserted directly into the DB.
                 let last_seen = <DateTime as DateTimeExt>::from_unix_timestamp(-1);
                 to silently_clamps_pre_epoch_heartbeat_to_zero { have(last_heartbeat) equal(0) }
             }
+        }
+
+        expect(RunningWorker::from(worker_row(last_seen, started_at, layers))) as worker_start_time {
+            let last_seen = <DateTime as DateTimeExt>::from_unix_timestamp(123);
+            let started_at = Some(<DateTime as DateTimeExt>::from_unix_timestamp(456));
+            let layers = Some("layer-a,layer-b".to_string());
 
             to converts_started_at_to_a_unix_timestamp { have(started_at) equal(456) }
 
@@ -522,12 +615,21 @@ mod tests {
                 // collapses pre-epoch timestamps to zero rather than surfacing an
                 // error. Dashboards consuming `RunningWorker.started_at` therefore
                 // cannot distinguish "started before 1970" from "unknown start time"
-                // — acceptable because the DB schema never produces such values,
-                // but the behaviour is asserted here so any future change is
-                // intentional rather than accidental.
+                // The public unsigned representation preserves this compatibility
+                // fallback even for timestamps inserted directly into the DB.
                 let started_at = Some(<DateTime as DateTimeExt>::from_unix_timestamp(-1));
                 to silently_clamps_pre_epoch_to_zero { have(started_at) equal(0) }
             }
+            when the_worker_started_at_the_epoch {
+                let started_at = Some(<DateTime as DateTimeExt>::from_unix_timestamp(0));
+                to preserves_the_epoch { have(started_at) equal(0) }
+            }
+        }
+
+        expect(RunningWorker::from(worker_row(last_seen, started_at, layers))) as worker_layers {
+            let last_seen = <DateTime as DateTimeExt>::from_unix_timestamp(123);
+            let started_at = Some(<DateTime as DateTimeExt>::from_unix_timestamp(456));
+            let layers = Some("layer-a,layer-b".to_string());
 
             to preserves_layers { have(layers) equal("layer-a,layer-b".to_string()) }
 
@@ -537,10 +639,10 @@ mod tests {
             }
         }
 
-        expect(Statistic::from(statistic_row(statistic, stat_type, value, priority))) {
+        expect(Statistic::from(statistic_row(statistic, stat_type, value, priority))) as statistic_title {
             let statistic = Some("processed".to_string());
             let stat_type = Some("Decimal".to_string());
-            let value = Some(7.5);
+            let value = Some("7.5".to_owned());
             let priority = Some(4);
 
             to preserves_the_title { have(title) equal("processed".to_string()) }
@@ -549,6 +651,13 @@ mod tests {
                 let statistic = None;
                 to defaults_the_title_to_an_empty_string { have(title) equal(String::new()) }
             }
+        }
+
+        expect(Statistic::from(statistic_row(statistic, stat_type, value, priority))) as statistic_type {
+            let statistic = Some("processed".to_string());
+            let stat_type = Some("Decimal".to_string());
+            let value = Some("7.5".to_owned());
+            let priority = Some(4);
 
             to maps_the_type_to_decimal { has_stat_type(StatType::Decimal) }
 
@@ -571,13 +680,37 @@ mod tests {
                 let stat_type = None;
                 to defaults_the_type_to_number { has_stat_type(StatType::Number) }
             }
+        }
 
-            to stringifies_the_value { have(value) equal("7.5".to_string()) }
+        expect(Statistic::from(statistic_row(statistic, stat_type, value, priority))) as statistic_value {
+            let statistic = Some("processed".to_string());
+            let stat_type = Some("Decimal".to_string());
+            let value = Some("7.5".to_owned());
+            let priority = Some(4);
+
+            to preserves_the_decimal_text { have(value) equal("7.5".to_string()) }
+
+            when the_value_exceeds_single_precision_integer_accuracy {
+                let value = Some("16777217".to_owned());
+                to preserves_every_integer_digit { have(value) equal("16777217".to_owned()) }
+            }
+
+            when the_value_exceeds_double_precision_integer_accuracy {
+                let value = Some("9007199254740993".to_owned());
+                to preserves_every_integer_digit { have(value) equal("9007199254740993".to_owned()) }
+            }
 
             when value_is_absent {
                 let value = None;
                 to defaults_the_value_to_zero { have(value) equal("0".to_string()) }
             }
+        }
+
+        expect(Statistic::from(statistic_row(statistic, stat_type, value, priority))) as statistic_priority {
+            let statistic = Some("processed".to_string());
+            let stat_type = Some("Decimal".to_string());
+            let value = Some("7.5".to_owned());
+            let priority = Some(4);
 
             when priority_is_absent {
                 let priority = None;
@@ -597,7 +730,7 @@ mod tests {
             }
         }
 
-        expect(QueueInfo::from(queue_info_row(name, stats, workers, activity))) {
+        expect(QueueInfo::from(queue_info_row(name, stats, workers, activity))) as queue_name {
             let name = Some("email".to_string());
             let stats = Some(decimal_statistic());
             let workers = Some(workers());
@@ -609,6 +742,13 @@ mod tests {
                 let name = None;
                 to defaults_the_name_to_an_empty_string { have(name) equal(String::new()) }
             }
+        }
+
+        expect(QueueInfo::from(queue_info_row(name, stats, workers, activity))) as queue_statistics {
+            let name = Some("email".to_string());
+            let stats = Some(decimal_statistic());
+            let workers = Some(workers());
+            let activity = Some(activity());
 
             to decodes_the_stats { contains_decimal_statistic }
 
@@ -621,6 +761,13 @@ mod tests {
                 let stats = None;
                 to defaults_stats_to_an_empty_list { have(stats.len()) equal(0) }
             }
+        }
+
+        expect(QueueInfo::from(queue_info_row(name, stats, workers, activity))) as queue_workers {
+            let name = Some("email".to_string());
+            let stats = Some(decimal_statistic());
+            let workers = Some(workers());
+            let activity = Some(activity());
 
             to decodes_the_workers { have(workers) equal(vec!["worker-1".to_string(), "worker-2".to_string()]) }
 
@@ -633,6 +780,13 @@ mod tests {
                 let workers = None;
                 to defaults_workers_to_an_empty_list { have(workers) equal(Vec::<String>::new()) }
             }
+        }
+
+        expect(QueueInfo::from(queue_info_row(name, stats, workers, activity))) as queue_activity {
+            let name = Some("email".to_string());
+            let stats = Some(decimal_statistic());
+            let workers = Some(workers());
+            let activity = Some(activity());
 
             to decodes_the_activity { have(activity) equal(vec![1, 2, 3, 4]) }
 
@@ -646,5 +800,6 @@ mod tests {
                 to defaults_activity_to_an_empty_list { have(activity) equal(Vec::<usize>::new()) }
             }
         }
+
     }
 }
