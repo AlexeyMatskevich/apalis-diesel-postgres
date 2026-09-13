@@ -412,6 +412,10 @@ branch. It cannot authorize further polling. A finite custom strategy must
 explicitly define how polling continues; creating fresh configuration or using
 the factory is the upgrade path for previously shared one-shot strategies.
 
+A claimed row whose payload fails to decode is released through the retry
+budget before the batch continues; a release that keeps failing after a few
+seconds of retries retires the worker registration so orphan recovery can
+reclaim the row and the rest of that batch.
 Each claim is acknowledged at most once. An in-process re-dispatch of an
 already acknowledged claim, for example by a retry layer placed outside the
 backend middleware, is refused with `AlreadyAcknowledged` before the handler

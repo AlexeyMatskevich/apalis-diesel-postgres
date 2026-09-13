@@ -27,6 +27,15 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- Releasing an undecodable claim (`Failed` with the codec error, or `Killed`)
+  yielded the database error to the consumer on every failed attempt and
+  retried without limit. Under Apalis the first error ended the worker and the
+  retained obligation with it; a consumer that continued polling looped
+  forever while the buffered siblings of that batch were never delivered and
+  stayed hidden behind a live heartbeat. The release is now retried with
+  bounded backoff while the consumer polls (about three seconds), and a
+  release that keeps failing retires the worker's local registration and
+  yields the error, so the row and its siblings are recovered as orphans.
 - A retry layer composed outside the backend middleware, such as apalis's
   `.retry(RetryPolicy::retries(n))`, re-dispatched a task whose claim was
   already acknowledged. The handler ran again, the second acknowledgement was

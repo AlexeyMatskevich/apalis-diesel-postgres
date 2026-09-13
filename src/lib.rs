@@ -514,10 +514,11 @@ where
             self.poll_factory,
         );
         crate::fetcher::decode_task_stream::<Args, Decode>(
-            crate::fetcher::LeaseStream::new(compact, lease, true).boxed(),
+            crate::fetcher::LeaseStream::new(compact, lease.clone(), true).boxed(),
             pool,
             std::sync::Arc::from(worker.name().as_str()),
             Some(lease_token),
+            lease,
         )
     }
 }

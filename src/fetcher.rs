@@ -32,6 +32,16 @@ use crate::{CompactType, Config, Error, PgContext, PgPool, PgTask, PgTaskId, que
 #[derive(Debug, Clone, Default)]
 pub struct PgNotify;
 
+/// Failed releases of an undecodable claim are retried this many times, with
+/// the delay doubling from [`RELEASE_RETRY_BASE_DELAY`], before the worker's
+/// local lease is retired: about three seconds in total.
+const RELEASE_RETRY_LIMIT: u32 = 5;
+const RELEASE_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+fn release_retry_delay(failures: u32) -> Duration {
+    RELEASE_RETRY_BASE_DELAY * 2u32.saturating_pow(failures.saturating_sub(1))
+}
+
 /// Gate `body` behind `register`: emit the registration outcome as the first
 /// stream item (preserving the wire contract that consumers observe it), and
 /// only proceed to drain `body` when registration succeeded. On failure the
@@ -73,14 +83,18 @@ where
 /// the row would stay `Running` for as long as this worker keeps heartbeating
 /// — unackable (ack needs a decoded task) and invisible to orphan recovery
 /// (which only reclaims rows of stale workers).
-/// A failed release remains owned by this stream. Database errors are yielded
-/// with bounded retry pacing; only a successful or stale release discharges the
-/// obligation and emits the original codec error before continuing the batch.
+/// A failed release remains owned by this stream: it is retried with bounded
+/// backoff while the consumer keeps polling, and only a successful or stale
+/// release discharges the obligation and emits the original codec error before
+/// continuing the batch. A release that keeps failing retires the worker's
+/// local lease and yields the database error, so the row and its buffered
+/// siblings become recoverable as orphans once the heartbeat stops.
 pub(crate) fn decode_task_stream<Args, Decode>(
     compact: TaskStream<PgTask<CompactType>, Error>,
     pool: PgPool,
     worker_id: Arc<str>,
     lease_token: Option<Arc<str>>,
+    lease: Arc<crate::lease::WorkerLease>,
 ) -> TaskStream<PgTask<Args>, Error>
 where
     Args: Send + 'static,
@@ -92,7 +106,7 @@ where
         lock_at: i64,
         attempts: i32,
         decode_error: Error,
-        retry: bool,
+        failures: u32,
     }
 
     stream::unfold(
@@ -101,11 +115,12 @@ where
             let pool = pool.clone();
             let worker_id = worker_id.clone();
             let lease_token = lease_token.clone();
+            let lease = lease.clone();
             async move {
                 loop {
                     if let Some(mut obligation) = release.take() {
-                        if obligation.retry {
-                            Delay::new(Duration::from_millis(100)).await;
+                        if obligation.failures > 0 {
+                            Delay::new(release_retry_delay(obligation.failures)).await;
                         }
                         match queries::fail_undecodable_task(
                             pool.clone(),
@@ -114,14 +129,23 @@ where
                             obligation.lock_at,
                             obligation.attempts,
                             obligation.decode_error.to_string(),
-                            lease_token,
+                            lease_token.clone(),
                         )
                         .await
                         {
                             Ok(_) => return Some((Err(obligation.decode_error), (compact, None))),
                             Err(error) => {
-                                obligation.retry = true;
-                                return Some((Err(error), (compact, Some(obligation))));
+                                obligation.failures += 1;
+                                if obligation.failures > RELEASE_RETRY_LIMIT {
+                                    // The row cannot be released and must not stay
+                                    // hidden behind a live heartbeat. Retiring stops
+                                    // this worker's claims and heartbeats so orphan
+                                    // recovery reclaims the row and its siblings.
+                                    lease.retire();
+                                    return Some((Err(error), (compact, None)));
+                                }
+                                release = Some(obligation);
+                                continue;
                             }
                         }
                     }
@@ -144,7 +168,7 @@ where
                                             lock_at,
                                             attempts,
                                             decode_error,
-                                            retry: false,
+                                            failures: 0,
                                         });
                                     }
                                     _ => return Some((Err(decode_error), (compact, None))),

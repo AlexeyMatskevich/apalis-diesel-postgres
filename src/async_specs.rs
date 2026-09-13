@@ -18,19 +18,26 @@ struct State {
     attempts: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Release {
+    Immediate,
+    AfterTransientFault,
+    PersistentFault,
+}
+
 #[derive(Debug)]
 struct DecodeOutcome {
     errors: Vec<&'static str>,
     corrupt_state: State,
-    sibling: PgTask<String>,
+    sibling: Option<PgTask<String>>,
     expected_sibling_id: PgTaskId,
     expected_worker: String,
-    active_after_next: bool,
+    retired_after_next: bool,
     retired_after_drop: bool,
 }
 
 async fn decode_cleanup(
-    transient_failure: bool,
+    release: Release,
     max_attempts: i32,
 ) -> Result<Option<DecodeOutcome>, String> {
     let Some(url) = support::database_url_or_skip()? else {
@@ -100,29 +107,45 @@ async fn decode_cleanup(
         pool.clone(),
         name.clone().into(),
         Some(token),
+        lease.clone(),
     );
-    let held = if transient_failure {
-        Some(pool.get().map_err(|error| error.to_string())?)
-    } else {
-        None
+    // The single pooled connection is held so the release cannot check one out.
+    let mut held = match release {
+        Release::Immediate => None,
+        Release::AfterTransientFault | Release::PersistentFault => {
+            Some(pool.get().map_err(|error| error.to_string())?)
+        }
     };
-    let mut outcomes = Vec::new();
-    if transient_failure {
-        match decoded.next().await {
-            Some(Err(Error::Pool(_))) => outcomes.push("pool"),
-            other => return Err(format!("expected transient pool error, got {other:?}")),
+    if matches!(release, Release::AfterTransientFault) {
+        // The fault clears while the stream is still retrying the release.
+        let released_later = held.take();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            drop(released_later);
+        });
+    }
+    fn kind(item: &Option<Result<Option<PgTask<String>>, Error>>) -> &'static str {
+        match item {
+            Some(Err(Error::Decode(_))) => "decode",
+            Some(Err(Error::Pool(_))) => "pool",
+            Some(Err(Error::WorkerRetired { .. })) => "retired",
+            Some(Err(_)) => "other_error",
+            Some(Ok(Some(_))) => "task",
+            Some(Ok(None)) => "empty",
+            None => "ended",
         }
     }
-    drop(held);
-    match decoded.next().await {
-        Some(Err(Error::Decode(_))) => outcomes.push("decode"),
-        other => return Err(format!("expected codec error after release, got {other:?}")),
-    }
-    let sibling = match decoded.next().await {
-        Some(Ok(Some(task))) => task,
-        other => return Err(format!("expected valid sibling, got {other:?}")),
+    let mut outcomes = Vec::new();
+    let first = decoded.next().await;
+    outcomes.push(kind(&first));
+    let retired_after_next = lease.is_retired();
+    let second = decoded.next().await;
+    outcomes.push(kind(&second));
+    let sibling = match second {
+        Some(Ok(Some(task))) => Some(task),
+        _ => None,
     };
-    let active_after_next = !lease.is_retired();
+    drop(held);
     drop(decoded);
     let retired_after_drop = lease.is_retired();
     let name_cleanup = name.clone();
@@ -147,13 +170,12 @@ async fn decode_cleanup(
         sibling,
         expected_sibling_id,
         expected_worker: name,
-        active_after_next,
+        retired_after_next,
         retired_after_drop,
     }))
 }
 
 fn recovered(
-    transient_failure: bool,
     max_attempts: i32,
 ) -> impl Fn(&Result<Option<DecodeOutcome>, String>) -> AssertionResult {
     move |outcome| {
@@ -163,54 +185,80 @@ fn recovered(
         let Some(outcome) = result else {
             return Ok(());
         };
-        let expected = if transient_failure {
-            vec!["pool", "decode"]
-        } else {
-            vec!["decode"]
-        };
         let expected_status = if max_attempts == 1 {
             "Killed"
         } else {
             "Failed"
         };
-        if outcome.errors == expected
+        let sibling_delivered = outcome.sibling.as_ref().is_some_and(|sibling| {
+            sibling.args == "healthy-sibling"
+                && sibling.parts.task_id == Some(outcome.expected_sibling_id)
+                && sibling.parts.status.load() == Status::Running
+                && sibling.parts.ctx.lock_by().as_deref() == Some(outcome.expected_worker.as_str())
+                && sibling.parts.ctx.lock_at().is_some()
+                && sibling.parts.attempt.current() == 0
+        });
+        if outcome.errors == ["decode", "task"]
             && outcome.corrupt_state.status == expected_status
             && outcome.corrupt_state.attempts == 1
-            && outcome.sibling.args == "healthy-sibling"
-            && outcome.sibling.parts.task_id == Some(outcome.expected_sibling_id)
-            && outcome.sibling.parts.status.load() == Status::Running
-            && outcome.sibling.parts.ctx.lock_by().as_deref()
-                == Some(outcome.expected_worker.as_str())
-            && outcome.sibling.parts.ctx.lock_at().is_some()
-            && outcome.sibling.parts.attempt.current() == 0
-            && outcome.active_after_next
+            && sibling_delivered
+            && !outcome.retired_after_next
             && outcome.retired_after_drop
         {
             Ok(())
         } else {
             Err(AssertionError::new(vec![format!(
-                "expected {expected:?}, {expected_status} after exactly one failed attempt, the original healthy sibling with Running owner/lock and attempt zero, active next and retired whole drop; got {result:?}"
+                "expected the codec error then the sibling, {expected_status} after exactly one failed attempt, the original healthy sibling with Running owner/lock and attempt zero, an active worker until the whole stream is dropped; got {result:?}"
+            )]))
+        }
+    }
+}
+
+fn retired_with_the_claim_intact()
+-> impl Fn(&Result<Option<DecodeOutcome>, String>) -> AssertionResult {
+    move |outcome| {
+        let result = outcome.as_ref().map_err(|error| {
+            AssertionError::new(vec![format!("decode cleanup scenario failed: {error}")])
+        })?;
+        let Some(outcome) = result else {
+            return Ok(());
+        };
+        if outcome.errors == ["pool", "retired"]
+            && outcome.corrupt_state.status == "Running"
+            && outcome.corrupt_state.attempts == 0
+            && outcome.sibling.is_none()
+            && outcome.retired_after_next
+            && outcome.retired_after_drop
+        {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "expected the database error then WorkerRetired, the corrupt row still Running with no attempt consumed, no sibling delivered and the worker retired by the failed release; got {result:?}"
             )]))
         }
     }
 }
 
 lets_expect! { #tokio_test
-    expect(decode_cleanup(transient_failure, max_attempts).await) as corrupt_claim_cleanup {
-        let transient_failure = false;
+    expect(decode_cleanup(release, max_attempts).await) as corrupt_claim_cleanup {
+        let release = Release::Immediate;
         let max_attempts = 3_i32;
-        to releases_the_corrupt_claim_before_delivering_the_valid_sibling { recovered(transient_failure, max_attempts) }
+        to releases_the_corrupt_claim_before_delivering_the_valid_sibling { recovered(max_attempts) }
         when the_corrupt_task_has_exhausted_its_attempt_budget {
             let max_attempts = 1_i32;
-            to kills_the_corrupt_task_and_preserves_the_valid_sibling { recovered(transient_failure, max_attempts) }
-            when the_pool_is_exhausted_during_decode_cleanup {
-                let transient_failure = true;
-                to retains_the_terminal_cleanup_until_the_pool_recovers { recovered(transient_failure, max_attempts) }
+            to kills_the_corrupt_task_and_preserves_the_valid_sibling { recovered(max_attempts) }
+            when the_pool_recovers_while_the_release_is_retried {
+                let release = Release::AfterTransientFault;
+                to retains_the_terminal_cleanup_until_the_pool_recovers { recovered(max_attempts) }
             }
         }
-        when the_pool_is_exhausted_during_decode_cleanup {
-            let transient_failure = true;
-            to preserves_the_cleanup_obligation_until_the_pool_recovers { recovered(transient_failure, max_attempts) }
+        when the_pool_recovers_while_the_release_is_retried {
+            let release = Release::AfterTransientFault;
+            to absorbs_the_fault_and_releases_the_claim { recovered(max_attempts) }
+        }
+        when the_pool_stays_exhausted_past_the_retry_budget {
+            let release = Release::PersistentFault;
+            to retires_the_worker_so_orphan_recovery_can_reclaim_the_batch { retired_with_the_claim_intact() }
         }
     }
 }
