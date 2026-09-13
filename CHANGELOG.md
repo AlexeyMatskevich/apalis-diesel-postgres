@@ -27,6 +27,14 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- The down migration of `20260910000000_reconcile_schema_contract` restores the
+  previous `jobs_dequeue_idx` predicate and the `apalis.get_jobs` and
+  `apalis.notify_new_jobs` definitions the 0.4.1 release installed, instead
+  of leaving the narrowed index and the newer function bodies behind, so
+  reverting the series returns a database installed by 0.4.1 to exactly its
+  own schema.
+- The down migration of `20260912000001_require_active_owner` drops the
+  constraint with `IF EXISTS`, matching the other down migrations.
 - The buffered enqueue sink failed permanently (`SinkFailed`) after any flush
   error, including a task rejected by a size cap or an unrepresentable
   `run_at` before any statement was issued, and a pool checkout failure; the

@@ -11,6 +11,13 @@ use ulid::Ulid;
 pub(crate) fn mint_lease_token() -> String {
     Ulid::new().to_string()
 }
+/// Per-statement cap on the periodic orphan-recovery sweep. Without a bound,
+/// a mass worker death would rewrite every orphaned row in one statement
+/// while holding their locks; the sweep repeats every `keep_alive` interval,
+/// so a larger backlog drains across sweeps. Registration takeover is
+/// deliberately unbounded: it must recover every claim of the identity it
+/// replaces before the new token renews the heartbeat, or those rows would
+/// stay hidden behind a live registration.
 pub(crate) const REENQUEUE_ORPHANED_BATCH_LIMIT: i32 = 1000;
 
 // Compare elapsed seconds as a numeric value instead of constructing an interval:
