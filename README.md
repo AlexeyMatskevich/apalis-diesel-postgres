@@ -213,7 +213,10 @@ whether `run` returned an error or not: the release hands any unfinished task
 back to the queue at once and lets a restart register the same name
 immediately instead of being refused with `AlreadyRegistered` until the
 deadline passes. Restart with fresh storage; the releasing storage and its
-clones are retired.
+clones are retired. A worker killed before it could release waits for the
+deadline by design: `reenqueue_orphaned_after` is the restart latency after
+a crash, so shorten it (with a proportionally shorter `keep_alive`) when a
+fast restart matters more than tolerance for slow heartbeats.
 
 ```rust,no_run
 # use apalis::prelude::*;

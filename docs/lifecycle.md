@@ -221,6 +221,16 @@ The first two rows are why the shutdown sequence matters: without a release,
 a restart under the same name is refused with `AlreadyRegistered` until the
 deadline passes, and in-flight tasks wait for it as well.
 
+That wait is the design, not a gap. A worker killed before it could release
+(`SIGKILL`, an out-of-memory kill, a pod eviction) leaves a registration
+that nothing can tell apart from a live one until the deadline, and
+background work tolerates the delay. `reenqueue_orphaned_after` is therefore
+the restart latency after a crash: keep the default 300 seconds when a
+delayed restart is acceptable, or pair a 5-second `keep_alive` with a
+20-to-30-second deadline when it is not. Shorter deadlines make a slow
+heartbeat statement look like a dead worker sooner, so keep the ratio of at
+least three.
+
 ### Failures while running
 
 Apalis stops a worker on the first error of its task stream or heartbeat
@@ -301,7 +311,8 @@ runs `VACUUM`.
 
 ## 10. Operating checklist
 
-- Configure `keep_alive` at most one third of `reenqueue_orphaned_after`.
+- Configure `keep_alive` at most one third of `reenqueue_orphaned_after`,
+  and choose the deadline as the restart latency you accept after a crash.
 - Release every worker after its run returns, then restart with fresh
   storage under the same name.
 - Bound handler duration with a timeout layer; watch `STALE_RUNNING_JOBS`.
