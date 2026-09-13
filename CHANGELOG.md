@@ -7,6 +7,15 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A worker stream whose registration failed (`AlreadyRegistered`, a pool
+  error) retired the worker name locally when it was dropped, so every clone
+  of that storage answered `WorkerRetired` and a same-name restart from a
+  cloned storage could never register. The local completion guard is now
+  armed when the registration item is yielded, the first point at which a
+  later poll can own a claim. Dropping a registered stream still retires.
+
 ## [0.5.0]
 
 ### Added

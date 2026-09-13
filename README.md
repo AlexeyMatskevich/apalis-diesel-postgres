@@ -424,7 +424,11 @@ stream consumer can continue after that error; Apalis treats stream errors as
 fatal. Errors before a claim and empty fetches also do not retire the local
 registration. Low-level token-free callers
 must resolve `ClaimOutcomeUnknown` before renewing that worker's heartbeat.
-Dropping a polling stream after its first poll also retires that registration.
+Dropping a polling stream after it has yielded its registration also retires
+that registration. A stream whose registration failed, for example with
+`AlreadyRegistered` or a pool error, owns no claim; dropping it leaves the
+name free, so a clone of the same storage can register once the holder is
+stale.
 The retired worker stops claiming new tasks and refreshing its heartbeat;
 other worker names sharing the storage remain independent. This is a fail-stop
 policy: with Apalis `Worker::run` or a monitored worker, the resulting stream
