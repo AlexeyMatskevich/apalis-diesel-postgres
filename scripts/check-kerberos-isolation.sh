@@ -106,12 +106,17 @@ test_roster() {
     # verdict then ends a later line; the name is held until it arrives, and
     # any other report line while it is held is an incomplete report.
     # Only complete libtest report lines end a held name early: a new test
-    # line, a summary, or a target header. Diagnostic text may begin with the
-    # same words ("running cleanup hook") and is not a report line.
-    phase == "run" && pending != "" && (/^test .* \.\.\. / || /^test result: / || /^running [0-9]+ tests?$/) {
+    # line, a full summary, or a target header. Diagnostic text may begin with
+    # the same words ("running cleanup hook", "test result: cache warmed") and
+    # is not a report line.
+    phase == "run" && pending != "" && (/^test .* \.\.\. / ||
+        /^test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out; finished in / ||
+        /^running [0-9]+ tests?$/) {
       bad = 1
     }
-    phase == "run" && pending != "" && /(^|[^[:alnum:]_])ok$/ {
+    # The verdict may be glued to a diagnostic written without a trailing
+    # newline ("backgroundok"); the summary counts still have to agree.
+    phase == "run" && pending != "" && /ok$/ {
       if (target == "" || !started || complete) bad = 1
       print "case\t" target "\t" pending
       count++; total++; pending = ""
@@ -120,6 +125,16 @@ test_roster() {
     phase == "run" && /^test .* \.\.\. ok$/ {
       if (target == "" || !started || complete) bad = 1
       sub(/^test /, ""); sub(/ \.\.\. ok$/, "")
+      sub(/ - should panic$/, "")
+      print "case\t" target "\t" $0
+      count++; total++
+      next
+    }
+    # A diagnostic without a trailing newline glues the verdict to the same
+    # line ("... backgroundok"); the summary counts still have to agree.
+    phase == "run" && /^test .* \.\.\. .*ok$/ {
+      if (target == "" || !started || complete) bad = 1
+      sub(/^test /, ""); sub(/ \.\.\. .*$/, "")
       sub(/ - should panic$/, "")
       print "case\t" target "\t" $0
       count++; total++
