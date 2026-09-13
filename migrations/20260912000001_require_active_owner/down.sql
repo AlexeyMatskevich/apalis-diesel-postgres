@@ -1,5 +1,5 @@
 -- Dropping the invariant cannot reconstruct a lost owner or undo repaired history.
-ALTER TABLE apalis.jobs DROP CONSTRAINT jobs_active_owner_check;
+ALTER TABLE apalis.jobs DROP CONSTRAINT IF EXISTS jobs_active_owner_check;
 
 -- Renew heartbeats without waiting for native or compatibility claims.
 CREATE OR REPLACE FUNCTION apalis.get_jobs(

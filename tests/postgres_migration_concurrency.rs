@@ -439,6 +439,42 @@ async fn listing_index_upgrade(panics: bool) -> Result<Outcome<Observations>, St
     }).await
 }
 
+/// Reverting the migrations that follow the released 0.4.1 generation must
+/// leave the schema of that generation, index predicate included.
+async fn reconciliation_downgrade() -> Result<Outcome<Observations>, String> {
+    with_isolated_database(|url| async move {
+        let pool = pool(&url)?;
+        setup(&pool).await.map_err(|e| e.to_string())?;
+        let mut out = Observations::new();
+        let dequeue = "SELECT pg_get_indexdef(to_regclass('apalis.jobs_dequeue_idx')) AS value";
+        let upgraded = catalog_text(&pool, dequeue).await?;
+        with_conn(pool.clone(), |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                conn.batch_execute(include_str!("../migrations/20260912000001_require_active_owner/down.sql"))?;
+                conn.batch_execute(include_str!("../migrations/20260912000000_worker_key_share/down.sql"))?;
+                conn.batch_execute(include_str!("../migrations/20260910000001_listing_id_tie_breaker/down.sql"))?;
+                conn.batch_execute(include_str!("../migrations/20260910000000_reconcile_schema_contract/down.sql"))?;
+                conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version IN ('20260912000001','20260912000000','20260910000001','20260910000000')")
+            }).map_err(|e| e.to_string())
+        }).await?;
+        out.check(
+            "down restores the previous generation's dequeue predicate",
+            catalog_text(&pool, dequeue).await? == "CREATE INDEX jobs_dequeue_idx ON apalis.jobs USING btree (job_type, priority DESC, run_at, id) WHERE ((status = 'Pending'::text) OR ((status = 'Failed'::text) AND (attempts < max_attempts)))",
+        );
+        out.check(
+            "down leaves the nine records of the previous generation",
+            count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 9,
+        );
+        setup(&pool).await.map_err(|e| e.to_string())?;
+        out.check(
+            "setup upgrades the downgraded schema again",
+            verify_schema(&pool).await.is_ok() && catalog_text(&pool, dequeue).await? == upgraded,
+        );
+        Ok(out)
+    })
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum IndexDrift {
     MissingTieBreaker,
@@ -549,6 +585,11 @@ lets_expect! { #tokio_test
         when delivery_of_the_migration_result_panics {
             let panics = true;
             to restores_the_previous_schema_and_allows_the_same_pool_to_retry { satisfies_contract() }
+        }
+    }
+    expect(reconciliation_downgrade().await) as schema_contract_downgrade {
+        when the_reconciliation_series_is_reverted {
+            to restores_the_previous_dequeue_index_and_upgrades_again { satisfies_contract() }
         }
     }
     expect(listing_index_verification(index, drift).await) as listing_index_verification {

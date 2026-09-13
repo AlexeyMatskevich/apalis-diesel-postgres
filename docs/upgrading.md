@@ -189,6 +189,17 @@ capacity. A failure before commit rolls back the entire new series; resolve its
 cause and retry. A lost COMMIT response or cancelled waiter does not establish
 whether the series committed; reconcile it as described in the cutover sequence.
 
+### Schema contract reconciliation
+
+Migration `20260910000000_reconcile_schema_contract` narrows the
+`jobs_dequeue_idx` predicate to
+`status IN ('Pending', 'Failed') AND attempts < max_attempts` and re-asserts
+the `apalis.get_jobs` and `apalis.notify_new_jobs` definitions of the preceding
+generation. The down migration restores the previous index predicate; the
+function bodies are the same in both directions. A 0.4.1 binary cannot prove
+that its wider claim predicate is covered by the narrowed index, so revert this
+migration before restoring that binary.
+
 ### Listing index update
 
 Migration `20260910000001_listing_id_tie_breaker` rebuilds

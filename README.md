@@ -375,7 +375,9 @@ fn build(pool: PgPool) {
     let _polling = PostgresStorage::<EmailJob>::new_with_config(&pool, &config);
 
     // Polling + LISTEN/NOTIFY wakeups (lower latency, dedicated connection).
-    let _notify = PostgresStorage::<EmailJob>::new_with_notify(&pool, &config);
+    // A `Config` carries a single-use polling strategy, so each worker's
+    // storage gets its own `Config` (or a poll strategy factory, see below).
+    let _notify = PostgresStorage::<EmailJob>::new_with_notify(&pool, &Config::new("emails"));
 
     // One listener shared across many queues, registered via apalis `MakeShared`.
     let _shared: SharedPostgresStorage = SharedPostgresStorage::new(&pool);
@@ -571,10 +573,16 @@ worker logs point at the failed lifecycle step:
   instead of a generic update-count mismatch.
 - Codec failures: `failed to decode task payload or result with the
   configured codec` — payload was written with a different codec or is
-  corrupt.
+  corrupt. A claimed row whose payload fails to decode is released through
+  its retry budget (`Failed`, then `Killed`) before the batch continues.
+- Structurally corrupt rows: a claimed row whose `id` is not a ULID cannot be
+  repaired by retrying, so the claim marks it `Killed` with the conversion
+  error in `last_result`, releases it, and delivers the rest of the batch.
 - Notification listener failures surface as stream errors. Polling still
   fetches jobs; `LISTEN`/`NOTIFY` wakeups stop until the notify stream is
-  recreated.
+  recreated. Apalis `Worker::run` treats a stream error as fatal, and one
+  shared listener serves every worker built from a `SharedPostgresStorage`,
+  so a single listener failure ends all of those workers.
 - Idempotency conflicts: `Error::IdempotencyConflict { job_type,
   conflicting_keys, total }` when an enqueue collides with the
   `(job_type, idempotency_key)` unique constraint. `conflicting_keys` names the

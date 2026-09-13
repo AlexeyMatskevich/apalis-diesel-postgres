@@ -48,8 +48,8 @@ $$ LANGUAGE plpgsql VOLATILE
 -- `pg_notify` plus a `COUNT(*)` filter instead of a window + aggregate.
 --
 -- SECURITY/search_path: this CREATE OR REPLACE re-asserts the same
--- `SECURITY INVOKER, SET search_path = pg_catalog, apalis` hardening as
--- migration `…000005_notify_new_jobs_search_path`. Without it, this REPLACE
+-- `SECURITY INVOKER, SET search_path = pg_catalog, apalis, pg_temp` hardening
+-- as migration `…000005_notify_new_jobs_search_path`. Without it, this REPLACE
 -- would silently revert the trigger to the default search_path and undo
 -- that earlier defense.
 
