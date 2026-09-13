@@ -255,6 +255,45 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
         )
     }
 
+    /// Release this storage's registration of `worker_id` for its queue: hand
+    /// every `Running` or `Queued` task the worker still owns back to the
+    /// queue, and mark the registration released so a successor can register
+    /// the same name immediately instead of waiting for
+    /// `reenqueue_orphaned_after`.
+    ///
+    /// Call this once the worker has stopped, after `Worker::run` (or
+    /// `run_until`) returns, whether it returned an error or not. The local
+    /// registration is retired first, so clones of this storage stop claiming
+    /// and heartbeating under the name before the database is updated; a
+    /// restart needs fresh storage, as after any retirement.
+    ///
+    /// Each recovered task consumes one attempt, like orphan recovery: the
+    /// worker may have executed it partially. A task the worker acknowledged
+    /// before stopping is not touched. With Apalis's graceful shutdown the
+    /// worker drains its handlers first, so nothing is left to recover. The
+    /// registration row itself is kept because completed tasks reference it
+    /// as their last owner.
+    ///
+    /// Returns the number of tasks handed back.
+    ///
+    /// # Errors
+    /// - [`Error::WorkerNotRegistered`] if the registration is absent, has
+    ///   no lease token, or is owned by another storage. Nothing is released:
+    ///   a successor that took the name over owns those claims now.
+    /// - [`Error::Pool`], [`Error::Database`], [`Error::Blocking`] for
+    ///   connection, SQL and executor failures. The database registration is
+    ///   then still live; the periodic sweep recovers it once it is stale.
+    pub async fn release_worker(&self, worker_id: &str) -> Result<usize, Error> {
+        self.leases.for_worker(worker_id).retire();
+        queries::release_worker(
+            self.pool.clone(),
+            self.config.clone(),
+            worker_id.to_owned(),
+            std::sync::Arc::clone(&self.lease_token),
+        )
+        .await
+    }
+
     /// Change the task codec while retaining pool, config, fetcher, and the
     /// sink's pipeline state (buffered tasks and any in-flight flush — the
     /// buffer holds already-encoded compact tasks, so switching the codec

@@ -26,7 +26,9 @@ pub(crate) use push::{FlushFailure, flush_tasks, push_tasks_on_conn, validate_ta
 pub(crate) use push::{
     MAX_IDEMPOTENCY_KEY_LEN, MAX_JOB_PAYLOAD_LEN, MAX_METADATA_PAYLOAD_LEN, MAX_QUEUE_NAME_LEN,
 };
-pub(crate) use worker::{initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream};
+pub(crate) use worker::{
+    initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream, release_worker,
+};
 
 pub(super) fn with_conn<F, T>(
     pool: PgPool,

@@ -2,7 +2,7 @@ use crate::{Config, Error, PgPool, queries::with_conn};
 use apalis_core::worker::context::WorkerContext;
 use diesel::{
     Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
-    sql_types::{Array, BigInt, Bool, Double, Nullable, Text},
+    sql_types::{Array, BigInt, Bool, Double, Jsonb, Nullable, Text},
 };
 use futures::stream;
 use std::{sync::Arc, time::Duration};
@@ -97,22 +97,51 @@ pub(crate) fn lock_current_worker(
     Ok(worker_registration(conn, worker, queue, token)? == Registration::Current)
 }
 
+/// Why a worker's active claims are handed back to the queue. The reason is
+/// recorded in `last_result` of every recovered row that had no result yet,
+/// and of every row that the recovery kills.
+#[derive(Clone, Copy)]
+enum Recovery {
+    /// The periodic sweep found the worker's heartbeat stale; the batch is
+    /// bounded and skips rows another sweep already holds.
+    StaleSweep,
+    /// A fresh registration takes the name over from a stale incumbent; it
+    /// must wait for, and recover, every claim of that incumbent.
+    Takeover,
+    /// The worker released its own registration; like a takeover it waits
+    /// for every claim that is still being committed.
+    Release,
+}
+
+impl Recovery {
+    fn result(self) -> serde_json::Value {
+        let message = match self {
+            Self::StaleSweep | Self::Takeover => "Re-enqueued due to worker heartbeat timeout.",
+            Self::Release => "Re-enqueued because the worker released its registration.",
+        };
+        serde_json::json!({ "Err": message })
+    }
+}
+
 fn recover_owned(
     conn: &mut PgConnection,
     queue: &str,
     workers: Vec<String>,
-    bounded: bool,
+    recovery: Recovery,
 ) -> Result<usize, Error> {
     if workers.is_empty() {
         return Ok(0);
     }
-    // Takeover must wait for every incumbent claim. SKIP LOCKED is appropriate
-    // only for a periodic sweep, whose stale worker identity remains unchanged.
+    // Takeover and release must wait for every incumbent claim. SKIP LOCKED is
+    // appropriate only for a periodic sweep, whose stale worker identity
+    // remains unchanged.
+    let bounded = matches!(recovery, Recovery::StaleSweep);
     let skip = if bounded { "SKIP LOCKED" } else { "" };
     // Keep one candidate set even when the planner chooses a nested-loop
     // join. Re-evaluating a locking LIMIT subquery after each UPDATE can select
     // more rows as earlier candidates leave the active states.
-    sql_query(format!("WITH candidates AS MATERIALIZED (
+    sql_query(format!(
+        "WITH candidates AS MATERIALIZED (
         SELECT id FROM apalis.jobs WHERE job_type=$1 AND lock_by=ANY($2)
             AND status IN ('Running','Queued') ORDER BY id LIMIT $3 FOR UPDATE {skip}
         )
@@ -122,12 +151,75 @@ fn recover_owned(
         lock_by=NULL, lock_at=NULL,
         attempts=LEAST(attempts::bigint+1,max_attempts),
         last_result=CASE WHEN attempts::bigint+1>=max_attempts OR last_result IS NULL
-            THEN '{{\"Err\":\"Re-enqueued due to worker heartbeat timeout.\"}}'::jsonb ELSE last_result END
+            THEN $4 ELSE last_result END
         FROM candidates
-        WHERE apalis.jobs.status IN ('Running','Queued') AND apalis.jobs.id=candidates.id"))
-        .bind::<Text,_>(queue).bind::<Array<Text>,_>(workers)
-        .bind::<Nullable<BigInt>,_>(bounded.then_some(i64::from(REENQUEUE_ORPHANED_BATCH_LIMIT)))
-        .execute(conn).map_err(Error::database("re-enqueueing orphaned jobs"))
+        WHERE apalis.jobs.status IN ('Running','Queued') AND apalis.jobs.id=candidates.id"
+    ))
+    .bind::<Text, _>(queue)
+    .bind::<Array<Text>, _>(workers)
+    .bind::<Nullable<BigInt>, _>(bounded.then_some(i64::from(REENQUEUE_ORPHANED_BATCH_LIMIT)))
+    .bind::<Jsonb, _>(recovery.result())
+    .execute(conn)
+    .map_err(Error::database("re-enqueueing orphaned jobs"))
+}
+
+/// Hand a registration back: recover every claim the token still owns and
+/// mark the row released, so a successor registers immediately instead of
+/// waiting for the stale deadline. The row is kept because completed jobs
+/// keep referencing it as their last owner.
+///
+/// Locking the row `FOR UPDATE` orders this after every in-flight claim
+/// (which holds `FOR KEY SHARE` on it) and fences takeover, the sweep and
+/// the heartbeat until the release commits.
+pub(crate) fn release_worker_blocking(
+    conn: &mut PgConnection,
+    queue: &str,
+    worker: &str,
+    lease_token: &str,
+) -> Result<usize, Error> {
+    conn.transaction(|tx| {
+        let owned = sql_query(
+            "SELECT id FROM apalis.workers WHERE id=$1 AND worker_type=$2 AND lease_token=$3 FOR UPDATE",
+        )
+        .bind::<Text, _>(worker)
+        .bind::<Text, _>(queue)
+        .bind::<Text, _>(lease_token)
+        .load::<WorkerIdentity>(tx)
+        .map_err(Error::database("locking the worker registration for release"))?;
+        if owned.is_empty() {
+            return Err(Error::worker_not_registered(
+                "releasing worker registration",
+                worker,
+                queue.to_owned(),
+                "the registration is absent, has no lease token, or is owned by another storage; nothing was released",
+            ));
+        }
+        let recovered = recover_owned(tx, queue, vec![worker.to_owned()], Recovery::Release)?;
+        // The epoch is older than any stale deadline, so every sweeper and
+        // successor treats the row as released regardless of its own window,
+        // and dashboards read a zero heartbeat.
+        sql_query(
+            "UPDATE apalis.workers SET lease_token=NULL, last_seen=to_timestamp(0)
+             WHERE id=$1 AND worker_type=$2 AND lease_token=$3",
+        )
+        .bind::<Text, _>(worker)
+        .bind::<Text, _>(queue)
+        .bind::<Text, _>(lease_token)
+        .execute(tx)
+        .map_err(Error::database("releasing worker registration"))?;
+        Ok(recovered)
+    })
+}
+
+pub(crate) fn release_worker(
+    pool: PgPool,
+    config: Config,
+    worker: String,
+    lease_token: Arc<str>,
+) -> impl Future<Output = Result<usize, Error>> + Send {
+    with_conn(pool, move |conn| {
+        release_worker_blocking(conn, config.queue().as_ref(), &worker, &lease_token)
+    })
 }
 
 pub(crate) fn reenqueue_orphaned_blocking(
@@ -143,7 +235,7 @@ pub(crate) fn reenqueue_orphaned_blocking(
             .bind::<Double,_>(timeout_seconds(config.reenqueue_orphaned_after()))
             .bind::<BigInt,_>(i64::from(REENQUEUE_ORPHANED_BATCH_LIMIT))
             .load::<WorkerIdentity>(tx).map_err(Error::database("locking orphaned workers"))?;
-        recover_owned(tx, config.queue().as_ref(), workers.into_iter().map(|w|w.id).collect(), true)
+        recover_owned(tx, config.queue().as_ref(), workers.into_iter().map(|w|w.id).collect(), Recovery::StaleSweep)
     })
 }
 pub(crate) fn reenqueue_orphaned(
@@ -202,7 +294,7 @@ pub(crate) fn register_worker_blocking(
             .map_err(Error::database("checking worker registration"))?;
         if let Some(decision)=existing.into_iter().next() {
             if !decision.allowed { return Err(Error::already_registered(worker.name(),worker_type)); }
-            if decision.lost { recover_owned(tx,worker_type,vec![worker.name().to_owned()],false)?; }
+            if decision.lost { recover_owned(tx,worker_type,vec![worker.name().to_owned()],Recovery::Takeover)?; }
         }
         sql_query("INSERT INTO apalis.workers(id,worker_type,storage_name,layers,last_seen,started_at,lease_token)
             VALUES($1,$2,$3,$4,clock_timestamp(),clock_timestamp(),$5)
