@@ -52,19 +52,60 @@ struct ClaimAttempt {
     task_id: Option<PgTaskId>,
     lock_at: Option<i64>,
     completed: usize,
-    /// Set once this claim's acknowledgement has committed. Every clone of the
-    /// task shares it, so a re-dispatch of the same claim is refused instead
-    /// of running the handler again and reporting a stale acknowledgement.
-    acknowledged: Arc<AtomicBool>,
+    /// Shared by every clone of the task, so a re-dispatch of the same claim
+    /// is refused instead of running the handler again and reporting a stale
+    /// acknowledgement.
+    acknowledgement: Arc<ClaimAcknowledgement>,
+}
+
+/// The acknowledgement state of one claim: the marker set once an
+/// acknowledgement commits, and the lock that serializes concurrent
+/// acknowledgements of the claim so the second observes the first instead
+/// of racing it to a stale result.
+struct ClaimAcknowledgement {
+    serial: futures::lock::Mutex<()>,
+    done: AtomicBool,
 }
 
 impl ClaimAttempt {
     fn is_acknowledged(&self) -> bool {
-        self.acknowledged.load(Ordering::Acquire)
+        self.acknowledgement.done.load(Ordering::Acquire)
     }
 
     fn mark_acknowledged(&self) {
-        self.acknowledged.store(true, Ordering::Release);
+        self.acknowledgement.done.store(true, Ordering::Release);
+    }
+
+    async fn serialize(&self) -> futures::lock::MutexGuard<'_, ()> {
+        self.acknowledgement.serial.lock().await
+    }
+}
+
+/// A completion obligation held while a claim is dispatched or acknowledged.
+/// Dropping it armed retires the worker, unless the claim's acknowledgement
+/// committed in the meantime: then nothing was lost.
+struct ClaimObligation {
+    guard: Option<crate::lease::LeaseGuard>,
+    claim: Option<ClaimAttempt>,
+}
+
+impl ClaimObligation {
+    fn disarm(&mut self) {
+        if let Some(guard) = &mut self.guard {
+            guard.disarm();
+        }
+    }
+}
+
+impl Drop for ClaimObligation {
+    fn drop(&mut self) {
+        if self
+            .claim
+            .as_ref()
+            .is_some_and(ClaimAttempt::is_acknowledged)
+        {
+            self.disarm();
+        }
     }
 }
 
@@ -73,7 +114,10 @@ pub(crate) fn record_claim(parts: &mut Parts<PgContext, Ulid>) {
         task_id: parts.task_id,
         lock_at: *parts.ctx.lock_at(),
         completed: parts.attempt.current(),
-        acknowledged: Arc::new(AtomicBool::new(false)),
+        acknowledgement: Arc::new(ClaimAcknowledgement {
+            serial: futures::lock::Mutex::new(()),
+            done: AtomicBool::new(false),
+        }),
     });
 }
 
@@ -1173,15 +1217,33 @@ mod tests {
 
         #[derive(Debug)]
         struct RedispatchObservation {
-            result: Result<(), BoxDynError>,
+            result: Option<Result<(), BoxDynError>>,
             handler_calls: usize,
             attempt: usize,
             owner_retired: bool,
         }
 
+        #[derive(Clone, Copy)]
+        enum Marker {
+            Unset,
+            SetBeforeCall,
+            SetAfterCall,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Dispatch {
+            Polled,
+            DroppedUnpolled,
+        }
+
         /// A retry layer outside the backend middleware re-dispatches a clone
-        /// of the task; the clone shares the claim's acknowledgement marker.
-        async fn preclaimed_redispatch(acknowledged: bool) -> RedispatchObservation {
+        /// of the task; the clone shares the claim's acknowledgement marker,
+        /// which may be set before the dispatch is created, between its
+        /// creation and its first poll, or never.
+        async fn preclaimed_redispatch(
+            marker: Marker,
+            dispatch: Dispatch,
+        ) -> RedispatchObservation {
             let registry = crate::lease::LeaseRegistry::default();
             let owner = registry.for_worker("redispatch-owner");
             let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1198,12 +1260,14 @@ mod tests {
                 .data
                 .insert(WorkerContext::new::<()>("redispatch-owner"));
             record_claim(&mut task.parts);
-            if acknowledged {
-                task.parts
-                    .data
-                    .get::<ClaimAttempt>()
-                    .expect("claim recorded")
-                    .mark_acknowledged();
+            let claim = task
+                .parts
+                .data
+                .get::<ClaimAttempt>()
+                .expect("claim recorded")
+                .clone();
+            if matches!(marker, Marker::SetBeforeCall) {
+                claim.mark_acknowledged();
             }
             let redispatched = task.clone();
             let mut service = LockTaskService {
@@ -1215,7 +1279,17 @@ mod tests {
             futures::future::poll_fn(|cx| service.poll_ready(cx))
                 .await
                 .expect("recording handler is ready");
-            let result = service.call(redispatched).await;
+            let future = service.call(redispatched);
+            if matches!(marker, Marker::SetAfterCall) {
+                claim.mark_acknowledged();
+            }
+            let result = match dispatch {
+                Dispatch::Polled => Some(future.await),
+                Dispatch::DroppedUnpolled => {
+                    drop(future);
+                    None
+                }
+            };
             RedispatchObservation {
                 result,
                 handler_calls: handler_calls.load(Ordering::SeqCst),
@@ -1224,16 +1298,38 @@ mod tests {
             }
         }
 
-        fn abort_already_acknowledged(error: &BoxDynError) -> AssertionResult {
-            let cause = error
-                .downcast_ref::<AbortError>()
+        fn ran_to_completion(result: &Option<Result<(), BoxDynError>>) -> AssertionResult {
+            match result {
+                Some(Ok(())) => Ok(()),
+                other => Err(AssertionError::new(vec![format!(
+                    "expected the dispatch to complete, got {other:?}"
+                )])),
+            }
+        }
+
+        fn never_polled(result: &Option<Result<(), BoxDynError>>) -> AssertionResult {
+            match result {
+                None => Ok(()),
+                other => Err(AssertionError::new(vec![format!(
+                    "expected no dispatch result, got {other:?}"
+                )])),
+            }
+        }
+
+        fn refused_as_already_acknowledged(
+            result: &Option<Result<(), BoxDynError>>,
+        ) -> AssertionResult {
+            let cause = result
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .and_then(|error| error.downcast_ref::<AbortError>())
                 .and_then(std::error::Error::source)
                 .and_then(|source| source.downcast_ref::<crate::Error>());
             if matches!(cause, Some(crate::Error::AlreadyAcknowledged { .. })) {
                 Ok(())
             } else {
                 Err(AssertionError::new(vec![format!(
-                    "expected AbortError with AlreadyAcknowledged, got {error:?}"
+                    "expected AbortError with AlreadyAcknowledged, got {result:?}"
                 )]))
             }
         }
@@ -1361,21 +1457,58 @@ mod tests {
                 }
             }
 
-            expect(preclaimed_redispatch(acknowledged).await) as a_claim_dispatched_again_in_process {
-                let acknowledged = false;
+            expect(preclaimed_redispatch(marker, dispatch).await) as a_claim_dispatched_again_in_process {
+                let marker = Marker::Unset;
+                let dispatch = Dispatch::Polled;
                 to runs_the_handler_and_keeps_the_worker_active {
-                    have(result) be_ok,
+                    have(result) ran_to_completion,
                     have(handler_calls) equal(1),
                     have(attempt) equal(0),
                     have(owner_retired) be_false
                 }
-                when the_claim_was_already_acknowledged {
-                    let acknowledged = true;
+                when the_dispatch_is_dropped_before_its_first_poll {
+                    let dispatch = Dispatch::DroppedUnpolled;
+                    to retires_the_worker_for_the_lost_obligation {
+                        have(result) never_polled,
+                        have(handler_calls) equal(0),
+                        have(attempt) equal(0),
+                        have(owner_retired) be_true
+                    }
+                }
+                when the_claim_was_acknowledged_before_the_dispatch_was_created {
+                    let marker = Marker::SetBeforeCall;
                     to refuses_before_the_handler_counts_the_dispatch_and_keeps_the_worker_active {
-                        have(result) be_err_and abort_already_acknowledged,
+                        have(result) refused_as_already_acknowledged,
                         have(handler_calls) equal(0),
                         have(attempt) equal(1),
                         have(owner_retired) be_false
+                    }
+                    when the_dispatch_is_dropped_before_its_first_poll {
+                        let dispatch = Dispatch::DroppedUnpolled;
+                        to keeps_the_worker_active {
+                            have(result) never_polled,
+                            have(handler_calls) equal(0),
+                            have(attempt) equal(0),
+                            have(owner_retired) be_false
+                        }
+                    }
+                }
+                when the_claim_was_acknowledged_after_the_dispatch_was_created {
+                    let marker = Marker::SetAfterCall;
+                    to refuses_before_the_handler_counts_the_dispatch_and_keeps_the_worker_active {
+                        have(result) refused_as_already_acknowledged,
+                        have(handler_calls) equal(0),
+                        have(attempt) equal(1),
+                        have(owner_retired) be_false
+                    }
+                    when the_dispatch_is_dropped_before_its_first_poll {
+                        let dispatch = Dispatch::DroppedUnpolled;
+                        to keeps_the_worker_active {
+                            have(result) never_polled,
+                            have(handler_calls) equal(0),
+                            have(attempt) equal(0),
+                            have(owner_retired) be_false
+                        }
                     }
                 }
             }
@@ -1498,11 +1631,14 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         let worker_id = parts.ctx.lock_by().clone();
         let queue = parts.ctx.queue().clone();
         let lock_at = *parts.ctx.lock_at();
-        let mut completion_guard = self
-            .leases
-            .as_ref()
-            .and_then(|leases| worker_id.as_deref().map(|id| leases.for_worker(id).guard()));
         let claim = parts.data.get::<ClaimAttempt>().cloned();
+        let mut completion_guard = ClaimObligation {
+            guard: self
+                .leases
+                .as_ref()
+                .and_then(|leases| worker_id.as_deref().map(|id| leases.for_worker(id).guard())),
+            claim: claim.clone(),
+        };
         let response = build_ack_response(res);
         // SQL stores completed history; Tracker increments a shared Attempt
         // only when it is present. Use the claim snapshot for both the retry
@@ -1522,14 +1658,18 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         let lease_token = self.lease_token.clone();
 
         async move {
+            // Acknowledgements of one claim run one at a time, so a concurrent
+            // repeat waits for the first and then observes its marker.
+            let _serial = match &claim {
+                Some(claim) => Some(claim.serialize().await),
+                None => None,
+            };
             if let Some(claim) = &claim
                 && claim.is_acknowledged()
             {
                 // The earlier acknowledgement committed, so no obligation is
                 // lost; refuse the repeat without touching the row.
-                if let Some(guard) = &mut completion_guard {
-                    guard.disarm();
-                }
+                completion_guard.disarm();
                 return Err(Error::already_acknowledged(
                     task_id.ok_or(Error::MissingField("task_id"))?.to_string(),
                     queue.ok_or(Error::MissingField("queue"))?,
@@ -1564,9 +1704,7 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
                 if let Some(claim) = &claim {
                     claim.mark_acknowledged();
                 }
-                if let Some(guard) = &mut completion_guard {
-                    guard.disarm();
-                }
+                completion_guard.disarm();
             }
             result
         }
@@ -1908,17 +2046,20 @@ where
             worker_id.as_deref(),
             req.parts.ctx.lock_at().is_some(),
         );
-        let mut completion_guard = if preclaimed {
-            local_lease.as_ref().map(|lease| lease.guard())
-        } else {
-            None
+        let claim = req.parts.data.get::<ClaimAttempt>().cloned();
+        let acknowledged_at_call =
+            preclaimed && claim.as_ref().is_some_and(ClaimAttempt::is_acknowledged);
+        // A preclaimed task carries a completion obligation from this call
+        // on, unless its acknowledgement already committed: then there is
+        // nothing to lose, so nothing is armed.
+        let mut completion_guard = ClaimObligation {
+            guard: if preclaimed && !acknowledged_at_call {
+                local_lease.as_ref().map(|lease| lease.guard())
+            } else {
+                None
+            },
+            claim: claim.clone(),
         };
-        let acknowledged_claim = preclaimed
-            && req
-                .parts
-                .data
-                .get::<ClaimAttempt>()
-                .is_some_and(ClaimAttempt::is_acknowledged);
         // Tower service contract: `poll_ready` reserves capacity on
         // `self.inner`; that exact instance MUST be the one that consumes the
         // reservation via `call`. Take ownership of the ready instance and
@@ -1932,16 +2073,16 @@ where
             let worker_id =
                 worker_id.ok_or_else(|| AbortError::new(Error::MissingField("worker_context")))?;
             let task_id = task_id.ok_or_else(|| AbortError::new(Error::MissingField("task_id")))?;
-            if acknowledged_claim {
+            // Read the marker when the dispatch runs: an acknowledgement in
+            // flight when this future was created may have committed since.
+            if preclaimed && claim.as_ref().is_some_and(ClaimAttempt::is_acknowledged) {
                 // This claim's acknowledgement already committed: the database
                 // retry budget schedules any further attempt. Refuse before the
                 // handler runs, count the dispatch as the worker's Tracker
                 // would so counter-based retry layers converge, and keep the
                 // lease: no obligation was lost.
                 let _ = req.parts.attempt.increment();
-                if let Some(guard) = &mut completion_guard {
-                    guard.disarm();
-                }
+                completion_guard.disarm();
                 return Err(AbortError::new(Error::already_acknowledged(
                     task_id.to_string(),
                     queue.unwrap_or_default(),
@@ -1953,7 +2094,7 @@ where
                 if let Some(lease) = &local_lease {
                     lease.ensure_active().map_err(AbortError::new)?;
                 }
-                completion_guard = local_lease.as_ref().map(|lease| lease.guard());
+                completion_guard.guard = local_lease.as_ref().map(|lease| lease.guard());
                 let claimed = match queries::fetch::lock_task_with_token(
                     pool,
                     task_id,
@@ -1968,10 +2109,8 @@ where
                         // A rejected transaction did not transfer ownership;
                         // an unconfirmed commit may have. Keep its obligation
                         // armed, including a panic after COMMIT instrumentation.
-                        if !matches!(&error, Error::ClaimOutcomeUnknown { .. })
-                            && let Some(guard) = &mut completion_guard
-                        {
-                            guard.disarm();
+                        if !matches!(&error, Error::ClaimOutcomeUnknown { .. }) {
+                            completion_guard.disarm();
                         }
                         return Err(AbortError::new(error).into());
                     }
@@ -1979,13 +2118,12 @@ where
                 req.parts.ctx = claimed.parts.ctx;
                 req.parts.attempt = claimed.parts.attempt;
                 record_claim(&mut req.parts);
+                completion_guard.claim = req.parts.data.get::<ClaimAttempt>().cloned();
             }
             let result = ready_inner.call(req).await.map_err(Into::into);
             // A completed handler error is a valid acknowledged outcome. PgAck
             // retires on acknowledgement failure; this guard covers cancellation.
-            if let Some(guard) = &mut completion_guard {
-                guard.disarm();
-            }
+            completion_guard.disarm();
             result
         }
         .boxed()

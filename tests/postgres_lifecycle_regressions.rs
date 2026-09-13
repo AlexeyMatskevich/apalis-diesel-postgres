@@ -1628,6 +1628,49 @@ mod attempt_accounting {
         .await
     }
 
+    /// Two acknowledgements of the same claim run at once; the first commits
+    /// and the second must observe it instead of racing it to a stale result.
+    async fn acknowledge_cloned_claim_concurrently() -> Result<support::Outcome<Value>, String> {
+        support::with_isolated_database(|url| async move {
+            let (pool, storage) = fixture(url, 0, 3).await?;
+            let worker = WorkerContext::new::<()>("attempt-worker");
+            let mut stream = storage.poll_compact(&worker);
+            let parts = next_claim(&mut stream).await?.parts;
+            let twin = parts.clone();
+            let (mut first, mut second) = (PgAck::new(&pool), PgAck::new(&pool));
+            let result: Result<String, apalis_core::error::BoxDynError> = Ok("accepted".to_owned());
+            let (a, b) = futures::join!(first.ack(&result, &parts), second.ack(&result, &twin));
+            let kind = |outcome: Result<(), Error>| match outcome {
+                Ok(()) => "acknowledged",
+                Err(Error::AlreadyAcknowledged { .. }) => "already_acknowledged",
+                Err(Error::StaleAcknowledgement { .. }) => "stale",
+                Err(_) => "other",
+            };
+            let mut kinds = vec![kind(a), kind(b)];
+            kinds.sort_unstable();
+            let row = row(pool).await?;
+            Ok(json!({"kinds": kinds, "row": row}))
+        })
+        .await
+    }
+
+    fn completed_once_under_concurrent_acknowledgement()
+    -> impl Fn(&Result<support::Outcome<Value>, String>) -> AssertionResult {
+        support::observe(
+            "concurrent manual acknowledgements of one claim",
+            |actual| {
+                let expected = json!({"kinds": ["acknowledged", "already_acknowledged"],
+                "row": {"status":"Done","attempts":1,"max_attempts":3,
+                "last_result":{"Ok":"accepted"},"owner":"attempt-worker","locked":true,"done":true}});
+                if actual == &expected {
+                    Ok(())
+                } else {
+                    Err(format!("expected {expected}, observed {actual}"))
+                }
+            },
+        )
+    }
+
     fn completed_only_once() -> impl Fn(&Result<support::Outcome<Value>, String>) -> AssertionResult
     {
         support::observe("manual acknowledgement of cloned claim", |actual| {
@@ -1647,6 +1690,9 @@ mod attempt_accounting {
         #tokio_test
         expect(acknowledge_cloned_claim().await) as manual_acknowledgement {
             to completes_a_cloned_claim_once_without_external_increment { completed_only_once() }
+        }
+        expect(acknowledge_cloned_claim_concurrently().await) as concurrent_manual_acknowledgements {
+            to completes_the_claim_once_and_refuses_the_other { completed_once_under_concurrent_acknowledgement() }
         }
         expect(scenario(Entry::Direct, previous, fails, Input::Default, budget).await) as direct_middleware {
             let previous=0;
