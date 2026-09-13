@@ -11,10 +11,13 @@ One schema change and two behaviours of the running system change; see the
   validating it, the migration clears stale owner columns from `Pending`
   rows and recovers active rows whose claim has no timestamp as lost
   executions, consuming one attempt within the budget (`Pending` or
-  `Killed`). Complete claims and terminal history are untouched. Run `setup`;
-  constraint validation scans `jobs` under the DDL lock until the series
-  commits, so plan a maintenance window for large tables. The down migration
-  removes the constraint and keeps the repaired rows. The current series
+  `Killed`). Complete claims and terminal history are untouched. It also
+  builds `jobs_job_type_lock_by_idx` over every owned row, the index the
+  registration foreign key needs when a registration is deleted. Run
+  `setup`; constraint validation and the index build scan `jobs` under the
+  DDL lock until the series commits, so plan a maintenance window and
+  disk/WAL headroom for large tables. The down migration removes the
+  constraint and the index and keeps the repaired rows. The current series
   has fourteen versions; a journal-less thirteen-version catalog is adopted
   like the eleven-version generation and completed.
 - A `Config` whose `keep_alive` is zero or not shorter than
@@ -283,10 +286,18 @@ attempt is consumed within the retry budget and the row becomes `Pending` or
 `Killed`. Claims with a complete timestamp and all terminal history, including
 the last owner a completed row names, are preserved.
 
-Run `setup` to apply the migration. Constraint validation scans `jobs` under
-the DDL lock until the complete setup transaction commits; plan a maintenance
-window for large tables. The down migration removes the constraint and keeps
-the repaired rows; it cannot restore a claim timestamp that never existed.
+The migration also creates `jobs_job_type_lock_by_idx` on `(job_type,
+lock_by)` over owned rows. Deleting a registration makes PostgreSQL probe
+`jobs` for rows that still name it, and the only earlier owner index covered
+active rows alone, so every deletion scanned the queue's history; the new
+index serves that probe and `prune_workers`. Each claim now maintains one
+more index entry.
+
+Run `setup` to apply the migration. Constraint validation and the index
+build scan `jobs` under the DDL lock until the complete setup transaction
+commits; plan a maintenance window and disk/WAL headroom for large tables.
+The down migration removes the constraint and the index and keeps the
+repaired rows; it cannot restore a claim timestamp that never existed.
 
 ## Direct middleware acknowledgement
 

@@ -58,8 +58,11 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   `jobs_state_shape_check`: a `Pending` row carries no owner columns and a
   `Queued` or `Running` row carries both `lock_by` and `lock_at`. Existing
   `Pending` rows lose stale owner columns, and active rows whose claim has no
-  timestamp are recovered as lost executions with one attempt consumed. Run
-  `setup` and follow the maintenance guidance in
+  timestamp are recovered as lost executions with one attempt consumed. The
+  same migration builds `jobs_job_type_lock_by_idx` over every owned row, so
+  deleting a registration (`prune_workers`) no longer scans the queue's
+  history for the foreign-key probe; each claim maintains one more index
+  entry. Run `setup` and follow the maintenance guidance in
   [the upgrade guide](docs/upgrading.md). The series now has fourteen
   versions; a journal-less thirteen-version catalog is adopted and completed.
 

@@ -2,7 +2,7 @@
 -- the common columns of a recognized legacy generation (lease/snapshot absent
 -- and nullable priority permitted). $2 is the generation whose objects are
 -- required: 11 selects the final indexes and function bodies, 13 adds the
--- active-owner constraint, 14 adds the state-shape constraint.
+-- active-owner constraint, 14 adds the state-shape constraint and the owner index.
 WITH expected_columns(table_name, column_name, type_name, required) AS (VALUES
     ('jobs', 'job', 'bytea', true),
     ('jobs', 'id', 'text', true),
@@ -84,13 +84,15 @@ WITH expected_columns(table_name, column_name, type_name, required) AS (VALUES
  ('jobs_job_type_done_at_idx', 'CREATE INDEX jobs_job_type_done_at_idx ON apalis.jobs USING btree (job_type, done_at) WHERE (done_at IS NOT NULL)'),
  ('idx_jobs_idempotency_key', 'CREATE UNIQUE INDEX idx_jobs_idempotency_key ON apalis.jobs USING btree (job_type, idempotency_key) WHERE (idempotency_key IS NOT NULL)'),
  ('queue_stats_snapshot_job_type_idx', 'CREATE UNIQUE INDEX queue_stats_snapshot_job_type_idx ON apalis.queue_stats_snapshot USING btree (job_type)'),
+ ('jobs_job_type_lock_by_idx', 'CREATE INDEX jobs_job_type_lock_by_idx ON apalis.jobs USING btree (job_type, lock_by) WHERE (lock_by IS NOT NULL)'),
  ('jobs_dequeue_idx', CASE WHEN $2 >= 11
     THEN $$CREATE INDEX jobs_dequeue_idx ON apalis.jobs USING btree (job_type, priority DESC, run_at, id) WHERE ((status = ANY (ARRAY['Pending'::text, 'Failed'::text])) AND (attempts < max_attempts))$$
     ELSE $$CREATE INDEX jobs_dequeue_idx ON apalis.jobs USING btree (job_type, priority DESC, run_at, id) WHERE ((status = 'Pending'::text) OR ((status = 'Failed'::text) AND (attempts < max_attempts)))$$ END)
 ), index_problems AS (
  SELECT 'index ' || e.index_name AS problem FROM expected_indexes e
  LEFT JOIN pg_index i ON i.indexrelid = to_regclass('apalis.' || e.index_name)
- WHERE NOT $1 AND (i.indexrelid IS NULL OR NOT i.indisvalid OR NOT i.indisready
+ WHERE NOT $1 AND ($2 >= 14 OR e.index_name != 'jobs_job_type_lock_by_idx')
+   AND (i.indexrelid IS NULL OR NOT i.indisvalid OR NOT i.indisready
                   OR pg_get_indexdef(i.indexrelid) != e.definition)
 ), function_problems AS (
  SELECT 'function ' || signature AS problem

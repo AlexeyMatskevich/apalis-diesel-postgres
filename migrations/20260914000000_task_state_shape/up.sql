@@ -31,3 +31,10 @@ BEGIN
     END IF;
 END;
 $$;
+
+-- Every registration deletion runs the foreign-key probe over the queue's
+-- history, and pruning looks for registrations no row names; the only owner
+-- index so far covered active rows alone. Cover every owned row.
+CREATE INDEX IF NOT EXISTS jobs_job_type_lock_by_idx
+    ON apalis.jobs(job_type, lock_by)
+    WHERE lock_by IS NOT NULL;

@@ -465,9 +465,9 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// `WorkerNotRegistered`. Use the longest deadline any worker of the queue
     /// runs with when they differ. A released registration passes any window.
     ///
-    /// Every deleted row runs the foreign-key probe over the queue's history,
-    /// which no index serves; treat this as a slow maintenance call on large
-    /// queues.
+    /// Every deleted row runs the foreign-key probe over the queue's history;
+    /// the `jobs_job_type_lock_by_idx` index serves both that probe and the
+    /// search for unreferenced registrations.
     ///
     /// # Errors
     /// - [`Error::InvalidArgument`] if `stale_for` is shorter than

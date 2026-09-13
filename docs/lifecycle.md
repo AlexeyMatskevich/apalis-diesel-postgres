@@ -290,8 +290,8 @@ retention with three operations, in this order:
    `stale_for` that no task references, in batches of 1000. `stale_for`
    must be at least the storage's `reenqueue_orphaned_after`; use the
    longest deadline any worker of the queue runs with when they differ.
-   Every deleted row runs the foreign-key probe over the queue's history,
-   which no index serves, so the call is slow on large queues.
+   The search for unreferenced registrations and the foreign-key probe of
+   every deletion use the `jobs_job_type_lock_by_idx` index.
 3. `refresh_queue_stats_snapshot` if dashboards read the snapshot.
 
 Consequences of a purge:
