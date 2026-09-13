@@ -313,7 +313,7 @@ impl PollStrategyFactory {
 
 /// Checks a local lease before polling either SQL work or heartbeat work. The
 /// optional guard belongs to the stream itself, so cancelling `next()` merely
-/// stops waiting; dropping a polled task stream retires its worker's claims.
+/// stops waiting; dropping a registered task stream retires its worker's claims.
 pub(crate) struct LeaseStream<S> {
     stream: Pin<Box<S>>,
     lease: Arc<crate::lease::WorkerLease>,
@@ -352,13 +352,19 @@ where
             this.ended = true;
             return Poll::Ready(Some(Err(error)));
         }
-        // Only polling can dispatch registration/claim SQL. Arm before the
-        // inner poll, including Pending: a queued SQL operation may commit
-        // after its waiter is cancelled. Construction alone owns no claim.
-        if this.retire_on_drop && this._guard.is_none() {
+        let result = this.stream.as_mut().poll_next(cx);
+        // Registration is the first item and assigns no task; claim SQL can
+        // only be dispatched by later polls. Arm the guard as that item
+        // arrives, so every later poll is covered, including one whose waiter
+        // is cancelled while its claim is queued and may still commit. A
+        // stream whose registration fails or that is never registered owns no
+        // claim and leaves the name free for its siblings.
+        if this.retire_on_drop
+            && this._guard.is_none()
+            && matches!(&result, Poll::Ready(Some(Ok(_))))
+        {
             this._guard = Some(this.lease.guard());
         }
-        let result = this.stream.as_mut().poll_next(cx);
         if matches!(
             &result,
             Poll::Ready(Some(Err(Error::ClaimOutcomeUnknown { .. })))
@@ -902,18 +908,45 @@ mod tests {
         (error, ended)
     }
 
+    #[derive(Clone, Copy)]
+    enum Progress {
+        Unpolled,
+        RegistrationPending,
+        RegistrationFailed,
+        Registered,
+        ClaimPending,
+    }
+
     fn lease_stream_lifetime(
+        progress: Progress,
         drop_whole_stream: bool,
-        first_poll: bool,
         retire_on_drop: bool,
     ) -> (bool, bool) {
         let leases = crate::lease::LeaseRegistry::default();
         let lease = leases.for_worker("claiming-worker");
         let other = leases.for_worker("unrelated-worker");
-        let compact = stream::pending::<Result<(), Error>>();
+        // The registration outcome is the first item; later polls may claim.
+        let compact: futures::stream::BoxStream<'static, Result<(), Error>> = match progress {
+            Progress::Unpolled | Progress::RegistrationPending => stream::pending().boxed(),
+            Progress::RegistrationFailed => stream::iter([Err(Error::already_registered(
+                "claiming-worker",
+                "fetcher-test",
+            ))])
+            .boxed(),
+            Progress::Registered | Progress::ClaimPending => {
+                stream::iter([Ok(())]).chain(stream::pending()).boxed()
+            }
+        };
         let mut stream = LeaseStream::new(compact, lease.clone(), retire_on_drop);
         // Dropping only the temporary next future leaves stream-owned work alive.
-        if first_poll {
+        let polls = match progress {
+            Progress::Unpolled => 0,
+            Progress::RegistrationPending | Progress::RegistrationFailed | Progress::Registered => {
+                1
+            }
+            Progress::ClaimPending => 2,
+        };
+        for _ in 0..polls {
             let _ = stream.next().now_or_never();
         }
         if drop_whole_stream {
@@ -991,20 +1024,28 @@ mod tests {
                 to reports_the_queue_once_then_finishes_without_querying { equal((true, true)) }
             }
         }
-        expect(lease_stream_lifetime(drop_whole_stream, first_poll, retire_on_drop)) as worker_stream_lifetime {
+        expect(lease_stream_lifetime(progress, drop_whole_stream, retire_on_drop)) as worker_stream_lifetime {
+            let progress = Progress::Registered;
             let drop_whole_stream = false;
-            let first_poll = true;
             let retire_on_drop = true;
             to keeps_both_workers_active_after_cancelling_only_next { equal((true, true)) }
             when the_whole_claim_stream_is_dropped {
                 let drop_whole_stream = true;
                 to retires_only_the_streams_worker { equal((false, true)) }
-            }
-            when the_stream_was_never_polled {
-                let first_poll = false;
-                to leaves_both_workers_active { equal((true, true)) }
-                when the_whole_stream_is_dropped {
-                    let drop_whole_stream = true;
+                when a_claim_is_still_pending {
+                    let progress = Progress::ClaimPending;
+                    to retires_only_the_streams_worker { equal((false, true)) }
+                }
+                when the_registration_is_still_pending {
+                    let progress = Progress::RegistrationPending;
+                    to leaves_both_workers_active { equal((true, true)) }
+                }
+                when the_registration_failed {
+                    let progress = Progress::RegistrationFailed;
+                    to leaves_both_workers_active { equal((true, true)) }
+                }
+                when the_stream_was_never_polled {
+                    let progress = Progress::Unpolled;
                     to leaves_both_workers_active { equal((true, true)) }
                 }
             }
@@ -1014,12 +1055,12 @@ mod tests {
                 when the_whole_stream_is_dropped {
                     let drop_whole_stream = true;
                     to leaves_both_workers_active { equal((true, true)) }
-                }
-                when the_stream_was_never_polled {
-                    let first_poll = false;
-                    to leaves_both_workers_active { equal((true, true)) }
-                    when the_whole_stream_is_dropped {
-                        let drop_whole_stream = true;
+                    when a_claim_is_still_pending {
+                        let progress = Progress::ClaimPending;
+                        to leaves_both_workers_active { equal((true, true)) }
+                    }
+                    when the_stream_was_never_polled {
+                        let progress = Progress::Unpolled;
                         to leaves_both_workers_active { equal((true, true)) }
                     }
                 }

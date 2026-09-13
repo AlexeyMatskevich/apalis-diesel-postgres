@@ -1,6 +1,8 @@
 //! Lifecycle ownership, retry budgets, and recovery after interrupted work.
 #![cfg(feature = "tokio")]
 mod support;
+#[path = "support/unreachable.rs"]
+mod unreachable;
 async fn database_case<T, F: Future<Output = T>>(
     run: impl FnOnce() -> F,
 ) -> Result<support::Outcome<T>, String> {
@@ -1055,6 +1057,150 @@ mod unpolled_stream {
         when the_shared_subscriptions_are_independent {let mode=Mode::Shared;
           to preserves_the_active_registration {preserves_active_worker()}
           when decoding_is_enabled {let decoded=true;to preserves_the_active_registration {preserves_active_worker()}}
+        }
+      }
+    }
+}
+
+// Only a stream that held a registration can lose completion obligations.
+mod dropped_stream {
+    use apalis_core::{backend::BackendExt, worker::context::WorkerContext};
+    use apalis_diesel_postgres::{
+        CompactType, Config, Error, PgPool, PgTask, PostgresStorage, build_pool, setup,
+    };
+    use diesel::{RunQueryDsl, sql_query, sql_types::Text};
+    use futures::{Stream, StreamExt};
+    use lets_expect::*;
+    use std::time::Duration;
+    #[derive(Clone, Copy)]
+    enum Registration {
+        Succeeded,
+        Refused,
+        Unreachable,
+    }
+    #[derive(Debug)]
+    struct Observation {
+        first_item: &'static str,
+        sibling_item: &'static str,
+        sibling_after_holder_stale: &'static str,
+    }
+    fn kind(item: Option<Result<Option<PgTask<CompactType>>, Error>>) -> &'static str {
+        match item {
+            Some(Ok(None)) => "registered",
+            Some(Ok(Some(_))) => "task",
+            Some(Err(Error::AlreadyRegistered { .. })) => "already_registered",
+            Some(Err(Error::WorkerRetired { .. })) => "retired",
+            Some(Err(Error::Pool(_))) => "pool",
+            Some(Err(_)) => "other_error",
+            None => "ended",
+        }
+    }
+    async fn next_kind<S>(stream: &mut S) -> &'static str
+    where
+        S: Stream<Item = Result<Option<PgTask<CompactType>>, Error>> + Unpin,
+    {
+        kind(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("a stream item within five seconds"),
+        )
+    }
+    async fn age_registration(pool: &PgPool, queue: &str, worker: &str) {
+        let pool = pool.clone();
+        let queue = queue.to_owned();
+        let worker = worker.to_owned();
+        tokio::task::spawn_blocking(move || {
+            sql_query(
+                "UPDATE apalis.workers SET last_seen=clock_timestamp()-interval '2 minutes' \
+                 WHERE worker_type=$1 AND id=$2",
+            )
+            .bind::<Text, _>(queue)
+            .bind::<Text, _>(worker)
+            .execute(&mut pool.get().unwrap())
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    async fn dispose_after_first_item(registration: Registration) -> Observation {
+        let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
+        setup(&pool).await.unwrap();
+        let queue = format!("lifecycle_dropped_{}", ulid::Ulid::new());
+        let config = Config::new(&queue)
+            .set_keep_alive(Duration::from_millis(5))
+            .set_reenqueue_orphaned_after(Duration::from_secs(60));
+        let worker = WorkerContext::new::<()>("rolling-worker");
+        // Another process keeps the name registered while the subject starts.
+        let mut holder = None;
+        if matches!(registration, Registration::Refused) {
+            let mut stream =
+                PostgresStorage::<String>::new_with_config(&pool, &config).poll_compact(&worker);
+            assert_eq!(next_kind(&mut stream).await, "registered");
+            holder = Some(stream);
+        }
+        let subject_pool = match registration {
+            Registration::Unreachable => crate::unreachable::unreachable_pool(),
+            Registration::Succeeded | Registration::Refused => pool.clone(),
+        };
+        let storage = PostgresStorage::<String>::new_with_config(&subject_pool, &config);
+        let mut first = storage.clone().poll_compact(&worker);
+        let first_item = next_kind(&mut first).await;
+        drop(first);
+        let mut sibling = storage.clone().poll_compact(&worker);
+        let sibling_item = next_kind(&mut sibling).await;
+        drop(sibling);
+        // The other process exits and its registration passes the stale deadline.
+        drop(holder);
+        age_registration(&pool, &queue, worker.name()).await;
+        let mut later = storage.clone().poll_compact(&worker);
+        let sibling_after_holder_stale = next_kind(&mut later).await;
+        drop(later);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().unwrap();
+            sql_query("DELETE FROM apalis.jobs WHERE job_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+            sql_query("DELETE FROM apalis.workers WHERE worker_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        Observation {
+            first_item,
+            sibling_item,
+            sibling_after_holder_stale,
+        }
+    }
+    fn observes(
+        first_item: &'static str,
+        sibling_item: &'static str,
+        sibling_after_holder_stale: &'static str,
+    ) -> impl Fn(&Result<crate::support::Outcome<Observation>, String>) -> AssertionResult {
+        crate::satisfies(move |o: &Observation| {
+            o.first_item == first_item
+                && o.sibling_item == sibling_item
+                && o.sibling_after_holder_stale == sibling_after_holder_stale
+        })
+    }
+    async fn run(
+        registration: Registration,
+    ) -> Result<crate::support::Outcome<Observation>, String> {
+        crate::database_case(|| dispose_after_first_item(registration)).await
+    }
+    lets_expect! {#tokio_test
+      expect(run(registration).await) as a_worker_stream_dropped_after_its_first_item {
+        let registration=Registration::Succeeded;
+        to retires_the_registration_for_every_clone {observes("registered","retired","retired")}
+        when the_name_is_held_by_a_live_registration {let registration=Registration::Refused;
+          to leaves_the_clones_free_to_register_once_the_holder_is_stale {
+            observes("already_registered","already_registered","registered")
+          }
+        }
+        when the_pool_is_unreachable {let registration=Registration::Unreachable;
+          to leaves_the_clones_free_to_retry {observes("pool","pool","pool")}
         }
       }
     }
