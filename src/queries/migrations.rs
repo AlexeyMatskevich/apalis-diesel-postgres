@@ -74,19 +74,18 @@ fn flag(conn: &mut PgConnection, query: &str) -> Result<bool, Error> {
         .map_err(|error| Error::Migration(Box::new(error)))
 }
 
-/// The catalog generations `setup` recognizes. The final generations share
-/// every index and function signature; they differ only in the constraints
-/// the later migrations add, so each is identified by the constraints it must
-/// carry and by the absence of the ones it must not.
+/// The catalog generations `setup` recognizes. Every final generation shares
+/// the indexes and function signatures of the eleven-version catalog and
+/// adopts the same eleven versions; the constraints later migrations add are
+/// created idempotently by those migrations and checked by the final
+/// verification of the same transaction, which names a malformed one exactly.
 #[derive(Clone, Copy)]
 enum SchemaGeneration {
     Legacy,
     ReleasedBaseline,
-    /// Eleven versions: the final catalog before the active-owner constraint.
-    Eleven,
-    /// Thirteen versions: the active-owner constraint, no state-shape constraint.
-    Thirteen,
-    /// Fourteen versions: the complete current contract.
+    /// The eleven-version catalog, with or without the later constraints.
+    Adoptable,
+    /// The complete current contract.
     Current,
 }
 
@@ -95,8 +94,7 @@ impl SchemaGeneration {
     fn required_constraints(self) -> i32 {
         match self {
             Self::Legacy | Self::ReleasedBaseline => 0,
-            Self::Eleven => 11,
-            Self::Thirteen => 13,
+            Self::Adoptable => 11,
             Self::Current => 14,
         }
     }
@@ -107,24 +105,11 @@ fn schema_problems(
     generation: SchemaGeneration,
 ) -> Result<Vec<String>, Error> {
     sql_query(include_str!("schema_contract.sql"))
-        .bind::<Bool, _>(matches!(
-            generation,
-            SchemaGeneration::Eleven | SchemaGeneration::Thirteen | SchemaGeneration::Current
-        ))
         .bind::<Bool, _>(matches!(generation, SchemaGeneration::Legacy))
         .bind::<Integer, _>(generation.required_constraints())
         .load::<Problem>(conn)
         .map(|rows| rows.into_iter().map(|row| row.problem).collect())
         .map_err(|error| Error::Migration(Box::new(error)))
-}
-
-fn constraint_absent(conn: &mut PgConnection, name: &str) -> Result<bool, Error> {
-    flag(
-        conn,
-        &format!(
-            "SELECT NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'apalis.jobs'::regclass AND conname = '{name}') AS value"
-        ),
-    )
 }
 
 fn verify_structure(conn: &mut PgConnection) -> Result<(), Error> {
@@ -175,19 +160,11 @@ fn adopt_or_check_existing(conn: &mut PgConnection) -> Result<(), Error> {
     )? {
         return Ok(());
     }
-    let current_matches = schema_problems(conn, SchemaGeneration::Current)?.is_empty();
-    // An absent later constraint distinguishes each previous supported
-    // catalog. A malformed present constraint must not be relabelled as an
-    // earlier generation.
-    let thirteen_matches = !current_matches
-        && schema_problems(conn, SchemaGeneration::Thirteen)?.is_empty()
-        && constraint_absent(conn, "jobs_state_shape_check")?;
-    let eleven_matches = !current_matches
-        && !thirteen_matches
-        && schema_problems(conn, SchemaGeneration::Eleven)?.is_empty()
-        && constraint_absent(conn, "jobs_active_owner_check")?
-        && constraint_absent(conn, "jobs_state_shape_check")?;
-    let final_matches = current_matches || thirteen_matches || eleven_matches;
+    // A malformed later constraint is not relabelled as an earlier
+    // generation: the later migrations create a missing constraint and leave
+    // a present one alone, and `verify_structure` then rejects the malformed
+    // one by name before the adoption commits.
+    let final_matches = schema_problems(conn, SchemaGeneration::Adoptable)?.is_empty();
     let baseline_problems = if final_matches {
         Vec::new()
     } else {
