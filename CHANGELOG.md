@@ -9,6 +9,21 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Added
 
+- `PostgresStorage::release_worker` hands a stopped worker's registration
+  back: every `Running` or `Queued` task it still owns returns to the queue
+  with one attempt consumed, the lease token is cleared, and the row is
+  marked released, so a restart registers the same name immediately instead
+  of waiting for `reenqueue_orphaned_after`. A registration the storage does
+  not own is reported as `WorkerNotRegistered` and left untouched.
+- Retention for the queue's data: `PostgresStorage::purge_terminal_tasks`
+  deletes `Done`, `Killed` and budget-exhausted `Failed` tasks completed
+  longer ago than a window, in bounded batches; the apalis `Vacuum` trait is
+  implemented as that purge with a zero window; and
+  `PostgresStorage::prune_workers` deletes registrations that have been
+  stale for a window and that no task references.
+- `docs/lifecycle.md` documents every task state and transition, the worker
+  registration protocol, recovery latency after each kind of failure, and
+  retention.
 - `PostgresStorage::acknowledger()` returns a `PgAck` bound to the storage's
   registration token and local liveness, so a manual acknowledgement that
   fails retires the worker's registration like the automatic middleware
@@ -22,6 +37,15 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed
 
+- Registration and the heartbeat stream refuse a schedule that cannot keep
+  a registration fresh: `keep_alive` must be greater than zero and shorter
+  than `reenqueue_orphaned_after`, or the first stream item is
+  `InvalidArgument` and no row is written. Such a worker was stale between
+  its own heartbeats and recovered its own running tasks as orphans.
+- Tasks recovered by `release_worker` record
+  `Re-enqueued because the worker released its registration.` as their
+  result when they had none; the sweep and takeover keep the heartbeat
+  timeout message.
 - A registration without a lease token (the admin `RegisterWorker` trait,
   legacy clients of `apalis.get_jobs`) now renews `last_seen` on every
   `register_worker` call, and a worker stream registering the same name

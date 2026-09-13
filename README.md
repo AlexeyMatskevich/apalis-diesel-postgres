@@ -29,6 +29,10 @@ covers Rust API changes, schema migration, deployment order and rollback limits.
 
 MSRV: Rust 1.88.
 
+The [lifecycle reference](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/master/docs/lifecycle.md)
+describes every task state and transition, the worker registration protocol,
+recovery latency after each kind of failure, and retention.
+
 The SQL used by this backend requires PostgreSQL 14 or later. CI currently tests
 PostgreSQL 18. PostgreSQL 12/13 are incompatible with the metrics queries;
 PostgreSQL 14–17 have not been validated by the current CI matrix.
@@ -198,6 +202,40 @@ let worker = WorkerBuilder::new("emails-worker")
     .data(activity)
     .build(handle_email);
 # let _ = worker;
+# }
+```
+
+### Stopping and restarting a worker
+
+A registration stays live for `reenqueue_orphaned_after` (five minutes by
+default) after its last heartbeat. Release it once the worker has stopped,
+whether `run` returned an error or not: the release hands any unfinished task
+back to the queue at once and lets a restart register the same name
+immediately instead of being refused with `AlreadyRegistered` until the
+deadline passes. Restart with fresh storage; the releasing storage and its
+clones are retired.
+
+```rust,no_run
+# use apalis::prelude::*;
+# use apalis_diesel_postgres::{Config, PostgresStorage, build_pool};
+# #[derive(Debug, serde::Deserialize, serde::Serialize)]
+# struct SendEmail { to: String }
+# async fn handle_email(job: SendEmail) -> Result<(), BoxDynError> { Ok(()) }
+# async fn run(shutdown: impl std::future::Future<Output = Result<(), WorkerError>> + Send + 'static) -> Result<(), BoxDynError> {
+# let pool = build_pool("postgres://127.0.0.1:5432/app")?;
+let storage: PostgresStorage<SendEmail> =
+    PostgresStorage::new_with_config(&pool, &Config::new("emails"));
+
+let outcome = WorkerBuilder::new("emails-worker")
+    .backend(storage.clone())
+    .build(handle_email)
+    .run_until(shutdown)
+    .await;
+// Release on every exit path; a registration another storage took over
+// reports `WorkerNotRegistered` and is left to its new owner.
+let _ = storage.release_worker("emails-worker").await;
+outcome?;
+# Ok(())
 # }
 ```
 
@@ -436,6 +474,12 @@ fatal. Errors before a claim and empty fetches also do not retire the local
 registration. Low-level token-free callers
 must resolve `ClaimOutcomeUnknown` before renewing that worker's heartbeat.
 
+Registration refuses a heartbeat schedule that cannot keep the registration
+fresh: `keep_alive` must be greater than zero and shorter than
+`reenqueue_orphaned_after`, or the first item of the task stream and of the
+heartbeat stream is `InvalidArgument`. Keep `keep_alive` at most a third of
+the deadline so a slow heartbeat statement is not mistaken for a dead worker.
+
 A registration created through the admin `RegisterWorker` trait carries no
 lease token and has no heartbeat: its liveness is the time of its last
 `register_worker` call. Callers that claim through `lock_task`,
@@ -467,7 +511,8 @@ To restart, construct fresh storage with a fresh `Config` or a poll strategy
 factory. Cloning retired storage preserves its retired local registration;
 reusing a consumed `Config` strategy can immediately exhaust polling. A fresh
 storage token cannot take over a still-fresh registration with the same name:
-restart may need to wait for the stale deadline. After the last committed
+restart may need to wait for the stale deadline unless the previous storage
+released its registration with `release_worker`. After the last committed
 heartbeat expires, another worker can recover unfinished tasks.
 Recovery counts a lost attempt and respects the retry budget. Taking over the
 same worker name recovers all of that registration's claims before renewal;
@@ -540,8 +585,12 @@ continuing polling strategy. A listener error remains observable even when its
 bounded ID buffer is full. PostgreSQL's server-side notification queue is a
 separate resource: exhaustion can reject a transaction's commit. Monitor it
 alongside pool saturation, heartbeat age, task backlog and database maintenance.
-Completed rows remain until application retention removes them; plan vacuum,
-retention and snapshot refresh for the actual workload. OFFSET pages have a
+Completed rows and registration rows remain until application retention
+removes them: `purge_terminal_tasks` (or the apalis `Vacuum` trait) deletes
+terminal tasks older than a window, and `prune_workers` deletes stale
+registrations that no task references. Plan them, database vacuum and the
+snapshot refresh for the actual workload, with windows longer than any result
+consumer and any deduplication horizon. OFFSET pages have a
 total order on unchanged data, but do not provide a shared snapshot across
 concurrent writes. SKIP LOCKED does not promise fairness under sustained load.
 
@@ -576,7 +625,13 @@ worker logs point at the failed lifecycle step:
 - Acknowledgement races: `stale acknowledgement` when the stored lock no
   longer matches the worker/attempt/lock timestamp being ack'd.
 - Heartbeat failures for missing worker rows: `worker not registered`,
-  instead of a generic update-count mismatch.
+  instead of a generic update-count mismatch. `release_worker` reports the
+  same error when the registration is absent, token-free, or owned by
+  another storage.
+- Heartbeat schedules that cannot keep a registration fresh (`keep_alive`
+  zero or not shorter than `reenqueue_orphaned_after`): `invalid argument`
+  from the first item of the task and heartbeat streams, before any
+  registration.
 - Codec failures: `failed to decode task payload or result with the
   configured codec` — payload was written with a different codec or is
   corrupt. A claimed row whose payload fails to decode is released through

@@ -1,5 +1,21 @@
 # Installation and upgrades
 
+## Upgrading from 0.5.0
+
+No schema change. Two behaviours of the running system change; see the
+[lifecycle reference](lifecycle.md) for the protocol they belong to.
+
+- A `Config` whose `keep_alive` is zero or not shorter than
+  `reenqueue_orphaned_after` is refused at registration with
+  `InvalidArgument`. Such a worker was stale between its own heartbeats and
+  recovered its own running tasks. Set `keep_alive` to at most a third of
+  `reenqueue_orphaned_after` (the defaults are 30 and 300 seconds).
+- Call `PostgresStorage::release_worker` after a worker's run returns, so a
+  redeploy under the same name registers immediately. Without it the
+  behaviour is unchanged: the name is refused until the previous registration
+  is stale. Schedule `purge_terminal_tasks` and `prune_workers` if the
+  application has no retention of its own; nothing is deleted automatically.
+
 ## Upgrading from 0.4.1 to 0.5.0
 
 Use this path when moving from `0.4.1` to `0.5.0`. It covers both the Rust
