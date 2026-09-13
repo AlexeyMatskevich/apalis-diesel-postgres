@@ -70,6 +70,14 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- The heartbeat stream could renew before the task stream had registered the
+  name: Apalis polls both streams from the start, so a registration that took
+  longer than one `keep_alive` (a slow database, a large startup sweep, a
+  short interval under load) ended the worker with `WorkerNotRegistered`
+  before it claimed anything. The first renewal now waits for the
+  registration item; a heartbeat stream polled on its own never yields until
+  the task stream has registered the name, or yields `WorkerRetired` once the
+  name is retired.
 - A token-bound claim by a worker with no registration for the task's queue
   reported `WorkerNotRegistered` with the hint that its registration had
   been replaced and that a fresh storage was needed. The hint now names the

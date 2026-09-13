@@ -456,20 +456,28 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
         if let Err(error) = queries::validate_liveness(&self.config) {
             return futures::stream::once(futures::future::ready(Err(error))).boxed();
         }
-        let keep_alive = queries::keep_alive_stream(
-            self.pool.clone(),
-            self.config.clone(),
-            worker.clone(),
-            std::sync::Arc::clone(&self.lease_token),
-        );
-        let reenqueue = queries::reenqueue_orphaned_stream(self.pool.clone(), self.config.clone())
-            .map_ok(|_| ());
-        crate::fetcher::LeaseStream::new(
-            futures::stream::select(keep_alive, reenqueue),
-            self.leases.for_worker(worker.name()),
-            false,
-        )
-        .boxed()
+        // The registration is the task stream's first item, and only that
+        // item creates the row a heartbeat renews. Apalis polls both streams
+        // from the start, so the first renewal must wait for it: a renewal
+        // that found no row would end the worker with `WorkerNotRegistered`
+        // whenever registration takes longer than one `keep_alive`.
+        let lease = self.leases.for_worker(worker.name());
+        let pool = self.pool.clone();
+        let config = self.config.clone();
+        let worker = worker.clone();
+        let lease_token = std::sync::Arc::clone(&self.lease_token);
+        let beats = futures::stream::once(lease.registered()).flat_map(move |()| {
+            let keep_alive = queries::keep_alive_stream(
+                pool.clone(),
+                config.clone(),
+                worker.clone(),
+                std::sync::Arc::clone(&lease_token),
+            );
+            let reenqueue =
+                queries::reenqueue_orphaned_stream(pool.clone(), config.clone()).map_ok(|_| ());
+            futures::stream::select(keep_alive, reenqueue)
+        });
+        crate::fetcher::LeaseStream::new(beats, lease, false).boxed()
     }
 }
 
@@ -653,6 +661,10 @@ where
     type Beat = futures::stream::BoxStream<'static, Result<(), Error>>;
     type Layer = PgMiddleware;
 
+    /// The keep-alive and orphan-sweep stream for `worker`. It yields nothing
+    /// until the task stream returned by [`Backend::poll`] has yielded the
+    /// registration item, renews every `keep_alive` from then on, and yields
+    /// [`Error::WorkerRetired`] once the name is retired.
     fn heartbeat(&self, worker: &WorkerContext) -> Self::Beat {
         self.heartbeat_stream(worker)
     }

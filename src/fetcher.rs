@@ -416,6 +416,10 @@ where
             && matches!(&result, Poll::Ready(Some(Ok(_))))
         {
             this._guard = Some(this.lease.guard());
+            // The heartbeat stream of this name waits for this moment: a
+            // renewal before the registration would update no row and end
+            // the worker with `WorkerNotRegistered`.
+            this.lease.mark_registered();
         }
         if matches!(
             &result,

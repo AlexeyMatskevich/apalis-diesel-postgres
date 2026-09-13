@@ -482,6 +482,10 @@ fatal. Errors before a claim and empty fetches also do not retire the local
 registration. Low-level token-free callers
 must resolve `ClaimOutcomeUnknown` before renewing that worker's heartbeat.
 
+The heartbeat stream renews only after the task stream has yielded its
+registration item, so a registration slower than one `keep_alive` cannot end
+the worker with `WorkerNotRegistered`; polled without a task stream it never
+yields, and it yields `WorkerRetired` once the name is retired.
 Registration refuses a heartbeat schedule that cannot keep the registration
 fresh: `keep_alive` must be greater than zero and shorter than
 `reenqueue_orphaned_after`, or the first item of the task stream and of the

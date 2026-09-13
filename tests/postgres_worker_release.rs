@@ -453,6 +453,86 @@ fn is_refused_before_registering()
 }
 
 // --------------------------------------------------------------------------
+// A heartbeat that starts before the registration
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct HeartbeatOrderObservation {
+    before_registration: &'static str,
+    registration: &'static str,
+    after_registration: &'static str,
+    after_retirement: &'static str,
+}
+
+async fn heartbeat_item<S>(heartbeat: &mut S, wait: Duration) -> &'static str
+where
+    S: futures::Stream<Item = Result<(), Error>> + Unpin,
+{
+    match tokio::time::timeout(wait, heartbeat.next()).await {
+        Err(_) => "pending",
+        Ok(Some(Ok(()))) => "beat",
+        Ok(Some(Err(Error::WorkerNotRegistered { .. }))) => "not_registered",
+        Ok(Some(Err(Error::WorkerRetired { .. }))) => "retired",
+        Ok(Some(Err(_))) => "other_error",
+        Ok(None) => "ended",
+    }
+}
+
+/// The heartbeat stream is created and polled before the task stream has
+/// registered the name, with a heartbeat interval far shorter than any
+/// registration round trip. It must wait for the registration instead of
+/// renewing a row that does not exist yet and ending the worker.
+async fn heartbeat_before_registration() -> Result<Outcome<HeartbeatOrderObservation>, String> {
+    let Some(pool) = pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("worker-release-heartbeat-order-{}", ulid::Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+    let observation = async {
+        let config = Config::new(&queue)
+            .set_keep_alive(Duration::from_millis(10))
+            .set_reenqueue_orphaned_after(Duration::from_secs(60));
+        let worker = WorkerContext::new::<()>("early-heartbeat-worker");
+        let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+        let mut heartbeat = storage.heartbeat(&worker);
+        // Many heartbeat intervals pass while nothing is registered.
+        let before_registration = heartbeat_item(&mut heartbeat, Duration::from_millis(300)).await;
+        let mut tasks = storage.clone().poll_compact(&worker);
+        let registration = next_item(&mut tasks).await;
+        let after_registration = heartbeat_item(&mut heartbeat, Duration::from_secs(5)).await;
+        // Dropping the registered task stream retires the name.
+        drop(tasks);
+        let after_retirement = heartbeat_item(&mut heartbeat, Duration::from_secs(5)).await;
+        Ok::<_, String>(HeartbeatOrderObservation {
+            before_registration,
+            registration,
+            after_registration,
+            after_retirement,
+        })
+    }
+    .await;
+    cleanup(pool, queue).await?;
+    observation.map(Outcome::Completed)
+}
+
+fn waits_for_the_registration()
+-> impl Fn(&Result<Outcome<HeartbeatOrderObservation>, String>) -> AssertionResult {
+    observe::<HeartbeatOrderObservation, _>("heartbeat before registration", |o| {
+        if o.before_registration == "pending"
+            && o.registration == "registered"
+            && o.after_registration == "beat"
+            && o.after_retirement == "retired"
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the heartbeat to wait for the registration, renew after it, and stop after retirement; got {o:?}"
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
 // Removing completed history
 // --------------------------------------------------------------------------
 
@@ -564,6 +644,10 @@ lets_expect! { #tokio_test
             let handover = Handover::Kept;
             to is_refused_until_the_registration_is_stale { is_refused_until_stale() }
         }
+    }
+
+    expect(heartbeat_before_registration().await) as a_heartbeat_started_before_the_registration {
+        to waits_for_the_registration { waits_for_the_registration() }
     }
 
     expect(misconfigured_liveness().await) as a_heartbeat_slower_than_the_stale_deadline {

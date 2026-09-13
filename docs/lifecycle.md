@@ -178,11 +178,13 @@ these states; the columns in parentheses are what other actors read.
    after recovering all of its claims in the same transaction. The
    registration outcome is the first item of the task stream; nothing is
    claimed before it.
-3. **Heartbeat and sweep.** Every `keep_alive`, the heartbeat stream sets
-   `last_seen` where the token still matches, and the sweep recovers up to
-   1000 rows of stale workers of the queue. A heartbeat that updates no row
-   reports `WorkerNotRegistered`: the name was taken over, released or
-   deleted.
+3. **Heartbeat and sweep.** The heartbeat stream waits for the registration
+   item of the task stream, then every `keep_alive` sets `last_seen` where
+   the token still matches, and the sweep recovers up to 1000 rows of stale
+   workers of the queue. A heartbeat that updates no row reports
+   `WorkerNotRegistered`: the name was taken over, released or deleted.
+   Polled without a task stream, the heartbeat never yields; once the name
+   is retired it yields `WorkerRetired`.
 4. **Claims.** Every claim first locks the registration row `FOR KEY SHARE`
    and, when the caller carries a token, checks that it still owns the row;
    the token-free `lock_task` entry points rely on the foreign key instead.
