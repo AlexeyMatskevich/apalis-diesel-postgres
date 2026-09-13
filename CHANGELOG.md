@@ -36,7 +36,10 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   doubling backoff while the consumer polls, for at most five retries or
   three seconds since the first failure, and a release that keeps failing
   retires the worker's local registration and yields the error, so the row
-  and its siblings are recovered as orphans.
+  and its siblings are recovered as orphans. A release that matches no row
+  proves the registration lost the claim to a sweep or a takeover and
+  retires the worker instead of delivering siblings that may already run
+  elsewhere.
 - A retry layer composed outside the backend middleware, such as apalis's
   `.retry(RetryPolicy::retries(n))`, re-dispatched a task whose claim was
   already acknowledged. The handler ran again, the second acknowledgement was

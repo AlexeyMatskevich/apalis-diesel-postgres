@@ -23,6 +23,7 @@ enum Release {
     Immediate,
     AfterTransientFault,
     PersistentFault,
+    ClaimSwept,
 }
 
 #[derive(Debug)]
@@ -110,8 +111,25 @@ async fn decode_cleanup(
         lease.clone(),
     );
     // The single pooled connection is held so the release cannot check one out.
+    if matches!(release, Release::ClaimSwept) {
+        // Orphan recovery reclaimed the batch while the release was pending.
+        let sweep_pool = pool.clone();
+        let sweep_queue = name.clone();
+        crate::runtime::run_blocking(move || {
+            let mut conn = sweep_pool.get()?;
+            sql_query(
+                "UPDATE apalis.jobs SET status='Pending', lock_by=NULL, lock_at=NULL, \
+                 attempts=attempts+1 WHERE job_type=$1",
+            )
+            .bind::<Text, _>(&sweep_queue)
+            .execute(&mut conn)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    }
     let mut held = match release {
-        Release::Immediate => None,
+        Release::Immediate | Release::ClaimSwept => None,
         Release::AfterTransientFault | Release::PersistentFault => {
             Some(pool.get().map_err(|error| error.to_string())?)
         }
@@ -239,6 +257,31 @@ fn retired_with_the_claim_intact()
     }
 }
 
+fn retired_after_losing_the_claim()
+-> impl Fn(&Result<Option<DecodeOutcome>, String>) -> AssertionResult {
+    move |outcome| {
+        let result = outcome.as_ref().map_err(|error| {
+            AssertionError::new(vec![format!("decode cleanup scenario failed: {error}")])
+        })?;
+        let Some(outcome) = result else {
+            return Ok(());
+        };
+        if outcome.errors == ["decode", "retired"]
+            && outcome.corrupt_state.status == "Pending"
+            && outcome.corrupt_state.attempts == 1
+            && outcome.sibling.is_none()
+            && outcome.retired_after_next
+            && outcome.retired_after_drop
+        {
+            Ok(())
+        } else {
+            Err(AssertionError::new(vec![format!(
+                "expected the codec error then WorkerRetired, the swept row untouched by the stale release, no sibling delivered and the worker retired for the lost claim; got {result:?}"
+            )]))
+        }
+    }
+}
+
 lets_expect! { #tokio_test
     expect(decode_cleanup(release, max_attempts).await) as corrupt_claim_cleanup {
         let release = Release::Immediate;
@@ -259,6 +302,10 @@ lets_expect! { #tokio_test
         when the_pool_stays_exhausted_past_the_retry_budget {
             let release = Release::PersistentFault;
             to retires_the_worker_so_orphan_recovery_can_reclaim_the_batch { retired_with_the_claim_intact() }
+        }
+        when orphan_recovery_swept_the_batch_before_the_release {
+            let release = Release::ClaimSwept;
+            to retires_the_worker_instead_of_delivering_reclaimed_siblings { retired_after_losing_the_claim() }
         }
     }
 }

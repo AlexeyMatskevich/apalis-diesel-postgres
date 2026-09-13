@@ -94,11 +94,14 @@ where
 /// — unackable (ack needs a decoded task) and invisible to orphan recovery
 /// (which only reclaims rows of stale workers).
 /// A failed release remains owned by this stream: it is retried with bounded
-/// backoff while the consumer keeps polling, and only a successful or stale
-/// release discharges the obligation and emits the original codec error before
-/// continuing the batch. A release that keeps failing retires the worker's
-/// local lease and yields the database error, so the row and its buffered
-/// siblings become recoverable as orphans once the heartbeat stops.
+/// backoff while the consumer keeps polling, and a successful release
+/// discharges the obligation and emits the original codec error before
+/// continuing the batch. A stale release, one that matched no row, proves the
+/// registration lost the claim to a sweep or a takeover; it emits the codec
+/// error and retires the worker's local lease instead of delivering siblings
+/// that may already run elsewhere. A release that keeps failing retires the
+/// lease and yields the database error, so the row and its buffered siblings
+/// become recoverable as orphans once the heartbeat stops.
 pub(crate) fn decode_task_stream<Args, Decode>(
     compact: TaskStream<PgTask<CompactType>, Error>,
     pool: PgPool,
@@ -144,7 +147,17 @@ where
                         )
                         .await
                         {
-                            Ok(_) => return Some((Err(obligation.decode_error), (compact, None))),
+                            Ok(released) => {
+                                if released == 0 {
+                                    // The row no longer carries this claim: it
+                                    // was swept or re-claimed, so this
+                                    // registration lost ownership and its
+                                    // buffered siblings may already run
+                                    // elsewhere. Stop delivering them.
+                                    lease.retire();
+                                }
+                                return Some((Err(obligation.decode_error), (compact, None)));
+                            }
                             Err(error) => {
                                 obligation.failures += 1;
                                 let first_failure = *obligation
