@@ -178,13 +178,14 @@ these states; the columns in parentheses are what other actors read.
    after recovering all of its claims in the same transaction. The
    registration outcome is the first item of the task stream; nothing is
    claimed before it.
-3. **Heartbeat and sweep.** The heartbeat stream waits for the registration
-   item of the task stream, then every `keep_alive` sets `last_seen` where
-   the token still matches, and the sweep recovers up to 1000 rows of stale
-   workers of the queue. A heartbeat that updates no row reports
-   `WorkerNotRegistered`: the name was taken over, released or deleted.
-   Polled without a task stream, the heartbeat never yields; once the name
-   is retired it yields `WorkerRetired`.
+3. **Heartbeat and sweep.** The heartbeat stream waits for the first item of
+   the task stream, the registration outcome, then every `keep_alive` sets
+   `last_seen` where the token still matches, and the sweep recovers up to
+   1000 rows of stale workers of the queue. A heartbeat that updates no row
+   reports `WorkerNotRegistered`: the registration was refused, or the name
+   was taken over, released or deleted. Polled without a task stream, the
+   heartbeat never yields; once the name is retired it yields
+   `WorkerRetired`.
 4. **Claims.** Every claim first locks the registration row `FOR KEY SHARE`
    and, when the caller carries a token, checks that it still owns the row;
    the token-free `lock_task` entry points rely on the foreign key instead.
@@ -201,10 +202,17 @@ these states; the columns in parentheses are what other actors read.
    clears the token and sets `last_seen` to the epoch, in one transaction
    that waits for claims being committed. A successor registers immediately.
    Call it after `Worker::run` (or `run_until`) returns, on success and on
-   error alike, or wrap the run in `run_released`, which does exactly that
-   and returns both results. Apalis drains handlers before a graceful stop,
-   so a graceful release usually recovers nothing; after a fail-stop it hands
-   unfinished claims back at once instead of after the stale deadline.
+   error alike, or wrap the run in `run_released`, which does that (also
+   after a panic, which it then resumes) and returns both results; the
+   `releaser()` handle carries both operations for a storage that has moved
+   into the builder. The name must be the stopped worker's own: clones of one
+   storage share the token, and a wrong name releases whichever live worker
+   uses it. Apalis drains running handlers before a graceful stop, but the
+   poll fetcher's buffer of claimed, undispatched tasks (up to `buffer_size`)
+   is dropped with the stream; the release recovers those rows too, and each
+   consumes one attempt because the database records a claim, not a
+   dispatch. After a fail-stop the release hands unfinished claims back at
+   once instead of after the stale deadline.
 7. **Prune.** `prune_workers` deletes, in bounded batches, registrations
    that have been stale for the given window and that no task references.
    The window must be at least `reenqueue_orphaned_after`, the deadline
@@ -218,7 +226,7 @@ Recovery of the tasks a worker held, by how the worker ended:
 
 | How the worker ended | Registration afterwards | Its claims are recovered |
 |---|---|---|
-| Graceful stop, then `release_worker` | released | immediately (normally nothing to recover) |
+| Graceful stop, then `release_worker` | released | immediately (handlers were drained; claimed, undispatched buffer rows are recovered at one attempt each) |
 | Fail-stop error, then `release_worker` | released | immediately |
 | Any stop without `release_worker` | fresh until `reenqueue_orphaned_after` elapses | by the next sweep of any live worker of the queue after the deadline, at most one `keep_alive` later, 1000 rows per sweep; or at once when a fresh token takes the name over after the deadline |
 | Process killed | as above | as above |
@@ -249,7 +257,7 @@ waiting.
 | Event | Backend behaviour |
 |---|---|
 | Heartbeat statement fails (pool timeout, connection lost) | The heartbeat stream yields the error; the worker stops. Registration stays fresh until the deadline unless released. |
-| Heartbeat updates no row | `WorkerNotRegistered`: the name was taken over or released elsewhere. Do not release; the current owner holds the claims. |
+| Heartbeat updates no row | `WorkerNotRegistered`: the registration was refused, or the name was taken over or released elsewhere. A release is then a no-op that reports `WorkerNotRegistered`; the current owner holds the claims. |
 | Claim fails before any row was claimed | The task stream yields the error; nothing is owned. |
 | Claim transaction produced rows but the commit was not confirmed | `ClaimOutcomeUnknown`; the name is retired locally so recovery can proceed. |
 | Acknowledgement fails or is lost | The storage's acknowledger retires the name; the row stays `Running` until recovery. `PgAck::new` and `with_lease_token` bind no liveness and leave the heartbeat running. |

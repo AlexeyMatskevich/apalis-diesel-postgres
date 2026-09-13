@@ -16,7 +16,12 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   of waiting for `reenqueue_orphaned_after`. A registration the storage does
   not own is reported as `WorkerNotRegistered` and left untouched.
   `PostgresStorage::run_released` awaits a worker future and then releases
-  on every exit path, returning both results as `ReleasedRun`.
+  whether the run returned, failed or panicked, returning both results as
+  `ReleasedRun`; only cancelling it skips the release.
+  `PostgresStorage::releaser` returns a clonable `PgReleaser` with both
+  operations, so a storage that moved into a `WorkerBuilder` (or whose
+  fetcher cannot be cloned, as with `SharedPostgresStorage`) can still be
+  released.
 - Retention for the queue's data: `PostgresStorage::purge_terminal_tasks`
   deletes `Done`, `Killed` and budget-exhausted `Failed` tasks completed
   longer ago than a window, in bounded batches that each borrow a pooled
@@ -42,6 +47,13 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed (breaking)
 
+- Registration and the heartbeat stream refuse a schedule that cannot keep
+  a registration fresh: `keep_alive` must be greater than zero and shorter
+  than `reenqueue_orphaned_after`, or the first stream item is
+  `InvalidArgument` and no row is written. Such a worker was stale between
+  its own heartbeats and recovered its own running tasks as orphans. A
+  `Config` that shortened `reenqueue_orphaned_after` to the default
+  30-second `keep_alive` or below now needs a shorter `keep_alive` as well.
 - Migration `20260914000000_task_state_shape` adds the constraint
   `jobs_state_shape_check`: a `Pending` row carries no owner columns and a
   `Queued` or `Running` row carries both `lock_by` and `lock_at`. Existing
@@ -53,11 +65,6 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed
 
-- Registration and the heartbeat stream refuse a schedule that cannot keep
-  a registration fresh: `keep_alive` must be greater than zero and shorter
-  than `reenqueue_orphaned_after`, or the first stream item is
-  `InvalidArgument` and no row is written. Such a worker was stale between
-  its own heartbeats and recovered its own running tasks as orphans.
 - Tasks recovered by `release_worker` record
   `Re-enqueued because the worker released its registration.` as their
   result when they had none; the sweep and takeover keep the heartbeat
@@ -78,9 +85,10 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   longer than one `keep_alive` (a slow database, a large startup sweep, a
   short interval under load) ended the worker with `WorkerNotRegistered`
   before it claimed anything. The first renewal now waits for the
-  registration item; a heartbeat stream polled on its own never yields until
-  the task stream has registered the name, or yields `WorkerRetired` once the
-  name is retired.
+  registration outcome: a heartbeat stream polled on its own never yields
+  until the task stream has yielded its first item, then renews (or reports
+  `WorkerNotRegistered` when the registration was refused), and yields
+  `WorkerRetired` once the name is retired.
 - A token-bound claim by a worker with no registration for the task's queue
   reported `WorkerNotRegistered` with the hint that its registration had
   been replaced and that a fresh storage was needed. The hint now names the

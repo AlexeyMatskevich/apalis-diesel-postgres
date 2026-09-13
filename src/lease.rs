@@ -6,9 +6,9 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 /// Shared by storage clones; different worker names have independent liveness.
@@ -30,7 +30,8 @@ impl LeaseRegistry {
                     worker_id: worker_id.to_owned(),
                     retired: AtomicBool::new(false),
                     registered: AtomicBool::new(false),
-                    waker: futures::task::AtomicWaker::new(),
+                    settled_registrations: AtomicU64::new(0),
+                    waiters: Mutex::new(Vec::new()),
                 })
             })
             .clone()
@@ -40,10 +41,16 @@ impl LeaseRegistry {
 pub(crate) struct WorkerLease {
     worker_id: String,
     retired: AtomicBool,
-    /// Set once the task stream yielded the registration item, so a
+    /// Set once a task stream yielded the registration item, so a
     /// heartbeat never renews a row that does not exist yet.
     registered: AtomicBool,
-    waker: futures::task::AtomicWaker,
+    /// Registration attempts that have yielded their first item, successful
+    /// or not. A heartbeat created before an attempt waits for that attempt
+    /// to settle; a refused attempt lets it report the refusal.
+    settled_registrations: AtomicU64,
+    /// Every waiter, so two heartbeat streams of one name (clones of one
+    /// storage register with the same token) are both woken.
+    waiters: Mutex<Vec<Waker>>,
 }
 impl WorkerLease {
     pub(crate) fn is_retired(&self) -> bool {
@@ -51,20 +58,40 @@ impl WorkerLease {
     }
     pub(crate) fn retire(&self) {
         self.retired.store(true, Ordering::Release);
-        self.waker.wake();
+        self.wake_waiters();
     }
     pub(crate) fn is_registered(&self) -> bool {
         self.registered.load(Ordering::Acquire)
     }
-    pub(crate) fn mark_registered(&self) {
-        self.registered.store(true, Ordering::Release);
-        self.waker.wake();
+    /// Record that a registration attempt yielded its first item.
+    pub(crate) fn settle_registration(&self, succeeded: bool) {
+        if succeeded {
+            self.registered.store(true, Ordering::Release);
+        }
+        self.settled_registrations.fetch_add(1, Ordering::AcqRel);
+        self.wake_waiters();
     }
-    /// Resolves once the name is registered, or once it is retired: a
-    /// retired name has nothing to renew and its stream reports
-    /// [`Error::WorkerRetired`] on its next poll.
-    pub(crate) fn registered(self: &Arc<Self>) -> Registered {
-        Registered(self.clone())
+    fn wake_waiters(&self) {
+        let waiters = std::mem::take(
+            &mut *self
+                .waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+    /// Resolves once the name is registered, once it is retired, or once a
+    /// registration attempt that had not settled when this future was
+    /// created has settled, refused or not. A heartbeat stream then either
+    /// renews a row that exists, reports the retirement, or reports the
+    /// refusal as `WorkerNotRegistered`.
+    pub(crate) fn registration(self: &Arc<Self>) -> Registration {
+        Registration {
+            lease: self.clone(),
+            settled_before: self.settled_registrations.load(Ordering::Acquire),
+        }
     }
     pub(crate) fn ensure_active(&self) -> Result<(), Error> {
         if self.is_retired() {
@@ -82,19 +109,37 @@ impl WorkerLease {
         }
     }
 }
-/// See [`WorkerLease::registered`].
-pub(crate) struct Registered(Arc<WorkerLease>);
-impl Future for Registered {
+/// See [`WorkerLease::registration`].
+pub(crate) struct Registration {
+    lease: Arc<WorkerLease>,
+    settled_before: u64,
+}
+impl Registration {
+    fn is_settled(&self) -> bool {
+        self.lease.is_registered()
+            || self.lease.is_retired()
+            || self.lease.settled_registrations.load(Ordering::Acquire) > self.settled_before
+    }
+}
+impl Future for Registration {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let lease = &self.0;
-        if lease.is_registered() || lease.is_retired() {
+        if self.is_settled() {
             return Poll::Ready(());
         }
-        lease.waker.register(cx.waker());
-        // A wake between the check above and the registration is not lost:
-        // the state is read again with the waker in place.
-        if lease.is_registered() || lease.is_retired() {
+        {
+            let mut waiters = self
+                .lease
+                .waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+        }
+        // A wake between the check above and the settlement is not lost: the
+        // state is read again with the waker in place.
+        if self.is_settled() {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -128,48 +173,101 @@ mod tests {
     enum Milestone {
         None,
         Registered,
+        Refused,
         Retired,
         RegisteredThenRetired,
     }
-    /// Poll the registration future of a name before and after a milestone,
-    /// through a clone of the registry, and report whether it resolved.
-    fn registration_wait(milestone: Milestone) -> (bool, bool) {
+    /// A waker that counts how often it was woken.
+    fn counting_waker() -> (std::task::Waker, Arc<std::sync::atomic::AtomicUsize>) {
+        struct Count(Arc<std::sync::atomic::AtomicUsize>);
+        impl futures::task::ArcWake for Count {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            futures::task::waker(Arc::new(Count(counter.clone()))),
+            counter,
+        )
+    }
+    /// Two heartbeat waiters on one name, polled with counting wakers before
+    /// a milestone, then polled again after it. Reports, per waiter, whether
+    /// it was woken and whether it then resolved.
+    fn registration_waits(milestone: Milestone) -> ((bool, bool), (bool, bool)) {
         let registry = LeaseRegistry::default();
         let lease = registry.for_worker("one");
-        let mut wait = registry.clone().for_worker("one").registered();
-        let before = wait
-            .poll_unpin(&mut Context::from_waker(futures::task::noop_waker_ref()))
+        let mut first = registry.clone().for_worker("one").registration();
+        let mut second = registry.clone().for_worker("one").registration();
+        let (first_waker, first_wakes) = counting_waker();
+        let (second_waker, second_wakes) = counting_waker();
+        let first_before = first
+            .poll_unpin(&mut Context::from_waker(&first_waker))
             .is_ready();
+        let second_before = second
+            .poll_unpin(&mut Context::from_waker(&second_waker))
+            .is_ready();
+        assert!(!first_before && !second_before);
         match milestone {
             Milestone::None => {}
-            Milestone::Registered => lease.mark_registered(),
+            Milestone::Registered => lease.settle_registration(true),
+            Milestone::Refused => lease.settle_registration(false),
             Milestone::Retired => lease.retire(),
             Milestone::RegisteredThenRetired => {
-                lease.mark_registered();
+                lease.settle_registration(true);
                 lease.retire();
             }
         }
-        let after = wait
-            .poll_unpin(&mut Context::from_waker(futures::task::noop_waker_ref()))
+        let first_after = first
+            .poll_unpin(&mut Context::from_waker(&first_waker))
+            .is_ready();
+        let second_after = second
+            .poll_unpin(&mut Context::from_waker(&second_waker))
+            .is_ready();
+        (
+            (first_wakes.load(Ordering::SeqCst) > 0, first_after),
+            (second_wakes.load(Ordering::SeqCst) > 0, second_after),
+        )
+    }
+    /// A waiter created after a refused attempt settled is not released by
+    /// that earlier refusal: it waits for the next attempt.
+    fn waiter_after_a_refusal() -> (bool, bool) {
+        let lease = LeaseRegistry::default().for_worker("one");
+        lease.settle_registration(false);
+        let mut later = lease.registration();
+        let noop = Context::from_waker(futures::task::noop_waker_ref());
+        let before = later
+            .poll_unpin(&mut Context::from_waker(noop.waker()))
+            .is_ready();
+        lease.settle_registration(false);
+        let after = later
+            .poll_unpin(&mut Context::from_waker(noop.waker()))
             .is_ready();
         (before, after)
     }
     lets_expect! {
-        expect(registration_wait(milestone)) as waiting_for_a_registration {
+        expect(registration_waits(milestone)) as heartbeats_waiting_for_a_registration {
             let milestone = Milestone::None;
-            to stays_pending_while_nothing_happened { equal((false, false)) }
+            to stay_pending_and_unwoken_while_nothing_happened { equal(((false, false), (false, false))) }
             when the_task_stream_registers_the_name {
                 let milestone = Milestone::Registered;
-                to resolves_after_the_registration { equal((false, true)) }
+                to are_both_woken_and_resolve { equal(((true, true), (true, true))) }
+            }
+            when the_registration_is_refused {
+                let milestone = Milestone::Refused;
+                to are_both_woken_and_resolve_to_report_the_refusal { equal(((true, true), (true, true))) }
             }
             when the_name_is_retired_before_registering {
                 let milestone = Milestone::Retired;
-                to resolves_so_the_stream_can_report_the_retirement { equal((false, true)) }
+                to are_both_woken_and_resolve_to_report_the_retirement { equal(((true, true), (true, true))) }
             }
             when the_name_is_registered_and_then_retired {
                 let milestone = Milestone::RegisteredThenRetired;
-                to resolves { equal((false, true)) }
+                to are_both_woken_and_resolve { equal(((true, true), (true, true))) }
             }
+        }
+        expect(waiter_after_a_refusal()) as a_heartbeat_created_after_a_refused_registration {
+            to waits_for_the_next_attempt_to_settle { equal((false, true)) }
         }
     }
     #[derive(Clone, Copy)]

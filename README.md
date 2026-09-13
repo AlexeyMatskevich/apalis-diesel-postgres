@@ -213,15 +213,18 @@ whether `run` returned an error or not: the release hands any unfinished task
 back to the queue at once and lets a restart register the same name
 immediately instead of being refused with `AlreadyRegistered` until the
 deadline passes. `run_released` awaits a worker future and then releases;
-`release_worker` is the explicit call. Restart with fresh storage; the
-releasing storage and its clones are retired. A worker killed before it could release waits for the
+`release_worker` is the explicit call; `releaser()` gives a clonable handle
+to both for a storage that has moved into the builder. Restart with fresh
+storage; the releasing storage and its clones are retired. The release
+consumes one attempt for every task the worker still owned, including tasks
+the poll fetcher had claimed but not yet handed to a handler. A worker killed before it could release waits for the
 deadline by design: `reenqueue_orphaned_after` is the restart latency after
 a crash, so shorten it (with a proportionally shorter `keep_alive`) when a
 fast restart matters more than tolerance for slow heartbeats.
 
 ```rust,no_run
 # use apalis::prelude::*;
-# use apalis_diesel_postgres::{Config, PostgresStorage, ReleasedRun, build_pool};
+# use apalis_diesel_postgres::{Config, Error, PostgresStorage, ReleasedRun, build_pool};
 # #[derive(Debug, serde::Deserialize, serde::Serialize)]
 # struct SendEmail { to: String }
 # async fn handle_email(job: SendEmail) -> Result<(), BoxDynError> { Ok(()) }
@@ -230,17 +233,21 @@ fast restart matters more than tolerance for slow heartbeats.
 let storage: PostgresStorage<SendEmail> =
     PostgresStorage::new_with_config(&pool, &Config::new("emails"));
 
+// Take the release handle before the storage moves into the builder.
+let releaser = storage.releaser();
 let worker = WorkerBuilder::new("emails-worker")
-    .backend(storage.clone())
+    .backend(storage)
     .build(handle_email);
-// `run_released` awaits the run and then releases on every exit path; a
-// registration another storage took over reports `WorkerNotRegistered` and
-// is left to its new owner.
-let ReleasedRun { outcome, released } = storage
+// `run_released` awaits the run and then releases, whether the run
+// returned, failed or panicked. A registration another storage took over
+// reports `WorkerNotRegistered` and is left to its new owner; any other
+// release error leaves the registration to the stale deadline.
+let ReleasedRun { outcome, released } = releaser
     .run_released("emails-worker", worker.run_until(shutdown))
     .await;
-if let Err(error) = released {
-    eprintln!("registration stays until the stale deadline: {error}");
+match released {
+    Ok(_) | Err(Error::WorkerNotRegistered { .. }) => {}
+    Err(error) => eprintln!("registration stays until the stale deadline: {error}"),
 }
 outcome?;
 # Ok(())
@@ -483,9 +490,10 @@ registration. Low-level token-free callers
 must resolve `ClaimOutcomeUnknown` before renewing that worker's heartbeat.
 
 The heartbeat stream renews only after the task stream has yielded its
-registration item, so a registration slower than one `keep_alive` cannot end
-the worker with `WorkerNotRegistered`; polled without a task stream it never
-yields, and it yields `WorkerRetired` once the name is retired.
+first item, the registration outcome, so a registration slower than one
+`keep_alive` cannot end the worker with `WorkerNotRegistered`; a refused
+registration makes it report that refusal, polled without a task stream it
+never yields, and it yields `WorkerRetired` once the name is retired.
 Registration refuses a heartbeat schedule that cannot keep the registration
 fresh: `keep_alive` must be greater than zero and shorter than
 `reenqueue_orphaned_after`, or the first item of the task stream and of the

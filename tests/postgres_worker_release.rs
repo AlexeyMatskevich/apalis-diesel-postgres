@@ -16,14 +16,15 @@ use std::{
 };
 
 use apalis::prelude::*;
+use apalis_core::backend::shared::MakeShared;
 use apalis_core::{
     backend::{Backend, BackendExt, FetchById, TaskSink, Vacuum},
     task::status::Status,
     worker::context::WorkerContext,
 };
 use apalis_diesel_postgres::{
-    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, ReleasedRun, build_pool,
-    setup,
+    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, ReleasedRun,
+    SharedPostgresStorage,
 };
 use diesel::{QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
@@ -31,12 +32,7 @@ use lets_expect::{AssertionResult, *};
 use support::{Outcome, observe};
 
 async fn pool() -> Result<Option<PgPool>, String> {
-    let Some(url) = support::database_url_or_skip()? else {
-        return Ok(None);
-    };
-    let pool = build_pool(url).map_err(|e| e.to_string())?;
-    setup(&pool).await.map_err(|e| e.to_string())?;
-    Ok(Some(pool))
+    support::shared_pool().await
 }
 
 async fn cleanup(pool: PgPool, queue: String) -> Result<(), String> {
@@ -271,8 +267,62 @@ enum Handover {
     Released,
     /// The first deployment ran through `run_released`.
     RunReleased,
+    /// The first deployment used a shared-listener storage, whose fetcher
+    /// cannot be cloned, and released through the handle taken beforehand.
+    SharedReleaser,
     /// The first deployment stopped without releasing.
     Kept,
+}
+
+/// Run one worker on a storage made by `SharedPostgresStorage` until the
+/// task is terminal, releasing through the handle taken before the build.
+async fn run_shared_released(
+    pool: &PgPool,
+    queue: &str,
+    name: &str,
+    task_id: PgTaskId,
+    handled: Arc<AtomicUsize>,
+) -> (Result<(), String>, Result<usize, &'static str>) {
+    let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(pool);
+    let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
+        &mut shared,
+        config(queue),
+    )
+    .expect("a shared storage");
+    let releaser = storage.releaser();
+    let observer = PostgresStorage::<String>::new_with_config(pool, &config(queue));
+    let handler = move |_job: String| {
+        let handled = handled.clone();
+        async move {
+            handled.fetch_add(1, Ordering::Relaxed);
+            Ok::<(), BoxDynError>(())
+        }
+    };
+    let worker = WorkerBuilder::new(name).backend(storage).build(handler);
+    let mut observer = observer;
+    let signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = observer
+                .fetch_by_id(&task_id)
+                .await
+                .map_err(|error| WorkerError::StreamError(Box::new(error)))?
+                .map(|task| task.parts.status.load());
+            if matches!(status, Some(Status::Done | Status::Killed)) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(WorkerError::PanicError("terminal state timeout".into()));
+            }
+            apalis_core::timer::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let ReleasedRun { outcome, released } =
+        releaser.run_released(name, worker.run_until(signal)).await;
+    (
+        outcome.map_err(|e| e.to_string()),
+        released.map_err(release_error),
+    )
 }
 
 async fn restart_under_the_same_name(
@@ -303,6 +353,9 @@ async fn restart_under_the_same_name(
                     )
                     .await;
                 (outcome, released.map_err(release_error))
+            }
+            Handover::SharedReleaser => {
+                run_shared_released(&pool, &queue, name, first_task, handled.clone()).await
             }
             Handover::Kept => (
                 run_until_done(first.clone(), name, first_task, handled.clone()).await,
@@ -478,11 +531,37 @@ where
     }
 }
 
+/// The heartbeat stream merges the renewal with the orphan sweep, and the
+/// sweep keeps yielding `Ok` for a name whose renewal fails. Report the
+/// first error among the next few items, or what stopped the wait.
+async fn first_heartbeat_error<S>(heartbeat: &mut S) -> &'static str
+where
+    S: futures::Stream<Item = Result<(), Error>> + Unpin,
+{
+    for _ in 0..20 {
+        match heartbeat_item(heartbeat, Duration::from_secs(5)).await {
+            "beat" => continue,
+            other => return other,
+        }
+    }
+    "only_beats"
+}
+
+#[derive(Clone, Copy)]
+enum Registration {
+    Succeeds,
+    /// Another storage holds the name with a fresh registration.
+    Refused,
+}
+
 /// The heartbeat stream is created and polled before the task stream has
 /// registered the name, with a heartbeat interval far shorter than any
-/// registration round trip. It must wait for the registration instead of
-/// renewing a row that does not exist yet and ending the worker.
-async fn heartbeat_before_registration() -> Result<Outcome<HeartbeatOrderObservation>, String> {
+/// registration round trip. It must wait for the registration outcome
+/// instead of renewing a row that does not exist yet and ending the worker;
+/// a refused registration lets it report the refusal.
+async fn heartbeat_before_registration(
+    registration: Registration,
+) -> Result<Outcome<HeartbeatOrderObservation>, String> {
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
@@ -493,16 +572,33 @@ async fn heartbeat_before_registration() -> Result<Outcome<HeartbeatOrderObserva
             .set_keep_alive(Duration::from_millis(10))
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
         let worker = WorkerContext::new::<()>("early-heartbeat-worker");
+        let mut holder = None;
+        if matches!(registration, Registration::Refused) {
+            let mut stream =
+                PostgresStorage::<String>::new_with_config(&pool, &config).poll_compact(&worker);
+            assert_eq!(next_item(&mut stream).await, "registered");
+            holder = Some(stream);
+        }
         let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
         let mut heartbeat = storage.heartbeat(&worker);
         // Many heartbeat intervals pass while nothing is registered.
         let before_registration = heartbeat_item(&mut heartbeat, Duration::from_millis(300)).await;
         let mut tasks = storage.clone().poll_compact(&worker);
-        let registration = next_item(&mut tasks).await;
-        let after_registration = heartbeat_item(&mut heartbeat, Duration::from_secs(5)).await;
-        // Dropping the registered task stream retires the name.
+        let registration_outcome = next_item(&mut tasks).await;
+        let after_registration = match registration {
+            Registration::Succeeds => heartbeat_item(&mut heartbeat, Duration::from_secs(5)).await,
+            Registration::Refused => first_heartbeat_error(&mut heartbeat).await,
+        };
+        // Dropping the registered task stream retires the name; a refused
+        // stream owns nothing and retires nothing, so its renewals keep
+        // reporting the refusal.
         drop(tasks);
-        let after_retirement = heartbeat_item(&mut heartbeat, Duration::from_secs(5)).await;
+        let after_retirement = match registration {
+            Registration::Succeeds => heartbeat_item(&mut heartbeat, Duration::from_secs(5)).await,
+            Registration::Refused => first_heartbeat_error(&mut heartbeat).await,
+        };
+        drop(holder);
+        let registration = registration_outcome;
         Ok::<_, String>(HeartbeatOrderObservation {
             before_registration,
             registration,
@@ -527,6 +623,23 @@ fn waits_for_the_registration()
         } else {
             Err(format!(
                 "expected the heartbeat to wait for the registration, renew after it, and stop after retirement; got {o:?}"
+            ))
+        }
+    })
+}
+
+fn reports_the_refusal()
+-> impl Fn(&Result<Outcome<HeartbeatOrderObservation>, String>) -> AssertionResult {
+    observe::<HeartbeatOrderObservation, _>("heartbeat before a refused registration", |o| {
+        if o.before_registration == "pending"
+            && o.registration == "already_registered"
+            && o.after_registration == "not_registered"
+            && o.after_retirement == "not_registered"
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the heartbeat to wait for the outcome and then report the refused registration on every tick; got {o:?}"
             ))
         }
     })
@@ -640,14 +753,23 @@ lets_expect! { #tokio_test
             let handover = Handover::RunReleased;
             to restarts_immediately { restarts_immediately() }
         }
+        when the_previous_deployment_used_a_shared_storage_and_its_release_handle {
+            let handover = Handover::SharedReleaser;
+            to restarts_immediately { restarts_immediately() }
+        }
         when the_previous_deployment_did_not_release_its_registration {
             let handover = Handover::Kept;
             to is_refused_until_the_registration_is_stale { is_refused_until_stale() }
         }
     }
 
-    expect(heartbeat_before_registration().await) as a_heartbeat_started_before_the_registration {
+    expect(heartbeat_before_registration(registration).await) as a_heartbeat_started_before_the_registration {
+        let registration = Registration::Succeeds;
         to waits_for_the_registration { waits_for_the_registration() }
+        when the_registration_is_refused {
+            let registration = Registration::Refused;
+            to reports_the_refusal_instead_of_waiting_forever { reports_the_refusal() }
+        }
     }
 
     expect(misconfigured_liveness().await) as a_heartbeat_slower_than_the_stale_deadline {

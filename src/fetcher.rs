@@ -371,6 +371,8 @@ pub(crate) struct LeaseStream<S> {
     lease: Arc<crate::lease::WorkerLease>,
     _guard: Option<crate::lease::LeaseGuard>,
     retire_on_drop: bool,
+    /// Whether the first item, the registration outcome, has been seen.
+    registration_settled: bool,
     ended: bool,
 }
 
@@ -385,6 +387,7 @@ impl<S> LeaseStream<S> {
             lease,
             _guard: None,
             retire_on_drop,
+            registration_settled: false,
             ended: false,
         }
     }
@@ -411,15 +414,25 @@ where
         // is cancelled while its claim is queued and may still commit. A
         // stream whose registration fails or that is never registered owns no
         // claim and leaves the name free for its siblings.
-        if this.retire_on_drop
-            && this._guard.is_none()
-            && matches!(&result, Poll::Ready(Some(Ok(_))))
-        {
-            this._guard = Some(this.lease.guard());
-            // The heartbeat stream of this name waits for this moment: a
-            // renewal before the registration would update no row and end
-            // the worker with `WorkerNotRegistered`.
-            this.lease.mark_registered();
+        if this.retire_on_drop && !this.registration_settled {
+            match &result {
+                Poll::Ready(Some(Ok(_))) => {
+                    this.registration_settled = true;
+                    this._guard = Some(this.lease.guard());
+                    // The heartbeat stream of this name waits for this
+                    // moment: a renewal before the registration would update
+                    // no row and end the worker with `WorkerNotRegistered`.
+                    this.lease.settle_registration(true);
+                }
+                Poll::Ready(Some(Err(_))) => {
+                    // A refused or failed registration settles the attempt
+                    // too, so a heartbeat waiting on it reports the refusal
+                    // instead of waiting for a registration that never comes.
+                    this.registration_settled = true;
+                    this.lease.settle_registration(false);
+                }
+                Poll::Ready(None) | Poll::Pending => {}
+            }
         }
         if matches!(
             &result,

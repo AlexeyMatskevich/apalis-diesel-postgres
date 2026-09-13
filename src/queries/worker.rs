@@ -27,7 +27,6 @@ pub(crate) const REENQUEUE_ORPHANED_BATCH_LIMIT: i32 = 1000;
 pub(crate) fn timeout_seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
-
 #[derive(QueryableByName)]
 struct WorkerIdentity {
     #[diesel(sql_type = Text)]
@@ -198,16 +197,15 @@ pub(crate) fn release_worker_blocking(
             ));
         }
         let recovered = recover_owned(tx, queue, vec![worker.to_owned()], Recovery::Release)?;
-        // The epoch is older than any stale deadline, so every sweeper and
-        // successor treats the row as released regardless of its own window,
-        // and dashboards read a zero heartbeat.
+        // The row is locked and known to carry the token. The epoch is older
+        // than any practical stale deadline, so every sweeper and successor
+        // treats the row as released, and dashboards read a zero heartbeat.
         sql_query(
             "UPDATE apalis.workers SET lease_token=NULL, last_seen=to_timestamp(0)
-             WHERE id=$1 AND worker_type=$2 AND lease_token=$3",
+             WHERE id=$1 AND worker_type=$2",
         )
         .bind::<Text, _>(worker)
         .bind::<Text, _>(queue)
-        .bind::<Text, _>(lease_token)
         .execute(tx)
         .map_err(Error::database("releasing worker registration"))?;
         Ok(recovered)
@@ -337,8 +335,11 @@ pub(crate) fn initial_heartbeat(
     storage_name: &'static str,
     lease_token: Arc<str>,
 ) -> impl Future<Output = Result<(), Error>> + Send {
-    with_conn(pool, move |conn| {
-        validate_liveness(&config)?;
+    // A configuration error is a property of the config alone: refuse it
+    // before any connection is checked out, so a saturated pool cannot turn
+    // it into a transient-looking `Error::Pool`.
+    let validation = validate_liveness(&config);
+    let register = with_conn(pool, move |conn| {
         // A failed startup sweep must not publish a new registration first.
         // Keep these transactions separate: registration locks its own worker,
         // whereas the global sweep locks unrelated workers in sorted order.
@@ -352,7 +353,11 @@ pub(crate) fn initial_heartbeat(
             config.reenqueue_orphaned_after(),
         )?;
         Ok(())
-    })
+    });
+    async move {
+        validation?;
+        register.await
+    }
 }
 
 pub(crate) fn keep_alive(
