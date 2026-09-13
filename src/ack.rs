@@ -1944,12 +1944,14 @@ pub struct PgMiddleware {
 impl PgMiddleware {
     /// Create the PostgreSQL backend middleware without a registration token.
     ///
-    /// Claims and acknowledgements are gated by `(lock_by, lock_at,
-    /// attempts)` only, and, like [`lock_task`], this middleware does not
-    /// manage local worker retirement: a dropped or failed acknowledgement
-    /// leaves the worker's heartbeat running. The middleware for a
-    /// storage-registered worker is `Backend::middleware`, which carries that
-    /// registration's token and liveness.
+    /// A fallback claim checks only that the worker is registered for the
+    /// task's queue, and an acknowledgement is gated by `(lock_by, lock_at,
+    /// attempts)` alone; neither is fenced by a registration token. Like
+    /// [`lock_task`], this middleware does not manage local worker
+    /// retirement: a dropped or failed acknowledgement leaves the worker's
+    /// heartbeat running. The middleware for a storage-registered worker is
+    /// `Backend::middleware`, which carries that registration's token and
+    /// liveness.
     #[must_use]
     pub fn new(pool: &PgPool, auto_ack: bool) -> Self {
         Self {

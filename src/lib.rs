@@ -235,7 +235,9 @@ impl<Args> PostgresStorage<Args> {
     pub fn config(&self) -> &Config {
         &self.config
     }
+}
 
+impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// An acknowledger bound to this storage's registration token and local
     /// liveness, for manual acknowledgement of tasks claimed by this
     /// storage's worker streams.
@@ -252,9 +254,7 @@ impl<Args> PostgresStorage<Args> {
             self.leases.clone(),
         )
     }
-}
 
-impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// Change the task codec while retaining pool, config, fetcher, and the
     /// sink's pipeline state (buffered tasks and any in-flight flush — the
     /// buffer holds already-encoded compact tasks, so switching the codec
