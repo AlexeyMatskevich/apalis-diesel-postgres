@@ -33,6 +33,11 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- A token-bound claim by a worker with no registration for the task's queue
+  reported `WorkerNotRegistered` with the hint that its registration had
+  been replaced and that a fresh storage was needed. The hint now names the
+  missing registration; the replaced-registration hint is reserved for a
+  registration another token owns.
 - The down migration of `20260910000000_reconcile_schema_contract` restores the
   previous `jobs_dequeue_idx` predicate and the `apalis.get_jobs` and
   `apalis.notify_new_jobs` definitions the 0.4.1 release installed, instead
