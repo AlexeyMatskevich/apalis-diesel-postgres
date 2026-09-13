@@ -13,7 +13,8 @@ use support::{Outcome, observe};
 #[derive(Clone, Copy)]
 enum Scenario {
     Completes,
-    Panics,
+    PanicsWhilePolling,
+    PanicsWhileBuildingTheFuture,
 }
 
 #[derive(Debug)]
@@ -22,10 +23,11 @@ struct Observation {
     panicked: bool,
 }
 
-/// The database name is the last path segment of the URI handed to the scenario.
+/// The database name is the last path segment of the URI handed to the
+/// scenario, before any query (whose values may themselves contain `/`).
 fn database_name(url: &str) -> String {
-    let path = url.rsplit('/').next().unwrap_or_default();
-    path.split('?').next().unwrap_or_default().to_owned()
+    let path = url.split('?').next().unwrap_or_default();
+    path.rsplit('/').next().unwrap_or_default().to_owned()
 }
 
 async fn database_exists(maintenance_url: String, name: String) -> Result<bool, String> {
@@ -53,12 +55,17 @@ async fn isolated_scenario(scenario: Scenario) -> Result<Outcome<Observation>, S
     let created = Arc::new(Mutex::new(None::<String>));
     let record = created.clone();
     let handle = tokio::spawn(async move {
-        support::with_isolated_database(|url| async move {
+        support::with_isolated_database(|url| {
             *record.lock().unwrap() = Some(database_name(&url));
-            if matches!(scenario, Scenario::Panics) {
-                panic!("the scenario panics after creating its database");
+            if matches!(scenario, Scenario::PanicsWhileBuildingTheFuture) {
+                panic!("the scenario panics while building its future");
             }
-            Ok::<(), String>(())
+            async move {
+                if matches!(scenario, Scenario::PanicsWhilePolling) {
+                    panic!("the scenario panics while its future runs");
+                }
+                Ok::<(), String>(())
+            }
         })
         .await
     });
@@ -99,8 +106,12 @@ lets_expect! { #tokio_test
     expect(isolated_scenario(scenario).await) as an_isolated_database_scenario {
         let scenario = Scenario::Completes;
         to removes_its_database { removed_its_database(false) }
-        when the_scenario_panics {
-            let scenario = Scenario::Panics;
+        when the_scenario_panics_while_its_future_runs {
+            let scenario = Scenario::PanicsWhilePolling;
+            to removes_its_database_and_propagates_the_panic { removed_its_database(true) }
+        }
+        when the_scenario_panics_while_building_its_future {
+            let scenario = Scenario::PanicsWhileBuildingTheFuture;
             to removes_its_database_and_propagates_the_panic { removed_its_database(true) }
         }
     }

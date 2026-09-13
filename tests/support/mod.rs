@@ -220,11 +220,14 @@ where
     .map_err(|e| e.to_string())
     .and_then(std::convert::identity);
     // A panicking scenario must not leak its database: catch the unwind,
-    // remove the database, then resume the panic.
+    // whether it happens while the scenario builds its future or while that
+    // future runs, remove the database, then resume the panic.
     let outcome = match validated {
         Ok(()) => {
             use futures::FutureExt as _;
-            std::panic::AssertUnwindSafe(work(url)).catch_unwind().await
+            std::panic::AssertUnwindSafe(async move { work(url).await })
+                .catch_unwind()
+                .await
         }
         Err(error) => Ok(Err(error)),
     };
