@@ -32,6 +32,26 @@ use crate::{CompactType, Config, Error, PgContext, PgPool, PgTask, PgTaskId, que
 #[derive(Debug, Clone, Default)]
 pub struct PgNotify;
 
+/// A failed release of an undecodable claim is retried with the delay doubling
+/// from [`RELEASE_RETRY_BASE_DELAY`] until either [`RELEASE_RETRY_LIMIT`]
+/// retries have failed or [`RELEASE_RETRY_BUDGET`] has elapsed since the
+/// first failure, whichever comes first; then the worker's local lease is
+/// retired. The budget bounds the window when each attempt is itself slow,
+/// such as a pool checkout that times out.
+const RELEASE_RETRY_LIMIT: u32 = 5;
+const RELEASE_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const RELEASE_RETRY_BUDGET: Duration = Duration::from_secs(3);
+
+fn release_retry_delay(failures: u32) -> Duration {
+    RELEASE_RETRY_BASE_DELAY * 2u32.saturating_pow(failures.saturating_sub(1))
+}
+
+/// Whether a release that has failed `failures` times, the first failure
+/// `since_first_failure` ago, has exhausted its retries.
+fn release_exhausted(failures: u32, since_first_failure: Duration) -> bool {
+    failures > RELEASE_RETRY_LIMIT || since_first_failure >= RELEASE_RETRY_BUDGET
+}
+
 /// Gate `body` behind `register`: emit the registration outcome as the first
 /// stream item (preserving the wire contract that consumers observe it), and
 /// only proceed to drain `body` when registration succeeded. On failure the
@@ -73,14 +93,21 @@ where
 /// the row would stay `Running` for as long as this worker keeps heartbeating
 /// — unackable (ack needs a decoded task) and invisible to orphan recovery
 /// (which only reclaims rows of stale workers).
-/// A failed release remains owned by this stream. Database errors are yielded
-/// with bounded retry pacing; only a successful or stale release discharges the
-/// obligation and emits the original codec error before continuing the batch.
+/// A failed release remains owned by this stream: it is retried with bounded
+/// backoff while the consumer keeps polling, and a successful release
+/// discharges the obligation and emits the original codec error before
+/// continuing the batch. A stale release, one that matched no row, proves the
+/// registration lost the claim to a sweep or a takeover; it emits the codec
+/// error and retires the worker's local lease instead of delivering siblings
+/// that may already run elsewhere. A release that keeps failing retires the
+/// lease and yields the database error, so the row and its buffered siblings
+/// become recoverable as orphans once the heartbeat stops.
 pub(crate) fn decode_task_stream<Args, Decode>(
     compact: TaskStream<PgTask<CompactType>, Error>,
     pool: PgPool,
     worker_id: Arc<str>,
     lease_token: Option<Arc<str>>,
+    lease: Arc<crate::lease::WorkerLease>,
 ) -> TaskStream<PgTask<Args>, Error>
 where
     Args: Send + 'static,
@@ -92,7 +119,8 @@ where
         lock_at: i64,
         attempts: i32,
         decode_error: Error,
-        retry: bool,
+        failures: u32,
+        first_failure: Option<std::time::Instant>,
     }
 
     stream::unfold(
@@ -101,11 +129,12 @@ where
             let pool = pool.clone();
             let worker_id = worker_id.clone();
             let lease_token = lease_token.clone();
+            let lease = lease.clone();
             async move {
                 loop {
                     if let Some(mut obligation) = release.take() {
-                        if obligation.retry {
-                            Delay::new(Duration::from_millis(100)).await;
+                        if obligation.failures > 0 {
+                            Delay::new(release_retry_delay(obligation.failures)).await;
                         }
                         match queries::fail_undecodable_task(
                             pool.clone(),
@@ -114,14 +143,36 @@ where
                             obligation.lock_at,
                             obligation.attempts,
                             obligation.decode_error.to_string(),
-                            lease_token,
+                            lease_token.clone(),
                         )
                         .await
                         {
-                            Ok(_) => return Some((Err(obligation.decode_error), (compact, None))),
+                            Ok(released) => {
+                                if released == 0 {
+                                    // The row no longer carries this claim: it
+                                    // was swept or re-claimed, so this
+                                    // registration lost ownership and its
+                                    // buffered siblings may already run
+                                    // elsewhere. Stop delivering them.
+                                    lease.retire();
+                                }
+                                return Some((Err(obligation.decode_error), (compact, None)));
+                            }
                             Err(error) => {
-                                obligation.retry = true;
-                                return Some((Err(error), (compact, Some(obligation))));
+                                obligation.failures += 1;
+                                let first_failure = *obligation
+                                    .first_failure
+                                    .get_or_insert_with(std::time::Instant::now);
+                                if release_exhausted(obligation.failures, first_failure.elapsed()) {
+                                    // The row cannot be released and must not stay
+                                    // hidden behind a live heartbeat. Retiring stops
+                                    // this worker's claims and heartbeats so orphan
+                                    // recovery reclaims the row and its siblings.
+                                    lease.retire();
+                                    return Some((Err(error), (compact, None)));
+                                }
+                                release = Some(obligation);
+                                continue;
                             }
                         }
                     }
@@ -144,7 +195,8 @@ where
                                             lock_at,
                                             attempts,
                                             decode_error,
-                                            retry: false,
+                                            failures: 0,
+                                            first_failure: None,
                                         });
                                     }
                                     _ => return Some((Err(decode_error), (compact, None))),
@@ -1064,6 +1116,27 @@ mod tests {
                         to leaves_both_workers_active { equal((true, true)) }
                     }
                 }
+            }
+        }
+        expect(release_exhausted(failures, since_first_failure)) as a_failed_release_of_an_undecodable_claim {
+            let failures = 1;
+            let since_first_failure = Duration::ZERO;
+            to is_retried { be_false }
+            when the_last_permitted_retry_has_failed {
+                let failures = RELEASE_RETRY_LIMIT;
+                to is_retried { be_false }
+            }
+            when one_more_retry_than_permitted_has_failed {
+                let failures = RELEASE_RETRY_LIMIT + 1;
+                to gives_up { be_true }
+            }
+            when the_budget_has_elapsed_since_the_first_failure {
+                let since_first_failure = RELEASE_RETRY_BUDGET;
+                to gives_up { be_true }
+            }
+            when the_budget_is_almost_spent {
+                let since_first_failure = RELEASE_RETRY_BUDGET - Duration::from_millis(1);
+                to is_retried { be_false }
             }
         }
         expect(retired_stream_ends_without_polling_inner()) as an_already_retired_worker_stream {

@@ -9,6 +9,12 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Added
 
+- `PostgresStorage::acknowledger()` returns a `PgAck` bound to the storage's
+  registration token and local liveness, so a manual acknowledgement that
+  fails retires the worker's registration like the automatic middleware
+  does. The public `PgMiddleware` and `PgAck` constructors bind at most a
+  token; their documentation now states that they do not manage local
+  retirement.
 - `Error::AlreadyAcknowledged` reports an in-process re-dispatch of a claim
   whose acknowledgement already committed. `PgMiddleware` returns it inside an
   `AbortError` before the handler runs again, and `PgAck` returns it for a
@@ -27,6 +33,41 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- A token-bound claim by a worker with no registration for the task's queue
+  reported `WorkerNotRegistered` with the hint that its registration had
+  been replaced and that a fresh storage was needed. The hint now names the
+  missing registration; the replaced-registration hint is reserved for a
+  registration another token owns.
+- The down migration of `20260910000000_reconcile_schema_contract` restores the
+  previous `jobs_dequeue_idx` predicate and the `apalis.get_jobs` and
+  `apalis.notify_new_jobs` definitions the 0.4.1 release installed, instead
+  of leaving the narrowed index and the newer function bodies behind, so
+  reverting the series returns a database installed by 0.4.1 to exactly its
+  own schema.
+- The down migration of `20260912000001_require_active_owner` drops the
+  constraint with `IF EXISTS`, matching the other down migrations.
+- The buffered enqueue sink failed permanently (`SinkFailed`) after any flush
+  error, including a task rejected by a size cap or an unrepresentable
+  `run_at` before any statement was issued, and a pool checkout failure; the
+  valid tasks buffered alongside were discarded. Size caps are now checked in
+  `start_send`, so a rejected task never enters the buffer and its neighbours
+  stay buffered; a flush that could not obtain a connection returns the pool
+  error once and keeps its batch for the next flush. Only a flush whose
+  statement was issued fails the pipeline, because only then is the outcome
+  uncertain.
+- Releasing an undecodable claim (`Failed` with the codec error, or `Killed`)
+  yielded the database error to the consumer on every failed attempt and
+  retried without limit. Under Apalis the first error ended the worker and the
+  retained obligation with it; a consumer that continued polling looped
+  forever while the buffered siblings of that batch were never delivered and
+  stayed hidden behind a live heartbeat. The release is now retried with
+  doubling backoff while the consumer polls, for at most five retries or
+  three seconds since the first failure, and a release that keeps failing
+  retires the worker's local registration and yields the error, so the row
+  and its siblings are recovered as orphans. A release that matches no row
+  proves the registration lost the claim to a sweep or a takeover and
+  retires the worker instead of delivering siblings that may already run
+  elsewhere.
 - A retry layer composed outside the backend middleware, such as apalis's
   `.retry(RetryPolicy::retries(n))`, re-dispatched a task whose claim was
   already acknowledged. The handler ran again, the second acknowledgement was

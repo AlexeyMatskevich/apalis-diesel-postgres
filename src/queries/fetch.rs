@@ -167,24 +167,16 @@ pub(crate) fn fail_undecodable_task(
     with_conn(pool, move |conn| {
         conn.transaction(|conn| {
             if let Some(token) = lease_token.as_deref() {
-                #[derive(diesel::QueryableByName)]
-                struct Queue {
-                    #[diesel(sql_type=Text)]
-                    job_type: String,
-                }
-                let queue = sql_query("SELECT job_type FROM apalis.jobs WHERE id=$1")
-                    .bind::<Text, _>(task_id.to_string())
-                    .load::<Queue>(conn)
-                    .map_err(Error::database("locating undecodable task"))?;
-                let Some(queue) = queue.first() else {
+                let Some(queue) = task_queue(
+                    conn,
+                    &task_id.to_string(),
+                    None,
+                    "locating undecodable task",
+                )?
+                else {
                     return Ok(0);
                 };
-                if !super::worker::lock_current_worker(
-                    conn,
-                    &worker_id,
-                    &queue.job_type,
-                    Some(token),
-                )? {
+                if !super::worker::lock_current_worker(conn, &worker_id, &queue, Some(token))? {
                     return Ok(0);
                 }
             }
@@ -244,16 +236,10 @@ pub(crate) fn lock_task_with_token(
         |_| true,
         move |conn| {
             let task_id = task_id.to_string();
-            #[derive(diesel::QueryableByName)]
-            struct Queue {
-                #[diesel(sql_type=Text)]
-                job_type: String,
-            }
-            let scoped=sql_query("SELECT job_type FROM apalis.jobs WHERE id=$1 AND ($2::text IS NULL OR job_type=$2)")
-            .bind::<Text,_>(&task_id).bind::<Nullable<Text>,_>(queue.as_deref()).load::<Queue>(conn)
-            .map_err(Error::database("locating task to lock"))?;
-            if let Some(scoped) = scoped.first() {
-                require_worker(conn, &worker_id, &scoped.job_type, lease_token.as_deref())?;
+            if let Some(scoped) =
+                task_queue(conn, &task_id, queue.as_deref(), "locating task to lock")?
+            {
+                require_worker(conn, &worker_id, &scoped, lease_token.as_deref())?;
             }
 
             let mut rows: Vec<crate::models::JobRow> = sql_query(
@@ -354,23 +340,56 @@ fn claim_outcome<T>(
     }
 }
 
+/// The queue a task belongs to, when the task exists and, if `scope` is
+/// given, belongs to that queue. The worker row for that queue is locked
+/// afterwards, so this lookup precedes any worker lock; a single statement
+/// cannot lock the worker row while still telling an absent task from an
+/// absent registration.
+fn task_queue(
+    conn: &mut diesel::PgConnection,
+    task_id: &str,
+    scope: Option<&str>,
+    operation: &'static str,
+) -> Result<Option<String>, Error> {
+    #[derive(diesel::QueryableByName)]
+    struct TaskQueue {
+        #[diesel(sql_type = Text)]
+        job_type: String,
+    }
+    let rows = sql_query(
+        "SELECT job_type FROM apalis.jobs WHERE id=$1 AND ($2::text IS NULL OR job_type=$2)",
+    )
+    .bind::<Text, _>(task_id)
+    .bind::<Nullable<Text>, _>(scope)
+    .load::<TaskQueue>(conn)
+    .map_err(Error::database(operation))?;
+    Ok(rows.into_iter().next().map(|row| row.job_type))
+}
+
 fn require_worker(
     conn: &mut diesel::PgConnection,
     worker: &str,
     queue: &str,
     token: Option<&str>,
 ) -> Result<(), Error> {
+    use super::worker::Registration;
     // None is the explicitly trusted low-level fetcher compatibility surface.
-    let current = super::worker::lock_current_worker(conn, worker, queue, token)?;
-    if token.is_some() && !current {
-        return Err(Error::worker_not_registered(
-            "claiming task",
-            worker,
-            queue.to_owned(),
-            "the worker registration was replaced; create a fresh storage",
-        ));
-    }
-    Ok(())
+    let registration = super::worker::worker_registration(conn, worker, queue, token)?;
+    let hint = match (token, registration) {
+        (None, _) | (Some(_), Registration::Current) => return Ok(()),
+        (Some(_), Registration::Absent) => {
+            "the worker is not registered for this queue; register it before claiming"
+        }
+        (Some(_), Registration::Replaced) => {
+            "the worker registration was replaced; create a fresh storage"
+        }
+    };
+    Err(Error::worker_not_registered(
+        "claiming task",
+        worker,
+        queue.to_owned(),
+        hint,
+    ))
 }
 
 fn claimed_tasks(

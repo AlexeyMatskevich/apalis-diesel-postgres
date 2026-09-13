@@ -375,7 +375,9 @@ fn build(pool: PgPool) {
     let _polling = PostgresStorage::<EmailJob>::new_with_config(&pool, &config);
 
     // Polling + LISTEN/NOTIFY wakeups (lower latency, dedicated connection).
-    let _notify = PostgresStorage::<EmailJob>::new_with_notify(&pool, &config);
+    // A `Config` carries a single-use polling strategy, so each worker's
+    // storage gets its own `Config` (or a poll strategy factory, see below).
+    let _notify = PostgresStorage::<EmailJob>::new_with_notify(&pool, &Config::new("emails"));
 
     // One listener shared across many queues, registered via apalis `MakeShared`.
     let _shared: SharedPostgresStorage = SharedPostgresStorage::new(&pool);
@@ -412,6 +414,10 @@ branch. It cannot authorize further polling. A finite custom strategy must
 explicitly define how polling continues; creating fresh configuration or using
 the factory is the upgrade path for previously shared one-shot strategies.
 
+A claimed row whose payload fails to decode is released through the retry
+budget before the batch continues; a release that keeps failing after a few
+seconds of retries retires the worker registration so orphan recovery can
+reclaim the row and the rest of that batch.
 Each claim is acknowledged at most once. An in-process re-dispatch of an
 already acknowledged claim, for example by a retry layer placed outside the
 backend middleware, is refused with `AlreadyAcknowledged` before the handler
@@ -438,6 +444,12 @@ within `reenqueue_orphaned_after`, or their `Running` and `Queued` tasks are
 recovered as orphans. While that registration is fresh, a worker stream
 registering the same name receives `AlreadyRegistered`; once it is stale, the
 stream takes the name over and recovers its claims first.
+The middleware returned by `Backend::middleware()` and the acknowledger from
+`PostgresStorage::acknowledger()` carry that storage's registration token and
+local liveness. `PgMiddleware::new`, `PgMiddleware::with_lease_token`,
+`PgAck::new` and `PgAck::with_lease_token` bind at most a token: like
+`lock_task`, they do not manage local retirement, so a dropped or failed
+acknowledgement through them leaves the worker's heartbeat running.
 Dropping a polling stream after it has yielded its registration also retires
 that registration. A stream whose registration failed, for example with
 `AlreadyRegistered` or a pool error, owns no claim; dropping it leaves the
@@ -483,13 +495,21 @@ successful `flush` or `close` confirms that all accepted tasks have been written
 including tasks buffered while an earlier batch was still in flight. Dropping a
 temporary flush waiter leaves that work in the sink; another flush can finish it.
 
-A failed batch returns its original error once. That sink then returns
-`Error::SinkFailed` from readiness, flush and close. Changing its codec preserves
-the failed state; cloning storage creates a fresh, empty sink. Keep submitted task
-IDs and idempotency keys so that an uncertain database outcome can be reconciled
-before resubmitting through a fresh sink. The backend does not automatically replay
-a failed batch. `SinkBufferFull` before a task is accepted is a recoverable
-capacity error and does not fail the pipeline.
+A task that exceeds a size cap (payload, metadata, idempotency key, queue
+name) or carries an unrepresentable `run_at` is refused by `start_send` with
+`InvalidArgument` and never enters the buffer; tasks accepted before it stay
+buffered. A flush that could not obtain a pooled connection returns the pool
+error once and keeps its batch buffered ahead of later tasks for the next
+flush.
+
+A batch whose statement was issued and failed returns its original error once.
+That sink then returns `Error::SinkFailed` from readiness, flush and close:
+the batch may have been written. Changing its codec preserves the failed
+state; cloning storage creates a fresh, empty sink. Keep submitted task IDs
+and idempotency keys so that an uncertain database outcome can be reconciled
+before resubmitting through a fresh sink. The backend does not automatically
+replay a failed batch. `SinkBufferFull` before a task is accepted is a
+recoverable capacity error and does not fail the pipeline.
 
 ## Operational boundaries
 
@@ -559,10 +579,16 @@ worker logs point at the failed lifecycle step:
   instead of a generic update-count mismatch.
 - Codec failures: `failed to decode task payload or result with the
   configured codec` — payload was written with a different codec or is
-  corrupt.
+  corrupt. A claimed row whose payload fails to decode is released through
+  its retry budget (`Failed`, then `Killed`) before the batch continues.
+- Structurally corrupt rows: a claimed row whose `id` is not a ULID cannot be
+  repaired by retrying, so the claim marks it `Killed` with the conversion
+  error in `last_result`, releases it, and delivers the rest of the batch.
 - Notification listener failures surface as stream errors. Polling still
   fetches jobs; `LISTEN`/`NOTIFY` wakeups stop until the notify stream is
-  recreated.
+  recreated. Apalis `Worker::run` treats a stream error as fatal, and one
+  shared listener serves every worker built from a `SharedPostgresStorage`,
+  so a single listener failure ends all of those workers.
 - Idempotency conflicts: `Error::IdempotencyConflict { job_type,
   conflicting_keys, total }` when an enqueue collides with the
   `(job_type, idempotency_key)` unique constraint. `conflicting_keys` names the

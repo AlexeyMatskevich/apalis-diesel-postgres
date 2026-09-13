@@ -11,6 +11,13 @@ use ulid::Ulid;
 pub(crate) fn mint_lease_token() -> String {
     Ulid::new().to_string()
 }
+/// Per-statement cap on the periodic orphan-recovery sweep. Without a bound,
+/// a mass worker death would rewrite every orphaned row in one statement
+/// while holding their locks; the sweep repeats every `keep_alive` interval,
+/// so a larger backlog drains across sweeps. Registration takeover is
+/// deliberately unbounded: it must recover every claim of the identity it
+/// replaces before the new token renews the heartbeat, or those rows would
+/// stay hidden behind a live registration.
 pub(crate) const REENQUEUE_ORPHANED_BATCH_LIMIT: i32 = 1000;
 
 // Compare elapsed seconds as a numeric value instead of constructing an interval:
@@ -37,19 +44,57 @@ struct RegistrationDecision {
     lost: bool,
 }
 
+/// What the worker row says about a name for a queue, judged against the
+/// caller's lease token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// No registration exists for this name and queue.
+    Absent,
+    /// A registration exists, but another token owns it.
+    Replaced,
+    /// The caller's token owns the registration, or the caller presented none.
+    Current,
+}
+
 /// All native ownership operations take the worker row before any job row.
 /// Takeover/recovery explicitly use FOR UPDATE, so KEY SHARE fences identity
 /// changes while allowing the independent last_seen heartbeat UPDATE to proceed.
+pub(crate) fn worker_registration(
+    conn: &mut PgConnection,
+    worker: &str,
+    queue: &str,
+    token: Option<&str>,
+) -> Result<Registration, Error> {
+    #[derive(QueryableByName)]
+    struct Held {
+        #[diesel(sql_type = Bool)]
+        current: bool,
+    }
+    let rows = sql_query(
+        "SELECT ($3::text IS NULL OR lease_token IS NOT DISTINCT FROM $3) AS current
+        FROM apalis.workers WHERE id=$1 AND worker_type=$2 FOR KEY SHARE",
+    )
+    .bind::<Text, _>(worker)
+    .bind::<Text, _>(queue)
+    .bind::<Nullable<Text>, _>(token)
+    .load::<Held>(conn)
+    .map_err(Error::database("checking worker registration"))?;
+    Ok(match rows.first() {
+        None => Registration::Absent,
+        Some(held) if held.current => Registration::Current,
+        Some(_) => Registration::Replaced,
+    })
+}
+
+/// Whether the caller's token currently owns the registration; see
+/// [`worker_registration`] for the distinction between absent and replaced.
 pub(crate) fn lock_current_worker(
     conn: &mut PgConnection,
     worker: &str,
     queue: &str,
     token: Option<&str>,
 ) -> Result<bool, Error> {
-    let rows = sql_query("SELECT id FROM apalis.workers WHERE id=$1 AND worker_type=$2 AND ($3::text IS NULL OR lease_token=$3) FOR KEY SHARE")
-        .bind::<Text,_>(worker).bind::<Text,_>(queue).bind::<Nullable<Text>,_>(token)
-        .load::<WorkerIdentity>(conn).map_err(Error::database("checking worker registration"))?;
-    Ok(!rows.is_empty())
+    Ok(worker_registration(conn, worker, queue, token)? == Registration::Current)
 }
 
 fn recover_owned(

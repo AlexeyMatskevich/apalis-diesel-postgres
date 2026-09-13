@@ -219,9 +219,17 @@ where
     .await
     .map_err(|e| e.to_string())
     .and_then(std::convert::identity);
+    // A panicking scenario must not leak its database: catch the unwind,
+    // whether it happens while the scenario builds its future or while that
+    // future runs, remove the database, then resume the panic.
     let outcome = match validated {
-        Ok(()) => work(url).await,
-        Err(error) => Err(error),
+        Ok(()) => {
+            use futures::FutureExt as _;
+            std::panic::AssertUnwindSafe(async move { work(url).await })
+                .catch_unwind()
+                .await
+        }
+        Err(error) => Ok(Err(error)),
     };
     let cleaned = tokio::task::spawn_blocking(move || {
         let mut conn = PgConnection::establish(&maintenance_url).map_err(|e| e.to_string())?;
@@ -233,6 +241,15 @@ where
     .await
     .map_err(|e| e.to_string())
     .and_then(std::convert::identity);
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            if let Err(cleanup) = cleaned {
+                eprintln!("isolated database cleanup failed after a scenario panic: {cleanup}");
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
     match (outcome, cleaned) {
         (Ok(value), Ok(())) => Ok(Outcome::Completed(value)),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),

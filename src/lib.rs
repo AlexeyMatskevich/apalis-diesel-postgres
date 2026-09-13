@@ -238,6 +238,23 @@ impl<Args> PostgresStorage<Args> {
 }
 
 impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
+    /// An acknowledger bound to this storage's registration token and local
+    /// liveness, for manual acknowledgement of tasks claimed by this
+    /// storage's worker streams.
+    ///
+    /// A failed acknowledgement retires the worker's local registration the
+    /// same way the automatic middleware does, so orphan recovery can reclaim
+    /// the task. [`PgAck::new`] and [`PgAck::with_lease_token`] bind no
+    /// liveness and leave the heartbeat running after a failure.
+    #[must_use]
+    pub fn acknowledger(&self) -> PgAck {
+        PgAck::with_lease_registry(
+            &self.pool,
+            std::sync::Arc::clone(&self.lease_token),
+            self.leases.clone(),
+        )
+    }
+
     /// Change the task codec while retaining pool, config, fetcher, and the
     /// sink's pipeline state (buffered tasks and any in-flight flush — the
     /// buffer holds already-encoded compact tasks, so switching the codec
@@ -514,10 +531,11 @@ where
             self.poll_factory,
         );
         crate::fetcher::decode_task_stream::<Args, Decode>(
-            crate::fetcher::LeaseStream::new(compact, lease, true).boxed(),
+            crate::fetcher::LeaseStream::new(compact, lease.clone(), true).boxed(),
             pool,
             std::sync::Arc::from(worker.name().as_str()),
             Some(lease_token),
+            lease,
         )
     }
 }

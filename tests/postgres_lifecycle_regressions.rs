@@ -740,6 +740,7 @@ mod registered_middleware {
         Current,
         Replaced,
         Retired,
+        Absent,
     }
     #[derive(Clone)]
     struct Handler {
@@ -770,7 +771,12 @@ mod registered_middleware {
         while let Some(error) = current {
             if let Some(error) = error.downcast_ref::<Error>() {
                 return match error {
-                    Error::WorkerNotRegistered { .. } => "replaced",
+                    Error::WorkerNotRegistered { hint, .. }
+                        if hint.starts_with("the worker registration was replaced") =>
+                    {
+                        "replaced"
+                    }
+                    Error::WorkerNotRegistered { .. } => "unregistered",
                     Error::WorkerRetired { .. } => "retired",
                     _ => "other",
                 };
@@ -788,8 +794,12 @@ mod registered_middleware {
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
         let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
         let worker = WorkerContext::new::<()>("fallback-worker");
-        let mut old_stream = Some(storage.clone().poll_compact(&worker));
-        assert!(old_stream.as_mut().unwrap().next().await.unwrap().is_ok());
+        // An absent registration never polls: the name is unknown to the queue.
+        let mut old_stream = (!matches!(registration, Registration::Absent))
+            .then(|| storage.clone().poll_compact(&worker));
+        if let Some(stream) = old_stream.as_mut() {
+            assert!(stream.next().await.unwrap().is_ok());
+        }
         if matches!(registration, Registration::Replaced) {
             let p = pool.clone();
             let q = queue.clone();
@@ -882,6 +892,9 @@ mod registered_middleware {
         when the_registration_has_retired {let registration=Registration::Retired;
           to refuses_the_claim_before_running_the_handler {outcome("retired",0,false,"Pending")}
         }
+        when the_worker_was_never_registered_for_the_queue {let registration=Registration::Absent;
+          to refuses_the_claim_and_names_the_missing_registration {outcome("unregistered",0,false,"Pending")}
+        }
         when acknowledgement_is_manual {let auto_ack=false;
           to passes_the_claim_context_to_the_handler {outcome("success",1,true,"Running")}
           when the_registration_has_been_replaced {let registration=Registration::Replaced;
@@ -889,6 +902,9 @@ mod registered_middleware {
           }
           when the_registration_has_retired {let registration=Registration::Retired;
             to refuses_the_claim_before_running_the_handler {outcome("retired",0,false,"Pending")}
+          }
+          when the_worker_was_never_registered_for_the_queue {let registration=Registration::Absent;
+            to refuses_the_claim_and_names_the_missing_registration {outcome("unregistered",0,false,"Pending")}
           }
         }
       }

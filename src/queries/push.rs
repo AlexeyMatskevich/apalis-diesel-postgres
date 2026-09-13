@@ -7,7 +7,7 @@ use diesel::{
 };
 use ulid::Ulid;
 
-use crate::{CompactType, Config, Error, PgPool, PgTask, queries::with_conn};
+use crate::{CompactType, Config, Error, PgPool, PgTask};
 
 /// Cap on serialized task `metadata` JSON. Matches the `last_result` cap
 /// (`MAX_ERROR_PAYLOAD_LEN` in `src/ack.rs`): unbounded JSONB on `apalis.jobs`
@@ -114,33 +114,100 @@ impl JobBatchBinds {
     }
 }
 
-pub(crate) fn push_tasks(
-    pool: PgPool,
-    config: Config,
-    tasks: Vec<PgTask<CompactType>>,
-) -> impl Future<Output = Result<(), Error>> + Send {
-    with_conn(pool, move |conn| push_tasks_pooled(conn, &config, tasks))
+/// Why a buffered flush did not write its batch, by the phase it reached.
+pub(crate) enum FlushFailure {
+    /// No statement was issued: the batch is handed back for a later flush.
+    NotStarted {
+        /// The batch, unchanged.
+        tasks: Vec<PgTask<CompactType>>,
+        /// The connection or executor failure.
+        error: Error,
+    },
+    /// Validation refused the batch before any statement; nothing was written.
+    Rejected(Error),
+    /// A statement was issued; the batch may or may not have been written.
+    Uncertain(Error),
 }
 
-/// Pool-path batch enqueue — the sink's flush hot path.
+enum FlushPhase {
+    NotStarted(Error),
+    Rejected(Error),
+    Uncertain(Error),
+}
+
+impl FlushFailure {
+    /// The underlying error, for specs that do not act on the phase.
+    #[cfg(all(test, feature = "tokio"))]
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::NotStarted { error, .. } | Self::Rejected(error) | Self::Uncertain(error) => {
+                error
+            }
+        }
+    }
+}
+
+/// Pool-path batch enqueue, the sink's flush, with its failure classified by
+/// phase so the sink fails permanently only after a statement was issued.
 ///
 /// The connection is freshly checked out from the pool and is never inside a
 /// caller transaction, so a batch without idempotency keys runs as one bare,
 /// statement-atomic INSERT with no BEGIN/COMMIT round-trips, `RETURNING`
 /// materialization, or key copies. Keyed batches share the conflict-recovery
 /// transaction with the outbox path.
-fn push_tasks_pooled(
-    conn: &mut PgConnection,
-    config: &Config,
+pub(crate) fn flush_tasks(
+    pool: PgPool,
+    config: Config,
     tasks: Vec<PgTask<CompactType>>,
-) -> Result<(), Error> {
-    let Some(batch) = prepare_batch(config, tasks)? else {
-        return Ok(());
-    };
-    if batch.any_idempotency_key {
-        conn.transaction(|conn| insert_reporting_conflicts(conn, batch))
-    } else {
-        insert_batch(conn, batch)
+) -> impl Future<Output = Result<(), FlushFailure>> + Send {
+    // The batch stays in this slot until the blocking closure runs, so a
+    // closure that never ran hands the batch back untouched.
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(Some(tasks)));
+    let slot = pending.clone();
+    let run = crate::runtime::run_blocking(move || {
+        let mut conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(error) => return Ok(Err(FlushPhase::NotStarted(error.into()))),
+        };
+        let tasks = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("a flush batch is taken exactly once");
+        let batch = match prepare_batch(&config, tasks) {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return Ok(Ok(())),
+            Err(error) => return Ok(Err(FlushPhase::Rejected(error))),
+        };
+        let written = if batch.any_idempotency_key {
+            conn.transaction(|conn| insert_reporting_conflicts(conn, batch))
+        } else {
+            insert_batch(&mut conn, batch)
+        };
+        Ok(written.map_err(FlushPhase::Uncertain))
+    });
+    async move {
+        let take_back = || {
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        };
+        match run.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(FlushPhase::NotStarted(error))) => Err(FlushFailure::NotStarted {
+                tasks: take_back().unwrap_or_default(),
+                error,
+            }),
+            Ok(Err(FlushPhase::Rejected(error))) => Err(FlushFailure::Rejected(error)),
+            Ok(Err(FlushPhase::Uncertain(error))) => Err(FlushFailure::Uncertain(error)),
+            // The executor failed. A batch still in the slot proves the
+            // closure never ran; otherwise its statement may have been issued.
+            Err(error) => match take_back() {
+                Some(tasks) => Err(FlushFailure::NotStarted { tasks, error }),
+                None => Err(FlushFailure::Uncertain(error)),
+            },
+        }
     }
 }
 
@@ -181,6 +248,76 @@ struct PreparedBatch {
     any_idempotency_key: bool,
 }
 
+/// The derived column values of one task that passed every cap.
+struct ValidatedTask {
+    run_at: DateTime,
+    meta_json: String,
+}
+
+/// Check the queue name cap once per batch.
+fn validate_queue(config: &Config) -> Result<String, Error> {
+    let job_type = config.queue().to_string();
+    if job_type.len() > MAX_QUEUE_NAME_LEN {
+        return Err(Error::InvalidArgument(format!(
+            "queue name is {} bytes, exceeds the {MAX_QUEUE_NAME_LEN}-byte cap",
+            job_type.len(),
+        )));
+    }
+    Ok(job_type)
+}
+
+/// Check every per-task cap and derive the column values that need it.
+/// The single place where a task can be rejected before any statement.
+fn validate_columns(task: &PgTask<CompactType>) -> Result<ValidatedTask, Error> {
+    if task.args.len() > MAX_JOB_PAYLOAD_LEN {
+        return Err(Error::InvalidArgument(format!(
+            "task payload is {} bytes, exceeds the {MAX_JOB_PAYLOAD_LEN}-byte cap",
+            task.args.len(),
+        )));
+    }
+    let run_at_secs = i64::try_from(task.parts.run_at).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "run_at {} exceeds i64::MAX seconds and cannot be stored",
+            task.parts.run_at
+        ))
+    })?;
+    let run_at = DateTime::from_timestamp(run_at_secs, 0).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "run_at {} exceeds the supported timestamp range",
+            task.parts.run_at
+        ))
+    })?;
+    // Serialize metadata once into the text representation handed to
+    // Postgres (cast to jsonb in the SELECT below), so the byte-length check
+    // and the bind share one pass.
+    let meta_json = serde_json::to_string(task.parts.ctx.meta())
+        .map_err(|err| Error::InvalidArgument(format!("serializing task metadata: {err}")))?;
+    if meta_json.len() > MAX_METADATA_PAYLOAD_LEN {
+        return Err(Error::InvalidArgument(format!(
+            "task metadata is {} bytes, exceeds the {MAX_METADATA_PAYLOAD_LEN}-byte cap",
+            meta_json.len(),
+        )));
+    }
+    if let Some(key) = task.parts.idempotency_key.as_deref()
+        && key.len() > MAX_IDEMPOTENCY_KEY_LEN
+    {
+        return Err(Error::InvalidArgument(format!(
+            "idempotency_key is {} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_LEN}-byte cap",
+            key.len(),
+        )));
+    }
+    Ok(ValidatedTask { run_at, meta_json })
+}
+
+/// Reject a task that no batch could ever write, before it is buffered.
+///
+/// Every cap that `prepare_batch` enforces is checked here against the same
+/// rules, so a buffered batch can only fail for database reasons.
+pub(crate) fn validate_task(config: &Config, task: &PgTask<CompactType>) -> Result<(), Error> {
+    validate_queue(config)?;
+    validate_columns(task).map(drop)
+}
+
 /// Validate caps and collect the batch into column-major bind arrays.
 /// Returns `None` for an empty batch.
 fn prepare_batch(
@@ -191,13 +328,7 @@ fn prepare_batch(
         return Ok(None);
     }
 
-    let job_type = config.queue().to_string();
-    if job_type.len() > MAX_QUEUE_NAME_LEN {
-        return Err(Error::InvalidArgument(format!(
-            "queue name is {} bytes, exceeds the {MAX_QUEUE_NAME_LEN}-byte cap",
-            job_type.len(),
-        )));
-    }
+    let job_type = validate_queue(config)?;
 
     let mut ids = Vec::with_capacity(tasks.len());
     let mut jobs = Vec::with_capacity(tasks.len());
@@ -208,57 +339,19 @@ fn prepare_batch(
     let mut idempotency_keys = Vec::with_capacity(tasks.len());
 
     for task in tasks {
+        let ValidatedTask { run_at, meta_json } = validate_columns(&task)?;
         ids.push(
             task.parts
                 .task_id
                 .map(|task_id| task_id.to_string())
                 .unwrap_or_else(|| Ulid::new().to_string()),
         );
-        if task.args.len() > MAX_JOB_PAYLOAD_LEN {
-            return Err(Error::InvalidArgument(format!(
-                "task payload is {} bytes, exceeds the {MAX_JOB_PAYLOAD_LEN}-byte cap",
-                task.args.len(),
-            )));
-        }
         jobs.push(task.args);
         max_attempts.push(task.parts.ctx.max_attempts());
-        let run_at_secs = i64::try_from(task.parts.run_at).map_err(|_| {
-            Error::InvalidArgument(format!(
-                "run_at {} exceeds i64::MAX seconds and cannot be stored",
-                task.parts.run_at
-            ))
-        })?;
-        let run_at = DateTime::from_timestamp(run_at_secs, 0).ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "run_at {} exceeds the supported timestamp range",
-                task.parts.run_at
-            ))
-        })?;
         run_ats.push(run_at);
         priorities.push(task.parts.ctx.priority());
-        // Serialize metadata once into the text representation we hand to
-        // Postgres (cast to jsonb in the SELECT below). Previously this
-        // path serialized twice — once for the byte-length check and again
-        // when diesel encoded `Value` as `Jsonb` at bind time.
-        let meta_json = serde_json::to_string(task.parts.ctx.meta())
-            .map_err(|err| Error::InvalidArgument(format!("serializing task metadata: {err}")))?;
-        if meta_json.len() > MAX_METADATA_PAYLOAD_LEN {
-            return Err(Error::InvalidArgument(format!(
-                "task metadata is {} bytes, exceeds the {MAX_METADATA_PAYLOAD_LEN}-byte cap",
-                meta_json.len(),
-            )));
-        }
         metadata.push(meta_json);
-        let idempotency_key = task.parts.idempotency_key;
-        if let Some(key) = idempotency_key.as_deref()
-            && key.len() > MAX_IDEMPOTENCY_KEY_LEN
-        {
-            return Err(Error::InvalidArgument(format!(
-                "idempotency_key is {} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_LEN}-byte cap",
-                key.len(),
-            )));
-        }
-        idempotency_keys.push(idempotency_key);
+        idempotency_keys.push(task.parts.idempotency_key);
     }
 
     let task_count = ids.len();
