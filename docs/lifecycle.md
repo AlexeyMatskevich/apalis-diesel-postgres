@@ -198,9 +198,10 @@ these states; the columns in parentheses are what other actors read.
    clears the token and sets `last_seen` to the epoch, in one transaction
    that waits for claims being committed. A successor registers immediately.
    Call it after `Worker::run` (or `run_until`) returns, on success and on
-   error alike. Apalis drains handlers before a graceful stop, so a graceful
-   release usually recovers nothing; after a fail-stop it hands unfinished
-   claims back at once instead of after the stale deadline.
+   error alike, or wrap the run in `run_released`, which does exactly that
+   and returns both results. Apalis drains handlers before a graceful stop,
+   so a graceful release usually recovers nothing; after a fail-stop it hands
+   unfinished claims back at once instead of after the stale deadline.
 7. **Prune.** `prune_workers` deletes registrations that have been stale for
    the given window and that no task references. A registration named by a
    completed task stays until `purge_terminal_tasks` removes that task.
@@ -313,8 +314,8 @@ runs `VACUUM`.
 
 - Configure `keep_alive` at most one third of `reenqueue_orphaned_after`,
   and choose the deadline as the restart latency you accept after a crash.
-- Release every worker after its run returns, then restart with fresh
-  storage under the same name.
+- Run every worker through `run_released`, or release it after its run
+  returns, then restart with fresh storage under the same name.
 - Bound handler duration with a timeout layer; watch `STALE_RUNNING_JOBS`.
 - Schedule `purge_terminal_tasks`, `prune_workers` and the snapshot refresh
   with windows longer than any result consumer and any deduplication

@@ -15,6 +15,8 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   marked released, so a restart registers the same name immediately instead
   of waiting for `reenqueue_orphaned_after`. A registration the storage does
   not own is reported as `WorkerNotRegistered` and left untouched.
+  `PostgresStorage::run_released` awaits a worker future and then releases
+  on every exit path, returning both results as `ReleasedRun`.
 - Retention for the queue's data: `PostgresStorage::purge_terminal_tasks`
   deletes `Done`, `Killed` and budget-exhausted `Failed` tasks completed
   longer ago than a window, in bounded batches; the apalis `Vacuum` trait is

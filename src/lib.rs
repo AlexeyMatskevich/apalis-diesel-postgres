@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
-use std::{fmt::Debug, marker::PhantomData, time::Duration};
+use std::{fmt::Debug, future::Future, marker::PhantomData, time::Duration};
 
 pub use apalis_codec::json::JsonCodec;
 use apalis_core::{
@@ -101,6 +101,17 @@ const _: fn() = || {
     assert_send_sync::<PostgresStorage<(), JsonCodec<CompactType>, SharedFetcher>>();
     assert_send_sync::<SharedPostgresStorage<()>>();
 };
+
+/// What [`PostgresStorage::run_released`] observed: the worker's own result
+/// and the release that followed it.
+#[derive(Debug)]
+pub struct ReleasedRun<T> {
+    /// The value the worker future resolved to.
+    pub outcome: T,
+    /// The release: the number of tasks handed back, or why nothing was
+    /// released (see [`PostgresStorage::release_worker`]).
+    pub released: Result<usize, Error>,
+}
 
 /// PostgreSQL storage backend implemented with Diesel.
 pub struct PostgresStorage<
@@ -293,6 +304,46 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
             std::sync::Arc::clone(&self.lease_token),
         )
         .await
+    }
+
+    /// Run a worker to completion, then release its registration, whatever
+    /// the run returned.
+    ///
+    /// `run` is typically `Worker::run_until(signal)`. The release follows
+    /// on every exit path, so a redeploy under the same name can register at
+    /// once; see [`Self::release_worker`] for what the release does and
+    /// reports. Both results are returned: a run that failed still needs its
+    /// error handled, and a release that failed leaves the registration to
+    /// the periodic sweep.
+    ///
+    /// ```no_run
+    /// # use apalis::prelude::*;
+    /// # use apalis_diesel_postgres::{PgPool, PostgresStorage, ReleasedRun};
+    /// # async fn handle(job: String) -> Result<(), BoxDynError> { Ok(()) }
+    /// # async fn example(
+    /// #     storage: PostgresStorage<String>,
+    /// #     shutdown: impl std::future::Future<Output = Result<(), WorkerError>> + Send + 'static,
+    /// # ) -> Result<(), BoxDynError> {
+    /// let worker = WorkerBuilder::new("emails-worker")
+    ///     .backend(storage.clone())
+    ///     .build(handle);
+    /// let ReleasedRun { outcome, released } = storage
+    ///     .run_released("emails-worker", worker.run_until(shutdown))
+    ///     .await;
+    /// if let Err(error) = released {
+    ///     eprintln!("registration stays until the stale deadline: {error}");
+    /// }
+    /// outcome?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_released<F>(&self, worker_id: &str, run: F) -> ReleasedRun<F::Output>
+    where
+        F: Future,
+    {
+        let outcome = run.await;
+        let released = self.release_worker(worker_id).await;
+        ReleasedRun { outcome, released }
     }
 
     /// Delete the terminal tasks of this storage's queue (`Done`, `Killed`,
@@ -946,6 +997,48 @@ mod tests {
             Err(AssertionError::new(vec![format!(
                 "unexpected backend trait surfaces: {result:?}"
             )]))
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    mod tokio_tests {
+        use super::*;
+
+        /// Run a worker future that resolves to `outcome` through
+        /// `run_released` against an unreachable pool: the outcome must come
+        /// back untouched, the release must report the pool failure, and the
+        /// name must be retired locally either way.
+        async fn released_run(
+            outcome: Result<(), &'static str>,
+        ) -> (Result<(), &'static str>, &'static str, bool) {
+            let storage = storage_for_config("run-released", 1);
+            let ReleasedRun { outcome, released } = storage
+                .run_released("released-worker", async move { outcome })
+                .await;
+            let released = match released {
+                Ok(_) => "released",
+                Err(Error::Pool(_)) => "pool",
+                Err(_) => "other",
+            };
+            let retired = storage.leases.for_worker("released-worker").is_retired();
+            (outcome, released, retired)
+        }
+
+        lets_expect! { #tokio_test
+            expect(released_run(outcome).await) as a_run_followed_by_a_release {
+                let outcome: Result<(), &'static str> = Ok(());
+                when the_database_cannot_be_reached {
+                    to keeps_the_outcome_reports_the_release_failure_and_retires_the_name {
+                        equal((Ok(()), "pool", true))
+                    }
+                    when the_run_itself_failed {
+                        let outcome: Result<(), &'static str> = Err("worker stopped");
+                        to keeps_the_failed_outcome_reports_the_release_failure_and_retires_the_name {
+                            equal((Err("worker stopped"), "pool", true))
+                        }
+                    }
+                }
+            }
         }
     }
 

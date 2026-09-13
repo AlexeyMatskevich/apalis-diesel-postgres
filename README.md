@@ -212,15 +212,16 @@ default) after its last heartbeat. Release it once the worker has stopped,
 whether `run` returned an error or not: the release hands any unfinished task
 back to the queue at once and lets a restart register the same name
 immediately instead of being refused with `AlreadyRegistered` until the
-deadline passes. Restart with fresh storage; the releasing storage and its
-clones are retired. A worker killed before it could release waits for the
+deadline passes. `run_released` awaits a worker future and then releases;
+`release_worker` is the explicit call. Restart with fresh storage; the
+releasing storage and its clones are retired. A worker killed before it could release waits for the
 deadline by design: `reenqueue_orphaned_after` is the restart latency after
 a crash, so shorten it (with a proportionally shorter `keep_alive`) when a
 fast restart matters more than tolerance for slow heartbeats.
 
 ```rust,no_run
 # use apalis::prelude::*;
-# use apalis_diesel_postgres::{Config, PostgresStorage, build_pool};
+# use apalis_diesel_postgres::{Config, PostgresStorage, ReleasedRun, build_pool};
 # #[derive(Debug, serde::Deserialize, serde::Serialize)]
 # struct SendEmail { to: String }
 # async fn handle_email(job: SendEmail) -> Result<(), BoxDynError> { Ok(()) }
@@ -229,14 +230,18 @@ fast restart matters more than tolerance for slow heartbeats.
 let storage: PostgresStorage<SendEmail> =
     PostgresStorage::new_with_config(&pool, &Config::new("emails"));
 
-let outcome = WorkerBuilder::new("emails-worker")
+let worker = WorkerBuilder::new("emails-worker")
     .backend(storage.clone())
-    .build(handle_email)
-    .run_until(shutdown)
+    .build(handle_email);
+// `run_released` awaits the run and then releases on every exit path; a
+// registration another storage took over reports `WorkerNotRegistered` and
+// is left to its new owner.
+let ReleasedRun { outcome, released } = storage
+    .run_released("emails-worker", worker.run_until(shutdown))
     .await;
-// Release on every exit path; a registration another storage took over
-// reports `WorkerNotRegistered` and is left to its new owner.
-let _ = storage.release_worker("emails-worker").await;
+if let Err(error) = released {
+    eprintln!("registration stays until the stale deadline: {error}");
+}
 outcome?;
 # Ok(())
 # }

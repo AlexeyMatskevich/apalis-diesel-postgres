@@ -22,7 +22,8 @@ use apalis_core::{
     worker::context::WorkerContext,
 };
 use apalis_diesel_postgres::{
-    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, build_pool, setup,
+    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, ReleasedRun, build_pool,
+    setup,
 };
 use diesel::{QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
@@ -264,7 +265,19 @@ async fn run_until_done(
     worker.run_until(signal).await.map_err(|e| e.to_string())
 }
 
-async fn restart_under_the_same_name(release: bool) -> Result<Outcome<RestartObservation>, String> {
+#[derive(Clone, Copy)]
+enum Handover {
+    /// The first deployment released explicitly after its run returned.
+    Released,
+    /// The first deployment ran through `run_released`.
+    RunReleased,
+    /// The first deployment stopped without releasing.
+    Kept,
+}
+
+async fn restart_under_the_same_name(
+    handover: Handover,
+) -> Result<Outcome<RestartObservation>, String> {
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
@@ -276,11 +289,25 @@ async fn restart_under_the_same_name(release: bool) -> Result<Outcome<RestartObs
         let first = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
         let mut producer = first.clone();
         let first_task = push_with_id(&mut producer, "first deploy", None).await?;
-        let first_run = run_until_done(first.clone(), name, first_task, handled.clone()).await;
-        let released = if release {
-            first.release_worker(name).await.map_err(release_error)
-        } else {
-            Ok(0)
+        let (first_run, released) = match handover {
+            Handover::Released => {
+                let run = run_until_done(first.clone(), name, first_task, handled.clone()).await;
+                let released = first.release_worker(name).await.map_err(release_error);
+                (run, released)
+            }
+            Handover::RunReleased => {
+                let ReleasedRun { outcome, released } = first
+                    .run_released(
+                        name,
+                        run_until_done(first.clone(), name, first_task, handled.clone()),
+                    )
+                    .await;
+                (outcome, released.map_err(release_error))
+            }
+            Handover::Kept => (
+                run_until_done(first.clone(), name, first_task, handled.clone()).await,
+                Ok(0),
+            ),
         };
         let second = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
         let second_task = push_with_id(&mut producer, "second deploy", None).await?;
@@ -524,13 +551,17 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(restart_under_the_same_name(release).await) as a_worker_redeployed_under_its_name {
-        let release = true;
+    expect(restart_under_the_same_name(handover).await) as a_worker_redeployed_under_its_name {
+        let handover = Handover::Released;
         when the_previous_deployment_released_its_registration {
             to restarts_immediately { restarts_immediately() }
         }
+        when the_previous_deployment_ran_through_run_released {
+            let handover = Handover::RunReleased;
+            to restarts_immediately { restarts_immediately() }
+        }
         when the_previous_deployment_did_not_release_its_registration {
-            let release = false;
+            let handover = Handover::Kept;
             to is_refused_until_the_registration_is_stale { is_refused_until_stale() }
         }
     }
