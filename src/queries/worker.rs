@@ -222,6 +222,28 @@ pub(crate) fn release_worker(
     })
 }
 
+/// A live registration renews `last_seen` every `keep_alive` and counts as
+/// stale once `reenqueue_orphaned_after` passes without a renewal. Unless the
+/// renewal period is shorter than the stale deadline, every registration is
+/// stale between two heartbeats: its own sweep and its peers recover its
+/// running claims, and its acknowledgements then report stale. Refusing such
+/// a configuration at registration closes that space before any claim.
+pub(crate) fn validate_liveness(config: &Config) -> Result<(), Error> {
+    let keep_alive = *config.keep_alive();
+    let stale_after = config.reenqueue_orphaned_after();
+    if keep_alive.is_zero() {
+        return Err(Error::InvalidArgument(
+            "keep_alive must be greater than zero: a zero interval renews the heartbeat in a busy loop".to_owned(),
+        ));
+    }
+    if keep_alive >= stale_after {
+        return Err(Error::InvalidArgument(format!(
+            "keep_alive ({keep_alive:?}) must be shorter than reenqueue_orphaned_after ({stale_after:?}): a worker would count as stale before its next heartbeat and its own running tasks would be recovered as orphans"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn reenqueue_orphaned_blocking(
     conn: &mut PgConnection,
     config: &Config,
@@ -313,6 +335,7 @@ pub(crate) fn initial_heartbeat(
     lease_token: Arc<str>,
 ) -> impl Future<Output = Result<(), Error>> + Send {
     with_conn(pool, move |conn| {
+        validate_liveness(&config)?;
         // A failed startup sweep must not publish a new registration first.
         // Keep these transactions separate: registration locks its own worker,
         // whereas the global sweep locks unrelated workers in sorted order.
@@ -454,6 +477,61 @@ mod tests {
             when the_update_affected_no_rows {
                 let rows = 0;
                 to reports_the_worker_is_no_longer_registered { be_err_and worker_not_registered }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use lets_expect::{AssertionError, AssertionResult, *};
+
+    fn liveness(keep_alive_ms: u64, stale_after_ms: u64) -> Result<(), Error> {
+        validate_liveness(
+            &Config::new("liveness")
+                .set_keep_alive(Duration::from_millis(keep_alive_ms))
+                .set_reenqueue_orphaned_after(Duration::from_millis(stale_after_ms)),
+        )
+    }
+
+    fn refused_because(needle: &'static str) -> impl Fn(&Error) -> AssertionResult {
+        move |error| match error {
+            Error::InvalidArgument(message) if message.contains(needle) => Ok(()),
+            other => Err(AssertionError::new(vec![format!(
+                "expected InvalidArgument mentioning {needle:?}, got {other:?}"
+            )])),
+        }
+    }
+
+    lets_expect! {
+        expect(liveness(keep_alive_ms, stale_after_ms)) as a_registration_with_a_heartbeat_schedule {
+            let keep_alive_ms = 30_000;
+            let stale_after_ms = 300_000;
+            to is_accepted_when_the_heartbeat_is_faster_than_the_stale_deadline { be_ok }
+            when the_heartbeat_barely_precedes_the_deadline {
+                let stale_after_ms = 30_001;
+                to is_accepted { be_ok }
+            }
+            when the_heartbeat_equals_the_deadline {
+                let stale_after_ms = 30_000;
+                to is_refused_before_any_claim { be_err_and refused_because("shorter than reenqueue_orphaned_after") }
+            }
+            when the_heartbeat_is_slower_than_the_deadline {
+                let stale_after_ms = 1_000;
+                to is_refused_before_any_claim { be_err_and refused_because("shorter than reenqueue_orphaned_after") }
+            }
+            when the_deadline_is_zero {
+                let stale_after_ms = 0;
+                to is_refused_before_any_claim { be_err_and refused_because("shorter than reenqueue_orphaned_after") }
+            }
+            when the_heartbeat_interval_is_zero {
+                let keep_alive_ms = 0;
+                to is_refused_as_a_busy_loop { be_err_and refused_because("greater than zero") }
+                when the_deadline_is_also_zero {
+                    let stale_after_ms = 0;
+                    to is_refused_as_a_busy_loop { be_err_and refused_because("greater than zero") }
+                }
             }
         }
     }

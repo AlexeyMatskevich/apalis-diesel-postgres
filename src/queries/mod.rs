@@ -28,6 +28,7 @@ pub(crate) use push::{
 };
 pub(crate) use worker::{
     initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream, release_worker,
+    validate_liveness,
 };
 
 pub(super) fn with_conn<F, T>(

@@ -388,7 +388,9 @@ mod races {
     async fn immediate_takeover() -> bool {
         let p = pool().await;
         let q = format!("lifecycle_fractional_timeout_{}", ulid::Ulid::new());
-        let c = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_millis(500));
+        let c = Config::new(&q)
+            .set_keep_alive(Duration::from_millis(100))
+            .set_reenqueue_orphaned_after(Duration::from_millis(500));
         let w = WorkerContext::new::<()>("fraction-worker");
         let mut a = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
         assert!(a.next().await.unwrap().is_ok());

@@ -345,6 +345,12 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
         &self,
         worker: &WorkerContext,
     ) -> futures::stream::BoxStream<'static, Result<(), Error>> {
+        // The poll stream refuses the same configuration at registration;
+        // refusing it here as well keeps the first heartbeat tick from
+        // reporting a misleading `WorkerNotRegistered` before that happens.
+        if let Err(error) = queries::validate_liveness(&self.config) {
+            return futures::stream::once(futures::future::ready(Err(error))).boxed();
+        }
         let keep_alive = queries::keep_alive_stream(
             self.pool.clone(),
             self.config.clone(),

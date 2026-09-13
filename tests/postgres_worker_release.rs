@@ -1,5 +1,6 @@
 //! The end of a worker's life through the public API: releasing a
-//! registration after the worker stops and restarting the same name at once.
+//! registration after the worker stops, restarting the same name at once, and
+//! refusing a heartbeat schedule that cannot keep a registration fresh.
 
 #![cfg(feature = "tokio")]
 
@@ -15,7 +16,7 @@ use std::{
 
 use apalis::prelude::*;
 use apalis_core::{
-    backend::{BackendExt, FetchById, TaskSink},
+    backend::{Backend, BackendExt, FetchById, TaskSink},
     task::status::Status,
     worker::context::WorkerContext,
 };
@@ -63,6 +64,7 @@ fn item(next: Option<Result<Option<PgTask<CompactType>>, Error>>) -> &'static st
         Some(Ok(Some(_))) => "task",
         Some(Err(Error::AlreadyRegistered { .. })) => "already_registered",
         Some(Err(Error::WorkerRetired { .. })) => "retired",
+        Some(Err(Error::InvalidArgument(_))) => "invalid_argument",
         Some(Err(_)) => "other_error",
         None => "ended",
     }
@@ -345,6 +347,83 @@ fn is_refused_until_stale()
     })
 }
 
+// --------------------------------------------------------------------------
+// A heartbeat schedule that cannot keep the registration fresh
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct LivenessObservation {
+    poll: &'static str,
+    heartbeat: &'static str,
+    registered_rows: i64,
+}
+
+#[derive(QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+async fn misconfigured_liveness() -> Result<Outcome<LivenessObservation>, String> {
+    let Some(pool) = pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("worker-release-liveness-{}", ulid::Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+    let observation = async {
+        let config = Config::new(&queue)
+            .set_keep_alive(Duration::from_secs(2))
+            .set_reenqueue_orphaned_after(Duration::from_secs(1));
+        let worker = WorkerContext::new::<()>("misconfigured-worker");
+        let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+        let mut poll = storage.clone().poll_compact(&worker);
+        let poll = next_item(&mut poll).await;
+        let mut heartbeat = storage.heartbeat(&worker);
+        let heartbeat = match tokio::time::timeout(Duration::from_secs(5), heartbeat.next())
+            .await
+            .expect("a heartbeat item within five seconds")
+        {
+            Some(Err(Error::InvalidArgument(_))) => "invalid_argument",
+            Some(Err(_)) => "other_error",
+            Some(Ok(())) => "beat",
+            None => "ended",
+        };
+        let count_queue = queue.clone();
+        let registered_rows = support::with_conn(pool.clone(), move |conn| {
+            sql_query("SELECT count(*)::bigint AS n FROM apalis.workers WHERE worker_type = $1")
+                .bind::<Text, _>(&count_queue)
+                .get_result::<Count>(conn)
+                .map(|row| row.n)
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+        Ok::<_, String>(LivenessObservation {
+            poll,
+            heartbeat,
+            registered_rows,
+        })
+    }
+    .await;
+    cleanup(pool, queue).await?;
+    observation.map(Outcome::Completed)
+}
+
+fn is_refused_before_registering()
+-> impl Fn(&Result<Outcome<LivenessObservation>, String>) -> AssertionResult {
+    observe::<LivenessObservation, _>("misconfigured liveness", |o| {
+        if o.poll == "invalid_argument"
+            && o.heartbeat == "invalid_argument"
+            && o.registered_rows == 0
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected both streams to refuse the schedule before any registration; got {o:?}"
+            ))
+        }
+    })
+}
+
 lets_expect! { #tokio_test
     expect(release_with_unfinished_claim().await) as a_released_registration {
         when the_worker_stopped_with_an_unfinished_claim {
@@ -361,5 +440,9 @@ lets_expect! { #tokio_test
             let release = false;
             to is_refused_until_the_registration_is_stale { is_refused_until_stale() }
         }
+    }
+
+    expect(misconfigured_liveness().await) as a_heartbeat_slower_than_the_stale_deadline {
+        to is_refused_before_registering { is_refused_before_registering() }
     }
 }

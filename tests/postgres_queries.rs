@@ -1947,7 +1947,9 @@ async fn run_orphan_reenqueue(queued: bool, terminal: bool) -> Result<Outcome<Or
     let queue = format!("apalis-query-orphan-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    let config = Config::new(&queue).set_reenqueue_orphaned_after(Duration::from_secs(1));
+    let config = Config::new(&queue)
+        .set_keep_alive(Duration::from_millis(100))
+        .set_reenqueue_orphaned_after(Duration::from_secs(1));
     let stale_worker = format!("query-orphan-stale-worker-{queue}");
     let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
     storage

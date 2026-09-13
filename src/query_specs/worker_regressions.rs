@@ -48,7 +48,9 @@ async fn pool(url: String) -> Result<PgPool, String> {
 }
 
 fn config() -> Config {
-    Config::new("fence-queue").set_reenqueue_orphaned_after(Duration::from_secs(30))
+    Config::new("fence-queue")
+        .set_keep_alive(Duration::from_secs(5))
+        .set_reenqueue_orphaned_after(Duration::from_secs(30))
 }
 
 fn worker_context() -> WorkerContext {
