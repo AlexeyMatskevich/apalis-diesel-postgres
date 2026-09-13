@@ -21,7 +21,11 @@ pub(crate) use admin::{
 };
 pub(crate) use fetch::{fail_undecodable_task, fetch_next, lock_task};
 pub(crate) use notify::{NOTIFY_LISTENER_POLL_INTERVAL, clamp_notify_capacity, notify_task_ids};
-pub(crate) use push::{push_tasks, push_tasks_on_conn};
+pub(crate) use push::{FlushFailure, flush_tasks, push_tasks_on_conn, validate_task};
+#[cfg(test)]
+pub(crate) use push::{
+    MAX_IDEMPOTENCY_KEY_LEN, MAX_JOB_PAYLOAD_LEN, MAX_METADATA_PAYLOAD_LEN, MAX_QUEUE_NAME_LEN,
+};
 pub(crate) use worker::{initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream};
 
 pub(super) fn with_conn<F, T>(

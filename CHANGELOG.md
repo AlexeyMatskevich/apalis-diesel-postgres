@@ -27,6 +27,15 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- The buffered enqueue sink failed permanently (`SinkFailed`) after any flush
+  error, including a task rejected by a size cap or an unrepresentable
+  `run_at` before any statement was issued, and a pool checkout failure; the
+  valid tasks buffered alongside were discarded. Size caps are now checked in
+  `start_send`, so a rejected task never enters the buffer and its neighbours
+  stay buffered; a flush that could not obtain a connection returns the pool
+  error once and keeps its batch for the next flush. Only a flush whose
+  statement was issued fails the pipeline, because only then is the outcome
+  uncertain.
 - Releasing an undecodable claim (`Failed` with the codec error, or `Killed`)
   yielded the database error to the consumer on every failed attempt and
   retried without limit. Under Apalis the first error ended the worker and the

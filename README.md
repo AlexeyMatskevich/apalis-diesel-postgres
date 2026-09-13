@@ -487,13 +487,21 @@ successful `flush` or `close` confirms that all accepted tasks have been written
 including tasks buffered while an earlier batch was still in flight. Dropping a
 temporary flush waiter leaves that work in the sink; another flush can finish it.
 
-A failed batch returns its original error once. That sink then returns
-`Error::SinkFailed` from readiness, flush and close. Changing its codec preserves
-the failed state; cloning storage creates a fresh, empty sink. Keep submitted task
-IDs and idempotency keys so that an uncertain database outcome can be reconciled
-before resubmitting through a fresh sink. The backend does not automatically replay
-a failed batch. `SinkBufferFull` before a task is accepted is a recoverable
-capacity error and does not fail the pipeline.
+A task that exceeds a size cap (payload, metadata, idempotency key, queue
+name) or carries an unrepresentable `run_at` is refused by `start_send` with
+`InvalidArgument` and never enters the buffer; tasks accepted before it stay
+buffered. A flush that could not obtain a pooled connection returns the pool
+error once and keeps its batch buffered ahead of later tasks for the next
+flush.
+
+A batch whose statement was issued and failed returns its original error once.
+That sink then returns `Error::SinkFailed` from readiness, flush and close:
+the batch may have been written. Changing its codec preserves the failed
+state; cloning storage creates a fresh, empty sink. Keep submitted task IDs
+and idempotency keys so that an uncertain database outcome can be reconciled
+before resubmitting through a fresh sink. The backend does not automatically
+replay a failed batch. `SinkBufferFull` before a task is accepted is a
+recoverable capacity error and does not fail the pipeline.
 
 ## Operational boundaries
 
