@@ -88,9 +88,9 @@ where
 /// and notify backends so the decode logic exists in exactly one place.
 ///
 /// Decode runs *after* the dequeue SQL has already claimed the row as
-/// `Running`, so a decode failure must not just surface the error: it also
+/// `Queued`, so a decode failure must not just surface the error: it also
 /// fails the claimed row via `fail_undecodable_task`, otherwise
-/// the row would stay `Running` for as long as this worker keeps heartbeating
+/// the row would stay claimed for as long as this worker keeps heartbeating
 /// — unackable (ack needs a decoded task) and invisible to orphan recovery
 /// (which only reclaims rows of stale workers).
 /// A failed release remains owned by this stream: it is retried with bounded

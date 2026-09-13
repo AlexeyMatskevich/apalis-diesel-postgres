@@ -20,7 +20,7 @@ pub(crate) use admin::{
     fetch_by_id, list_all_tasks, list_queues, list_tasks, list_workers, metrics_for_queue,
     metrics_global, register_worker,
 };
-pub(crate) use fetch::{fail_undecodable_task, fetch_next, lock_task};
+pub(crate) use fetch::{StartClaim, fail_undecodable_task, fetch_next, lock_task, start_task};
 pub(crate) use notify::{NOTIFY_LISTENER_POLL_INTERVAL, clamp_notify_capacity, notify_task_ids};
 pub(crate) use push::{FlushFailure, flush_tasks, push_tasks_on_conn, validate_task};
 #[cfg(test)]

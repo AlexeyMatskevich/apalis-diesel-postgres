@@ -2150,6 +2150,16 @@ fn orphan_attempts_equals(
     })
 }
 
+fn orphan_left_no_result() -> impl Fn(&Result<Outcome<OrphanRun>, String>) -> AssertionResult {
+    observe::<OrphanRun, _>("orphan last_result", |run| {
+        if run.last_result_present {
+            Err("expected a claim that never started to be handed back without a result".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
 fn orphan_recorded_last_result() -> impl Fn(&Result<Outcome<OrphanRun>, String>) -> AssertionResult
 {
     observe::<OrphanRun, _>("orphan last_result", |run| {
@@ -3477,27 +3487,28 @@ lets_expect! { #tokio_test
         }
     }
 
-    expect(run_orphan_reenqueue(true, true).await) as orphaned_queued_task_at_limit {
-        when a_stale_worker_left_a_queued_task_with_no_retries_remaining {
-            to kills_the_task {
-                orphan_status_equals("Killed"),
-                orphan_attempts_equals(2),
-                orphan_recorded_last_result()
+    // A `Queued` claim never started, so recovery hands it back without
+    // charging an attempt or recording a result, whatever budget it has left;
+    // a `Running` claim is charged, and killed when that uses its last attempt.
+    // Both statuses are pinned at both budgets so a regression that charges a
+    // claim that never started, or spares one that did, is caught.
+
+    expect(run_orphan_reenqueue(true, true).await) as orphaned_queued_task_with_one_attempt_left {
+        when a_stale_worker_left_a_queued_task_with_one_attempt_remaining {
+            to hands_the_task_back_with_that_attempt_intact {
+                orphan_status_equals("Pending"),
+                orphan_attempts_equals(1),
+                orphan_left_no_result()
             }
         }
     }
 
-    // Off-diagonal of (queued, terminal): the reenqueue path branches on the
-    // retry budget, not on the snapshot status. Pin both crossings explicitly
-    // so a future regression that conflates "Queued" with "no retries" or
-    // "Running" with "has retries" is caught.
-
     expect(run_orphan_reenqueue(true, false).await) as orphaned_queued_task_with_retries {
         when a_stale_worker_left_a_queued_task_with_retries_available {
-            to requeues_the_task_back_to_pending {
+            to hands_the_task_back_without_charging_an_attempt {
                 orphan_status_equals("Pending"),
-                orphan_attempts_equals(1),
-                orphan_recorded_last_result()
+                orphan_attempts_equals(0),
+                orphan_left_no_result()
             }
         }
     }

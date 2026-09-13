@@ -125,6 +125,12 @@ impl Recovery {
     }
 }
 
+/// Hand the active claims of `workers` back. A `Queued` row was claimed but
+/// no handler started it, so it keeps its attempt count and its last result;
+/// a `Running` row may have executed partially, so it consumes one attempt
+/// and records the reason when it had no result yet. Either row becomes
+/// `Pending`, or `Killed` with the reason when its budget leaves no attempt:
+/// recovery never leaves a row waiting that no claim can take.
 fn recover_owned(
     conn: &mut PgConnection,
     queue: &str,
@@ -144,16 +150,20 @@ fn recover_owned(
     // more rows as earlier candidates leave the active states.
     sql_query(format!(
         "WITH candidates AS MATERIALIZED (
-        SELECT id FROM apalis.jobs WHERE job_type=$1 AND lock_by=ANY($2)
+        SELECT id, max_attempts, status = 'Running' AS started,
+            CASE WHEN status = 'Running' THEN LEAST(attempts::bigint+1,max_attempts)
+                 ELSE attempts::bigint END AS next_attempts
+        FROM apalis.jobs WHERE job_type=$1 AND lock_by=ANY($2)
             AND status IN ('Running','Queued') ORDER BY id LIMIT $3 FOR UPDATE {skip}
         )
         UPDATE apalis.jobs SET
-        status=CASE WHEN attempts::bigint+1>=max_attempts THEN 'Killed' ELSE 'Pending' END,
-        done_at=CASE WHEN attempts::bigint+1>=max_attempts THEN clock_timestamp() ELSE NULL END,
+        status=CASE WHEN candidates.next_attempts>=candidates.max_attempts THEN 'Killed' ELSE 'Pending' END,
+        done_at=CASE WHEN candidates.next_attempts>=candidates.max_attempts THEN clock_timestamp() ELSE NULL END,
         lock_by=NULL, lock_at=NULL,
-        attempts=LEAST(attempts::bigint+1,max_attempts),
-        last_result=CASE WHEN attempts::bigint+1>=max_attempts OR last_result IS NULL
-            THEN $4 ELSE last_result END
+        attempts=candidates.next_attempts::integer,
+        last_result=CASE WHEN candidates.next_attempts>=candidates.max_attempts
+                OR (candidates.started AND apalis.jobs.last_result IS NULL)
+            THEN $4 ELSE apalis.jobs.last_result END
         FROM candidates
         WHERE apalis.jobs.status IN ('Running','Queued') AND apalis.jobs.id=candidates.id"
     ))

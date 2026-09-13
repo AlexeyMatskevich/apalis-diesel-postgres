@@ -16,7 +16,7 @@ backend does and does not guarantee. The [README](../README.md) covers usage;
 | Queue | No row | The `job_type` string (`Config::new(name)`, the task type name by default) | Exists while any task or registration names it. |
 | Lease token | `apalis.workers.lease_token` and `PostgresStorage` | One random token per storage instance, shared by clones | Marks which storage instance owns a registration. It fences cooperating instances, not callers with table access. |
 | Local lease | In memory, per storage instance, per worker name | | Retired when the instance can no longer vouch for its claims. A retired name refuses further claims and heartbeats in that instance and its clones. |
-| Claim epoch | In memory, inside `Task::parts` | `(lock_by, lock_at, attempts)` as the claim returned them | Identifies one execution of one task. Every acknowledgement and release is predicated on it. |
+| Claim epoch | In memory, inside `Task::parts` | `(lock_by, lock_at, attempts)` as the claim returned them | Identifies one claim of one task. Its start, acknowledgement and release are predicated on it. |
 
 ## 2. Task states
 
@@ -26,8 +26,8 @@ carry the rest of the state.
 | Status | Meaning | Owner (`lock_by`, `lock_at`) | `done_at` | Claimable | Terminal |
 |---|---|---|---|---|---|
 | `Pending` | Waiting to run at `run_at` | none | none | when `run_at <= now()` and `attempts < max_attempts` | no |
-| `Queued` | Claimed through the compatibility function `apalis.get_jobs`; the Rust fetchers never produce it | set | none | only by its owner, which moves it to `Running` | no |
-| `Running` | Claimed; an execution is expected to acknowledge it | set | none | only by its owner | no |
+| `Queued` | Claimed by a worker; no handler has started it yet. The compatibility function `apalis.get_jobs` claims into this state as well | set | none | only by its owner, which starts it (`Running`) | no |
+| `Running` | Started: a handler runs, and an acknowledgement is expected | set | none | only by its owner | no |
 | `Failed` | The last execution failed and retry budget remains (`attempts < max_attempts`) | last owner kept as history | set | immediately, by any worker | no |
 | `Done` | The last execution succeeded | last owner kept as history | set | no | yes |
 | `Killed` | No further execution will happen: the budget is exhausted, or the payload cannot be executed | last owner kept, or cleared by quarantine | set | no | yes |
@@ -58,33 +58,38 @@ predicates tolerate the result as described in section 3):
 - `Done` and `Killed` rows have `done_at`.
 - `attempts` never decreases. A migration repair and an administrator
   restoring retry budget are the only writers that change it otherwise.
-- Every transition out of `Running` or `Queued` increments `attempts`, so two
-  claims of one task never share an epoch.
+- Every transition out of `Running` increments `attempts`. A `Queued` row
+  handed back keeps its count; section 4 describes how the start keeps two
+  claims that share an epoch from both running.
 
 ## 3. Transitions
 
 Every transition is one SQL statement (or one transaction) whose `WHERE`
 clause is the guard. A guard that does not match changes nothing and reports
-it: a claim returns no row, an acknowledgement reports
-`StaleAcknowledgement`, a release reports zero rows.
+it: a claim returns no row, a start reports `ClaimLost`, an acknowledgement
+reports `StaleAcknowledgement`, a release reports zero rows.
 
 | # | From → To | Operation | Guard | Writes | `attempts` |
 |---|---|---|---|---|---|
 | 1 | ∅ → `Pending` | enqueue (`Sink`, `push_*_with_conn`) | payload, metadata, key and queue caps; `run_at` representable | all columns; `lock_by`, `lock_at`, `done_at`, `last_result` null | `0` |
-| 2 | `Pending`, `Failed` → `Running` | poll claim (`fetch_next`) | `attempts < max_attempts`, `run_at <= now()`, registration current for the token; `ORDER BY priority DESC, run_at ASC LIMIT buffer_size FOR UPDATE SKIP LOCKED` | `lock_by`, `lock_at = date_trunc('second', now)`, `done_at = NULL` | unchanged |
-| 3 | `Pending`, `Failed` → `Running` | notify claim (`queue_by_id`) | as 2, restricted to the notified ids | as 2 | unchanged |
-| 4 | `Pending`, `Failed` → `Queued` | compatibility claim (`apalis.get_jobs`) | as 2 without a token | as 2 with status `Queued` | unchanged |
-| 5 | `Pending`, `Failed` → `Running`; `Queued`, `Running` → `Running` | lock (`lock_task`, `lock_task_in_queue`, middleware fallback) | claimable, or already owned by the same name (idempotent, `lock_at` kept) | as 2 | unchanged |
-| 6 | `Running` → `Done`, `Failed`, `Killed` | acknowledge (`PgAck`, middleware) | `id`, `job_type`, `lock_by`, `lock_at`, `attempts` equal the claim epoch; status `Running`; the token owns the registration when the acknowledger carries one | `status`, `last_result`, `done_at = now`; owner columns kept | claim `+ 1` |
-| 7 | `Running` → `Failed`, `Killed` | release of an undecodable payload | the claim epoch | `last_result` = codec error, `done_at = now`; owner kept | `+ 1` |
-| 8 | `Running` → `Killed` | quarantine of a structurally malformed row (id or status unreadable) | the row was just claimed | owner cleared, `last_result` = conversion error, `done_at = now` | `+ 1` |
-| 9 | `Running`, `Queued` → `Pending`, `Killed` | recovery: stale-worker sweep, registration takeover, `release_worker` | the owner is stale, taken over, or releasing | owner cleared; `done_at` null for `Pending`, now for `Killed`; `last_result` set when null or when killed | `+ 1` |
-| 10 | terminal → ∅ | retention (`purge_terminal_tasks`, `Vacuum`) | terminal and older than the window | row deleted | |
+| 2 | `Pending`, `Failed` → `Queued` | poll claim (`fetch_next`) | `attempts < max_attempts`, `run_at <= now()`, registration current for the token; `ORDER BY priority DESC, run_at ASC LIMIT buffer_size FOR UPDATE SKIP LOCKED` | `lock_by`, `lock_at = date_trunc('second', now)`, `done_at = NULL` | unchanged |
+| 3 | `Pending`, `Failed` → `Queued` | notify claim (`queue_by_id`) | as 2, restricted to the notified ids | as 2 | unchanged |
+| 4 | `Pending`, `Failed` → `Queued` | compatibility claim (`apalis.get_jobs`) | as 2 without a token | as 2 | unchanged |
+| 5 | `Queued` → `Running` | start (backend middleware, right before the handler) | the claim epoch; status `Queued`, or `Running` for a re-dispatch of a claim this process already started; the token owns the registration when the middleware carries one; the name is not retired locally | `status` | unchanged |
+| 6 | `Pending`, `Failed` → `Running`; `Queued`, `Running` → `Running` | lock (`lock_task`, `lock_task_in_queue`, middleware for a task that carries no claim) | claimable, or already owned by the same name (idempotent, `lock_at` kept) | as 2, with status `Running` | unchanged |
+| 7 | `Queued`, `Running` → `Done`, `Failed`, `Killed` | acknowledge (`PgAck`, middleware, a stream consumer acknowledging its claims) | `id`, `job_type`, `lock_by`, `lock_at`, `attempts` equal the claim epoch; status `Queued` or `Running`; the token owns the registration when the acknowledger carries one | `status`, `last_result`, `done_at = now`; owner columns kept | claim `+ 1` |
+| 8 | `Queued` → `Failed`, `Killed` | release of an undecodable payload | the claim epoch | `last_result` = codec error, `done_at = now`; owner kept | `+ 1` |
+| 9 | `Queued` → `Killed` | quarantine of a structurally malformed row (id or status unreadable) | the row was just claimed | owner cleared, `last_result` = conversion error, `done_at = now` | `+ 1` |
+| 10 | `Running`, `Queued` → `Pending`, `Killed` | recovery: stale-worker sweep, registration takeover, `release_worker` | the owner is stale, taken over, or releasing | owner cleared; `done_at` null for `Pending`, now for `Killed`; `last_result` set when a `Running` row had none, and when killed | `Running`: `+ 1`; `Queued`: unchanged |
+| 11 | terminal → ∅ | retention (`purge_terminal_tasks`, `Vacuum`) | terminal and older than the window | row deleted | |
 
-The status written by 6, 7 and 9 follows one rule: with budget left after
+The status written by 7, 8 and 10 follows one rule: with budget left after
 the increment (`attempts + 1 < max_attempts`) a failed execution becomes
-`Failed` (6, 7) or `Pending` (9); otherwise it becomes `Killed`. A
-successful acknowledgement is always `Done`.
+`Failed` (7, 8) or `Pending` (10); otherwise it becomes `Killed`. A
+successful acknowledgement is always `Done`. A `Queued` row handed back by
+10 never started, so nothing is charged: it becomes `Pending` with its count
+unchanged, or `Killed` when that count already leaves no attempt, which only
+a row edited outside this crate can carry because a claim requires budget.
 
 There is no transition out of a terminal state and no rescheduling of an
 active row. An administrator who wants to run a `Killed` task again restores
@@ -94,20 +99,20 @@ its budget with SQL (`status = 'Pending'`, `attempts` below `max_attempts`,
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: enqueue
-    Pending --> Running: claim (poll, notify, lock)
-    Pending --> Queued: apalis.get_jobs
-    Failed --> Running: claim
-    Failed --> Queued: apalis.get_jobs
-    Queued --> Running: lock by the owner
+    Pending --> Queued: claim (poll, notify, apalis.get_jobs)
+    Failed --> Queued: claim
+    Queued --> Running: start by the owner, or lock
+    Pending --> Running: lock
+    Failed --> Running: lock
+    Queued --> Pending: recovery, nothing charged
+    Queued --> Done: ack Ok by a stream consumer
+    Queued --> Failed: undecodable payload or ack Err, budget left
+    Queued --> Killed: undecodable or malformed payload, ack Err, budget exhausted
     Running --> Done: ack Ok
     Running --> Failed: ack Err, budget left
     Running --> Killed: ack Err, budget exhausted
-    Running --> Failed: undecodable payload, budget left
-    Running --> Killed: undecodable or malformed payload
     Running --> Pending: recovery, budget left
-    Queued --> Pending: recovery, budget left
     Running --> Killed: recovery, budget exhausted
-    Queued --> Killed: recovery, budget exhausted
     Done --> [*]: purge
     Killed --> [*]: purge
 ```
@@ -116,12 +121,23 @@ stateDiagram-v2
 
 A claim returns the row with `lock_by`, `lock_at` and `attempts` as it
 wrote them. The backend keeps that triple with the task, in memory, as the
-claim epoch. Every write that ends the execution requires the row to still
-carry exactly that epoch and status `Running`:
+claim epoch. The start and every write that ends the execution require the
+row to still carry exactly that epoch:
 
 - `lock_at` is truncated to the second; the epoch therefore relies on
   `attempts` to separate two claims of the same task by the same worker, and
-  every transition out of `Running` increments `attempts`.
+  every transition out of `Running` increments `attempts`. A `Queued` row
+  handed back keeps its count, so a new claim of it by the same name within
+  the same second repeats the epoch. The start admits one of the two: a
+  claim this process has not started requires status `Queued`, and only a
+  re-dispatch of a claim this process already started, such as a retry
+  layer outside the middleware, accepts `Running`.
+- A start that matches nothing refuses the dispatch with `ClaimLost` before
+  the handler runs: the claim was recovered, released, taken over, or
+  started by the other claim of its epoch. The worker keeps running because
+  it owes nothing for that claim. A start through the storage's middleware
+  also requires the storage's token to own the registration, and a locally
+  retired name starts nothing.
 - An acknowledgement whose epoch no longer matches reports
   `StaleAcknowledgement`: the task was recovered, re-claimed, or completed
   by another path. Nothing is written.
@@ -134,8 +150,10 @@ carry exactly that epoch and status `Running`:
 
 ## 5. Retry budget
 
-`attempts` counts completed executions and consumed recoveries; it grows by
-one per acknowledgement, release, quarantine and recovery. `max_attempts` is
+`attempts` counts completed executions and lost ones; it grows by one per
+acknowledgement, undecodable release, quarantine, and recovery of a started
+(`Running`) row. Handing back a `Queued` claim that no handler started
+charges nothing. `max_attempts` is
 fixed at enqueue. A `Failed` row is eligible for its next claim at once:
 the backend adds no delay between attempts. Delay a retry from the handler,
 or enqueue with a later `run_at` and a smaller budget, when the failure is
@@ -209,10 +227,10 @@ these states; the columns in parentheses are what other actors read.
    storage share the token, and a wrong name releases whichever live worker
    uses it. Apalis drains running handlers before a graceful stop, but the
    poll fetcher's buffer of claimed, undispatched tasks (up to `buffer_size`)
-   is dropped with the stream; the release recovers those rows too, and each
-   consumes one attempt because the database records a claim, not a
-   dispatch. After a fail-stop the release hands unfinished claims back at
-   once instead of after the stale deadline.
+   is dropped with the stream; those rows are still `Queued`, and the
+   release hands them back without charging an attempt. After a fail-stop
+   the release hands unfinished claims back at once instead of after the
+   stale deadline; a task whose handler had started consumes one attempt.
 7. **Prune.** `prune_workers` deletes, in bounded batches, registrations
    that have been stale for the given window and that no task references.
    The window must be at least `reenqueue_orphaned_after`, the deadline
@@ -226,7 +244,7 @@ Recovery of the tasks a worker held, by how the worker ended:
 
 | How the worker ended | Registration afterwards | Its claims are recovered |
 |---|---|---|
-| Graceful stop, then `release_worker` | released | immediately (handlers were drained; claimed, undispatched buffer rows are recovered at one attempt each) |
+| Graceful stop, then `release_worker` | released | immediately (handlers were drained; claimed, undispatched buffer rows return without charging an attempt) |
 | Fail-stop error, then `release_worker` | released | immediately |
 | Any stop without `release_worker` | fresh until `reenqueue_orphaned_after` elapses | by the next sweep of any live worker of the queue after the deadline, at most one `keep_alive` later, 1000 rows per sweep; or at once when a fresh token takes the name over after the deadline |
 | Process killed | as above | as above |
@@ -261,6 +279,8 @@ waiting.
 | Claim fails before any row was claimed | The task stream yields the error; nothing is owned. |
 | Claim transaction produced rows but the commit was not confirmed | `ClaimOutcomeUnknown`; the name is retired locally so recovery can proceed. |
 | Acknowledgement fails or is lost | The storage's acknowledger retires the name; the row stays `Running` until recovery. `PgAck::new` and `with_lease_token` bind no liveness and leave the heartbeat running. |
+| Start fails (pool timeout, connection lost) | The dispatch aborts before the handler and the name is retired locally. Recovery hands the claim back after the stale deadline, charging an attempt only if the start had committed unseen. |
+| Start matches nothing | `ClaimLost`: the claim was recovered, released, taken over, or started by another claim of its epoch. The handler does not run and the worker continues. |
 | Payload does not decode | The row is released through its budget (`Failed`, then `Killed`) with bounded retries; persistent failure retires the name. |
 | Handler hangs | Nothing: liveness is per worker, not per task. The row stays `Running` while the heartbeat continues (`STALE_RUNNING_JOBS` counts it after an hour). Bound handlers with a timeout layer. |
 

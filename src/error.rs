@@ -32,7 +32,8 @@ pub enum Error {
     Blocking(#[source] BoxDynError),
 
     /// A claim produced runnable tasks, but its commit was not confirmed.
-    /// The tasks may be Running even though their rows were not delivered.
+    /// The rows may be claimed (`Queued`, or `Running` for a lock) even though
+    /// they were not delivered.
     #[error(
         "claim outcome is unknown while {operation}: {source}; retire this worker and allow orphan recovery before restarting with fresh storage"
     )]
@@ -136,6 +137,20 @@ pub enum Error {
         /// Queue involved in the acknowledgement.
         queue: String,
         /// Worker id involved in the acknowledgement.
+        worker_id: String,
+    },
+
+    /// A claimed task was recovered or taken over before its handler
+    /// started, so this worker did not run it.
+    #[error(
+        "claim of task {task_id} in queue {queue} by worker {worker_id} was lost before the task started; it was recovered or taken over and runs elsewhere"
+    )]
+    ClaimLost {
+        /// Task id whose claim was lost.
+        task_id: String,
+        /// Queue the task belongs to.
+        queue: String,
+        /// Worker that held the claim.
         worker_id: String,
     },
 
@@ -245,6 +260,18 @@ impl Error {
         worker_id: impl Into<String>,
     ) -> Self {
         Self::StaleAcknowledgement {
+            task_id: task_id.into(),
+            queue: queue.into(),
+            worker_id: worker_id.into(),
+        }
+    }
+
+    pub(crate) fn claim_lost(
+        task_id: impl Into<String>,
+        queue: impl Into<String>,
+        worker_id: impl Into<String>,
+    ) -> Self {
+        Self::ClaimLost {
             task_id: task_id.into(),
             queue: queue.into(),
             worker_id: worker_id.into(),

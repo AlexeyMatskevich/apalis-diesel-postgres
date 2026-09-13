@@ -216,8 +216,10 @@ deadline passes. `run_released` awaits a worker future and then releases;
 `release_worker` is the explicit call; `releaser()` gives a clonable handle
 to both for a storage that has moved into the builder. Restart with fresh
 storage; the releasing storage and its clones are retired. The release
-consumes one attempt for every task the worker still owned, including tasks
-the poll fetcher had claimed but not yet handed to a handler. A worker killed before it could release waits for the
+charges one attempt only for a task whose handler had started; tasks the
+poll fetcher had claimed but not yet handed to a handler stay `Queued` until
+then and return to the queue uncharged. A worker killed before it could
+release waits for the
 deadline by design: `reenqueue_orphaned_after` is the restart latency after
 a crash, so shorten it (with a proportionally shorter `keep_alive`) when a
 fast restart matters more than tolerance for slow heartbeats.
@@ -534,7 +536,9 @@ storage token cannot take over a still-fresh registration with the same name:
 restart may need to wait for the stale deadline unless the previous storage
 released its registration with `release_worker`. After the last committed
 heartbeat expires, another worker can recover unfinished tasks.
-Recovery counts a lost attempt and respects the retry budget. Taking over the
+Recovery charges one attempt for a task whose handler had started and
+respects the retry budget; a claimed task that never started returns
+uncharged. Taking over the
 same worker name recovers all of that registration's claims before renewal;
 this can be a large transaction after a large in-flight batch.
 Storage clones retain one local liveness record per distinct worker name until
@@ -644,6 +648,10 @@ worker logs point at the failed lifecycle step:
   already locked, out of retry attempts, or in another queue.
 - Acknowledgement races: `stale acknowledgement` when the stored lock no
   longer matches the worker/attempt/lock timestamp being ack'd.
+- Lost claims: `claim of task … was lost before the task started`
+  (`Error::ClaimLost`) when a claimed task was recovered, released or taken
+  over before the middleware started it. The handler does not run, the
+  worker continues, and the task runs elsewhere.
 - Waiting on an id no row carries: `task not found while waiting for
   completion` once the id is absent on two consecutive polls, for ids that
   were never enqueued or tasks that retention removed.

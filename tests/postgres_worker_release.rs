@@ -23,7 +23,7 @@ use apalis_core::{
     worker::context::WorkerContext,
 };
 use apalis_diesel_postgres::{
-    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, ReleasedRun,
+    CompactType, Config, Error, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage, ReleasedRun,
     SharedPostgresStorage,
 };
 use diesel::{QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
@@ -192,7 +192,9 @@ async fn release_with_unfinished_claim() -> Result<Outcome<ReleaseObservation>, 
 fn hands_the_claim_to_an_immediate_successor()
 -> impl Fn(&Result<Outcome<ReleaseObservation>, String>) -> AssertionResult {
     observe::<ReleaseObservation, _>("release with an unfinished claim", |o| {
-        let expected_row = ("Pending".to_owned(), 1, None);
+        // The stream claimed the task but nothing started it, so the
+        // release hands it back with its attempt count unchanged.
+        let expected_row = ("Pending".to_owned(), 0, None);
         if o.claimed == "task"
             && o.released == Ok(1)
             && o.row_after_release == expected_row
@@ -204,7 +206,7 @@ fn hands_the_claim_to_an_immediate_successor()
             Ok(())
         } else {
             Err(format!(
-                "expected the claim handed back as Pending with one attempt consumed, the releasing storage retired, an immediate successor that receives the task, and a second release refused; got {o:?}"
+                "expected the unstarted claim handed back as Pending with no attempt consumed, the releasing storage retired, an immediate successor that receives the task, and a second release refused; got {o:?}"
             ))
         }
     })
@@ -224,10 +226,12 @@ struct RestartObservation {
 }
 
 /// Run one `WorkerBuilder` worker until the given task is terminal.
+/// Runs a worker that counts handled tasks until every task in `task_ids`
+/// is terminal.
 async fn run_until_done(
     storage: PostgresStorage<String>,
     name: &str,
-    task_id: PgTaskId,
+    task_ids: &[PgTaskId],
     handled: Arc<AtomicUsize>,
 ) -> Result<(), String> {
     let handler = move |_job: String| {
@@ -241,15 +245,20 @@ async fn run_until_done(
         .backend(storage.clone())
         .build(handler);
     let mut observer = storage;
+    let task_ids = task_ids.to_vec();
     let signal = async move {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let status = observer
-                .fetch_by_id(&task_id)
-                .await
-                .map_err(|error| WorkerError::StreamError(Box::new(error)))?
-                .map(|task| task.parts.status.load());
-            if matches!(status, Some(Status::Done | Status::Killed)) {
+            let mut all_terminal = true;
+            for task_id in &task_ids {
+                let status = observer
+                    .fetch_by_id(task_id)
+                    .await
+                    .map_err(|error| WorkerError::StreamError(Box::new(error)))?
+                    .map(|task| task.parts.status.load());
+                all_terminal &= matches!(status, Some(Status::Done | Status::Killed));
+            }
+            if all_terminal {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -257,6 +266,126 @@ async fn run_until_done(
             }
             apalis_core::timer::sleep(Duration::from_millis(10)).await;
         }
+    };
+    worker.run_until(signal).await.map_err(|e| e.to_string())
+}
+
+/// Admits one task into the worker at a time. While a task is in flight the
+/// worker takes nothing more from the stream, so the rest of a claimed batch
+/// stays claimed and undispatched.
+#[derive(Clone, Default)]
+struct OneAtATimeLayer {
+    gate: Arc<Gate>,
+}
+
+#[derive(Default)]
+struct Gate {
+    busy: std::sync::atomic::AtomicBool,
+    waiter: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl<S> apalis_core::layers::Layer<S> for OneAtATimeLayer {
+    type Service = OneAtATime<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        OneAtATime {
+            inner,
+            gate: self.gate.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OneAtATime<S> {
+    inner: S,
+    gate: Arc<Gate>,
+}
+
+impl<S, Request> apalis_core::layers::Service<Request> for OneAtATime<S>
+where
+    S: apalis_core::layers::Service<Request>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = futures::future::BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        if self.gate.busy.load(Ordering::SeqCst) {
+            *self
+                .gate
+                .waiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cx.waker().clone());
+            // Read again with the waker in place so a completion in between
+            // is not missed.
+            if self.gate.busy.load(Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+        }
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        self.gate.busy.store(true, Ordering::SeqCst);
+        let gate = self.gate.clone();
+        let response = self.inner.call(request);
+        Box::pin(async move {
+            let result = response.await;
+            gate.busy.store(false, Ordering::SeqCst);
+            let waiter = gate
+                .waiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(waiter) = waiter {
+                waiter.wake();
+            }
+            result
+        })
+    }
+}
+
+/// Runs a worker that admits one task at a time and stops while the first
+/// task it dispatched is still running, so the rest of the claimed batch is
+/// never dispatched. That handler returns once the stop is issued, and
+/// Apalis drains it before the run returns.
+async fn run_one_then_stop(
+    storage: PostgresStorage<String>,
+    name: &str,
+    handled: Arc<AtomicUsize>,
+) -> Result<(), String> {
+    let dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler_dispatched = dispatched.clone();
+    let handler = move |_job: String, worker: WorkerContext| {
+        let handled = handled.clone();
+        let dispatched = handler_dispatched.clone();
+        async move {
+            dispatched.store(true, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !worker.is_shutting_down() && std::time::Instant::now() < deadline {
+                apalis_core::timer::sleep(Duration::from_millis(5)).await;
+            }
+            handled.fetch_add(1, Ordering::Relaxed);
+            Ok::<(), BoxDynError>(())
+        }
+    };
+    let worker = WorkerBuilder::new(name)
+        .backend(storage)
+        .layer(OneAtATimeLayer::default())
+        .build(handler);
+    let signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !dispatched.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                return Err(WorkerError::PanicError("no task was dispatched".into()));
+            }
+            apalis_core::timer::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
     };
     worker.run_until(signal).await.map_err(|e| e.to_string())
 }
@@ -341,7 +470,7 @@ async fn restart_under_the_same_name(
         let first_task = push_with_id(&mut producer, "first deploy", None).await?;
         let (first_run, released) = match handover {
             Handover::Released => {
-                let run = run_until_done(first.clone(), name, first_task, handled.clone()).await;
+                let run = run_until_done(first.clone(), name, &[first_task], handled.clone()).await;
                 let released = first.release_worker(name).await.map_err(release_error);
                 (run, released)
             }
@@ -349,7 +478,7 @@ async fn restart_under_the_same_name(
                 let ReleasedRun { outcome, released } = first
                     .run_released(
                         name,
-                        run_until_done(first.clone(), name, first_task, handled.clone()),
+                        run_until_done(first.clone(), name, &[first_task], handled.clone()),
                     )
                     .await;
                 (outcome, released.map_err(release_error))
@@ -358,13 +487,13 @@ async fn restart_under_the_same_name(
                 run_shared_released(&pool, &queue, name, first_task, handled.clone()).await
             }
             Handover::Kept => (
-                run_until_done(first.clone(), name, first_task, handled.clone()).await,
+                run_until_done(first.clone(), name, &[first_task], handled.clone()).await,
                 Ok(0),
             ),
         };
         let second = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
         let second_task = push_with_id(&mut producer, "second deploy", None).await?;
-        let second_run = run_until_done(second, name, second_task, handled.clone()).await;
+        let second_run = run_until_done(second, name, &[second_task], handled.clone()).await;
         let mut statuses = Vec::new();
         for id in [first_task, second_task] {
             statuses.push(
@@ -500,6 +629,113 @@ fn is_refused_before_registering()
         } else {
             Err(format!(
                 "expected both streams to refuse the schedule before any registration; got {o:?}"
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// A graceful stop with claimed but undispatched tasks
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct BufferedStopObservation {
+    first_run: Result<(), String>,
+    released: Result<usize, &'static str>,
+    /// `(status, attempts)` of every task after the release, sorted: which
+    /// task the first deployment dispatched is not part of the contract.
+    after_release: Vec<(String, i32)>,
+    second_run: Result<(), String>,
+    handled: usize,
+    /// Statuses after the second deployment.
+    final_statuses: Vec<Status>,
+}
+
+/// The first deployment handles one task; the other two are claimed into
+/// the fetcher's buffer and never reach a handler before the worker stops.
+/// Each task allows exactly one attempt, so a release that charged the
+/// buffered tasks an attempt would kill them.
+async fn graceful_stop_with_buffered_tasks() -> Result<Outcome<BufferedStopObservation>, String> {
+    let Some(pool) = pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("worker-release-buffered-{}", ulid::Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+    let observation = async {
+        let name = "buffered-worker";
+        let config_for = config;
+        let config = config_for(&queue).set_buffer_size(3);
+        let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
+        let mut producer = storage.clone();
+        let mut ids = Vec::new();
+        for label in ["first", "second", "third"] {
+            let id = PgTaskId::new(ulid::Ulid::new());
+            let mut task = PgTask::<String>::new(label.to_owned());
+            task.parts.task_id = Some(id);
+            task.parts.ctx = PgContext::new().with_max_attempts(1);
+            producer.push_task(task).await.map_err(|e| e.to_string())?;
+            ids.push(id);
+        }
+        let handled = Arc::new(AtomicUsize::new(0));
+        // One claim of `buffer_size` rows takes all three tasks; the first
+        // deployment dispatches one and stops while it runs.
+        let first_run = run_one_then_stop(storage.clone(), name, handled.clone()).await;
+        let released = storage.release_worker(name).await.map_err(release_error);
+        let mut after_release = Vec::new();
+        for id in &ids {
+            let (status, attempts, _) = job_row(pool.clone(), *id).await?;
+            after_release.push((status, attempts));
+        }
+        after_release.sort();
+        // A fresh `Config`: the first deployment consumed its poll strategy.
+        let second = PostgresStorage::<String>::new_with_config(
+            &pool,
+            &config_for(&queue).set_buffer_size(3),
+        );
+        let second_run = run_until_done(second, name, &ids, handled.clone()).await;
+        let mut final_statuses = Vec::new();
+        for id in &ids {
+            final_statuses.push(
+                producer
+                    .fetch_by_id(id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map(|task| task.parts.status.load())
+                    .ok_or("the task row exists")?,
+            );
+        }
+        Ok::<_, String>(BufferedStopObservation {
+            first_run,
+            released,
+            after_release,
+            second_run,
+            handled: handled.load(Ordering::Relaxed),
+            final_statuses,
+        })
+    }
+    .await;
+    cleanup(pool, queue).await?;
+    observation.map(Outcome::Completed)
+}
+
+fn hands_buffered_tasks_back_without_charging_them()
+-> impl Fn(&Result<Outcome<BufferedStopObservation>, String>) -> AssertionResult {
+    observe::<BufferedStopObservation, _>("graceful stop with buffered tasks", |o| {
+        let buffered_untouched = o.after_release.len() == 3
+            && o.after_release[0] == ("Done".to_owned(), 1)
+            && o.after_release[1] == ("Pending".to_owned(), 0)
+            && o.after_release[2] == ("Pending".to_owned(), 0);
+        if o.first_run.is_ok()
+            && o.released == Ok(2)
+            && buffered_untouched
+            && o.second_run.is_ok()
+            && o.handled == 3
+            && o.final_statuses == [Status::Done, Status::Done, Status::Done]
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the two buffered tasks to return to Pending with no attempt consumed and to run in the next deployment; got {o:?}"
             ))
         }
     })
@@ -669,7 +905,13 @@ async fn retention_after_a_run() -> Result<Outcome<RetentionObservation>, String
         let storage = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
         let mut producer = storage.clone();
         let done = push_with_id(&mut producer, "to complete", None).await?;
-        run_until_done(storage.clone(), "retention-worker", done, handled.clone()).await?;
+        run_until_done(
+            storage.clone(),
+            "retention-worker",
+            &[done],
+            handled.clone(),
+        )
+        .await?;
         storage
             .release_worker("retention-worker")
             .await
@@ -761,6 +1003,10 @@ lets_expect! { #tokio_test
             let handover = Handover::Kept;
             to is_refused_until_the_registration_is_stale { is_refused_until_stale() }
         }
+    }
+
+    expect(graceful_stop_with_buffered_tasks().await) as a_graceful_stop_with_claimed_but_undispatched_tasks {
+        to hands_them_back_without_charging_an_attempt { hands_buffered_tasks_back_without_charging_them() }
     }
 
     expect(heartbeat_before_registration(registration).await) as a_heartbeat_started_before_the_registration {

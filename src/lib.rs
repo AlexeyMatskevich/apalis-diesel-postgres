@@ -357,12 +357,13 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// live worker of the same storage uses releases that worker instead;
     /// the call cannot tell the two apart.
     ///
-    /// Each recovered task consumes one attempt, like orphan recovery: the
-    /// worker may have executed it partially. This includes tasks the poll
-    /// fetcher claimed into its buffer but never handed to a handler before
-    /// the worker stopped: the database records a claim, not a dispatch, so
-    /// up to `buffer_size` tasks per worker lose an attempt on a graceful
-    /// stop. A task the worker acknowledged before stopping is not touched.
+    /// A `Running` task consumes one attempt, like orphan recovery: its
+    /// handler started, so the worker may have executed it partially. A
+    /// `Queued` task was claimed but never started, such as the tasks the
+    /// poll fetcher buffered and the stopped worker never handed to a
+    /// handler; it returns to `Pending` with its attempt count and result
+    /// unchanged. A task the worker acknowledged before stopping is not
+    /// touched.
     /// The registration row itself is kept because completed tasks reference
     /// it as their last owner; [`Self::prune_workers`] removes it once
     /// nothing references it any more.

@@ -152,7 +152,7 @@ async fn batch(
         let expected_errors=if failure==Failure::Healthy {vec![]} else {vec!["listener failed".to_owned()]};
         if delivered==fixture.expected() && errors==expected_errors
             && rows.iter().map(|row|row.id.clone()).collect::<Vec<_>>()==fixture.expected()
-            && rows.iter().all(|row|row.status=="Running" && row.attempts==0 && row.owned) {Ok(())}
+            && rows.iter().all(|row|row.status=="Queued" && row.attempts==0 && row.owned) {Ok(())}
         else {Err(format!("failure={failure:?}, capacity={capacity}, separate={separate}, empty={empty}; expected={:?}; delivered={delivered:?}; errors={errors:?}; rows={rows:?}",fixture.expected()))}
     }.await;
     fixture.cleanup().await?;
@@ -342,7 +342,7 @@ async fn live(shared: bool, terminate: bool) -> Result<(), String> {
         if delivered==fixture.expected() && errors.len()==usize::from(terminate)
             && errors.iter().all(|error|error.contains("notification"))
             && rows.iter().map(|row|row.id.clone()).collect::<Vec<_>>()==fixture.expected()
-            && rows.iter().all(|row|row.status=="Running"&&row.owned&&row.attempts==0) {Ok(())}
+            && rows.iter().all(|row|row.status=="Queued"&&row.owned&&row.attempts==0) {Ok(())}
         else {Err(format!("shared={shared}, terminate={terminate}; expected={:?}; delivered={delivered:?}; errors={errors:?}; rows={rows:?}",fixture.expected()))}
     }.await;
     wait_idle(&fixture.pool).await?;
@@ -393,9 +393,9 @@ async fn overflow(shared: bool) -> Result<(), String> {
         let mut pending=before.iter().filter(|row|row.status=="Pending"&&!row.owned&&row.attempts==0).map(|row|row.id.clone()).collect::<Vec<_>>(); pending.sort();
         let rejected=sorted_ids(&fixture.ids.iter().copied().filter(|id|!accepted.contains(id)).collect::<Vec<_>>());
         if delivered==sorted_ids(&accepted) && errors.is_empty() && pending==rejected
-            && before.iter().filter(|row|row.status=="Running"&&row.owned&&row.attempts==0).map(|row|row.id.clone()).collect::<Vec<_>>()==delivered
+            && before.iter().filter(|row|row.status=="Queued"&&row.owned&&row.attempts==0).map(|row|row.id.clone()).collect::<Vec<_>>()==delivered
             && all==fixture.expected() && after.iter().map(|row|row.id.clone()).collect::<Vec<_>>()==fixture.expected()
-            && after.iter().all(|row|row.status=="Running"&&row.owned&&row.attempts==0) {Ok(())}
+            && after.iter().all(|row|row.status=="Queued"&&row.owned&&row.attempts==0) {Ok(())}
         else {Err(format!("shared={shared}; accepted={accepted:?}; delivered={delivered:?}; errors={errors:?}; all={all:?}; before={before:?}; after={after:?}"))}
     }.await;
     fixture.cleanup().await?;

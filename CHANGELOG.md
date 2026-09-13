@@ -10,8 +10,9 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 ### Added
 
 - `PostgresStorage::release_worker` hands a stopped worker's registration
-  back: every `Running` or `Queued` task it still owns returns to the queue
-  with one attempt consumed, the lease token is cleared, and the row is
+  back: every `Running` or `Queued` task it still owns returns to the queue,
+  charged one attempt only when its handler had started, the lease token is
+  cleared, and the row is
   marked released, so a restart registers the same name immediately instead
   of waiting for `reenqueue_orphaned_after`. A registration the storage does
   not own is reported as `WorkerNotRegistered` and left untouched.
@@ -47,6 +48,20 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed (breaking)
 
+- A claimed task stays `Queued` until the backend middleware starts it,
+  right before its handler runs; only then does it become `Running`. The
+  stale sweep, a takeover and `release_worker` hand a `Queued` task back to
+  `Pending` without consuming an attempt or recording a result, so the tasks
+  a poll fetcher had buffered when its worker stopped or died keep their
+  budget; before, each lost an attempt, and a task allowed one attempt was
+  killed without running. A dispatch whose claim was recovered, released,
+  or taken over in the meantime is refused before the handler runs with the
+  new `Error::ClaimLost`, and the worker continues. Starting a task costs one
+  more transaction per task, and a start that fails on the database retires
+  the worker like a failed acknowledgement. Code that reads `status` sees
+  buffered claims as `Queued`, and `running_jobs` counts only started tasks.
+  A stream consumer that acknowledges without the middleware acknowledges
+  `Queued` rows as before.
 - Registration and the heartbeat stream refuse a schedule that cannot keep
   a registration fresh: `keep_alive` must be greater than zero and shorter
   than `reenqueue_orphaned_after`, or the first stream item is

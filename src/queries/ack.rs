@@ -62,7 +62,7 @@ pub(crate) fn ack_task(
                  AND lock_by = $6
                  AND lock_at = to_timestamp($7::double precision)
                  AND attempts = $8
-                 AND status = 'Running'
+                 AND status IN ('Queued', 'Running')
                  ",
             )
             .bind::<Text, _>(update.status.to_string())

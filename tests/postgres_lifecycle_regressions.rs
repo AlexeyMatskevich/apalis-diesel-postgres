@@ -427,7 +427,7 @@ mod races {
         .await
         .unwrap();
         sql(&p,format!("UPDATE apalis.workers SET last_seen=now()-interval '2 minutes' WHERE worker_type='{q}'")).await;
-        sql(&p,"CREATE OR REPLACE FUNCTION apalis.test_block_recovery() RETURNS trigger AS $$ BEGIN IF NEW.status='Pending' AND OLD.status='Running' THEN PERFORM pg_advisory_xact_lock(8765412); END IF; RETURN NEW; END $$ LANGUAGE plpgsql".to_owned()).await;
+        sql(&p,"CREATE OR REPLACE FUNCTION apalis.test_block_recovery() RETURNS trigger AS $$ BEGIN IF NEW.status='Pending' AND OLD.status IN ('Queued','Running') THEN PERFORM pg_advisory_xact_lock(8765412); END IF; RETURN NEW; END $$ LANGUAGE plpgsql".to_owned()).await;
         sql(&p,format!("CREATE TRIGGER test_block_recovery BEFORE UPDATE ON apalis.jobs FOR EACH ROW WHEN (OLD.job_type='{q}') EXECUTE FUNCTION apalis.test_block_recovery()")).await;
         let mut holder = p.get().unwrap();
         sql_query("BEGIN").execute(&mut holder).unwrap();

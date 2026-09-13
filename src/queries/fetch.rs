@@ -1,7 +1,7 @@
 use apalis_core::worker::context::WorkerContext;
 use diesel::{
     Connection, RunQueryDsl, sql_query,
-    sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text},
+    sql_types::{Array, BigInt, Bool, Integer, Jsonb, Nullable, Text},
 };
 use std::sync::{
     Arc,
@@ -59,14 +59,14 @@ pub(crate) fn fetch_next(
                  FOR UPDATE SKIP LOCKED
              ),
              updated AS (
-                 -- H4: dequeue + lock used to be two round-trips
-                 -- (fetch_next → Queued, then LockTaskService → Running).
-                 -- Transition straight to `Running` in this CTE so the
-                 -- subsequent `LockTaskService` call becomes idempotent
-                 -- (`lock_task` accepts already-Running rows owned by the
-                 -- same worker) and no second round-trip is needed per job.
+                 -- A claim is `Queued`: owned, but no handler has started.
+                 -- `LockTaskService` moves the row to `Running` right before
+                 -- the handler (`start_task`), so recovery can tell a
+                 -- claimed-but-undispatched row (handed back without
+                 -- consuming an attempt) from an execution that may have
+                 -- run partially.
                  UPDATE apalis.jobs
-                 SET status = 'Running',
+                 SET status = 'Queued',
                      lock_by = $1,
                      lock_at = date_trunc('second', statement_timestamp()),
                      done_at = NULL
@@ -119,7 +119,7 @@ pub(crate) fn queue_by_id(
              ),
              updated AS (
                  UPDATE apalis.jobs
-                 SET status = 'Running',
+                 SET status = 'Queued',
                      lock_at = date_trunc('second', statement_timestamp()),
                      lock_by = $1,
                      done_at = NULL
@@ -140,9 +140,9 @@ pub(crate) fn queue_by_id(
     )
 }
 
-/// Release a row the dequeue SQL already claimed as `Running` but whose
+/// Release a row the dequeue SQL already claimed as `Queued` but whose
 /// payload failed to decode. Without this, a poisoned payload (codec drift, a
-/// third-party insert) would strand the row in `Running` for as long as the
+/// third-party insert) would strand the row in `Queued` for as long as the
 /// claiming worker keeps heartbeating: ack requires a decoded task, and
 /// orphan recovery only reclaims rows of *stale* workers. Failing the attempt
 /// instead routes the row through the normal retry budget — it stays
@@ -197,7 +197,7 @@ pub(crate) fn fail_undecodable_task(
                  done_at = clock_timestamp(),
                  last_result = $3
              WHERE id = $1
-                 AND status = 'Running'
+                 AND status IN ('Queued', 'Running')
                  AND lock_by = $2
                  AND lock_at = to_timestamp($4::double precision)
                  AND attempts = $5",
@@ -210,6 +210,72 @@ pub(crate) fn fail_undecodable_task(
             .execute(conn)
             .map_err(Error::database("failing undecodable task"))?;
             Ok(count)
+        })
+    })
+}
+
+/// The claim a dispatch starts: its epoch, and what the dispatching process
+/// knows about it.
+pub(crate) struct StartClaim {
+    pub(crate) task_id: PgTaskId,
+    pub(crate) queue: String,
+    pub(crate) worker_id: String,
+    pub(crate) lock_at: i64,
+    pub(crate) attempts: i32,
+    /// This claim already started once in this process, so the dispatch is a
+    /// re-dispatch of it and a `Running` row of the epoch is accepted. A claim
+    /// that has not started requires `Queued`: a recovered `Queued` row keeps
+    /// its attempt count, so a later claim of the same task by the same name
+    /// within the same second carries the same epoch, and only one of the two
+    /// may start.
+    pub(crate) restart: bool,
+    /// When `Some`, the registration must still be owned by this token, so a
+    /// claim released or taken over is not started by its former holder.
+    pub(crate) lease_token: Option<Arc<str>>,
+}
+
+/// Move a claimed row from `Queued` to `Running` right before its handler
+/// runs. The predicate pins the claim epoch, like an acknowledgement: a row
+/// that a sweep, a takeover or a release recovered in the meantime, or that
+/// another claim owns or already started, matches nothing, and the caller
+/// must not run the handler. Returns whether the row was started.
+pub(crate) fn start_task(
+    pool: PgPool,
+    claim: StartClaim,
+) -> impl Future<Output = Result<bool, Error>> + Send {
+    with_conn(pool, move |conn| {
+        conn.transaction(|conn| {
+            // The worker row is taken before the job row, like every other
+            // ownership operation, and stays locked until the start commits.
+            if claim.lease_token.is_some()
+                && !super::worker::lock_current_worker(
+                    conn,
+                    &claim.worker_id,
+                    &claim.queue,
+                    claim.lease_token.as_deref(),
+                )?
+            {
+                return Ok(false);
+            }
+            let count = sql_query(
+                "UPDATE apalis.jobs
+                 SET status = 'Running'
+                 WHERE id = $1
+                     AND job_type = $2
+                     AND lock_by = $3
+                     AND lock_at = to_timestamp($4::double precision)
+                     AND attempts = $5
+                     AND (status = 'Queued' OR ($6 AND status = 'Running'))",
+            )
+            .bind::<Text, _>(claim.task_id.to_string())
+            .bind::<Text, _>(&claim.queue)
+            .bind::<Text, _>(&claim.worker_id)
+            .bind::<BigInt, _>(claim.lock_at)
+            .bind::<Integer, _>(claim.attempts)
+            .bind::<Bool, _>(claim.restart)
+            .execute(conn)
+            .map_err(Error::database("starting task"))?;
+            Ok(count == 1)
         })
     })
 }

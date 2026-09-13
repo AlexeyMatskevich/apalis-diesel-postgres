@@ -370,7 +370,7 @@ mod tests {
     /// (`from_row.rs`), so any non-object JSONB — which a third-party writer can
     /// insert straight into `apalis.jobs`, bypassing this crate's push API —
     /// used to panic during row conversion. In the polling path that panic
-    /// fires mid-batch, stranding every co-claimed row as `Running`. Coercing
+    /// fires mid-batch, stranding every co-claimed row as `Queued`. Coercing
     /// non-object metadata to an empty object in `From<JobRow>` keeps the
     /// conversion total, matching apalis-sql's own defensive `try_into_task`.
     fn compact_metadata_json(metadata: Value) -> Result<String, String> {

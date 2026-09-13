@@ -413,6 +413,27 @@ fn job_handed_back(
     })
 }
 
+/// A claim that no handler started returns to `Pending` exactly as it was
+/// before the claim: same attempt count, no result, no completion timestamp.
+fn job_handed_back_untouched(
+    attempts: i32,
+) -> impl Fn(&Result<Outcome<ReleaseRun>, String>) -> AssertionResult {
+    observe::<ReleaseRun, _>("handed-back claim", move |run| match &run.job {
+        Some(job)
+            if job.status == "Pending"
+                && job.attempts == attempts
+                && job.lock_by.is_none()
+                && !job.done_at_present
+                && job.last_result.is_none() =>
+        {
+            Ok(())
+        }
+        other => Err(format!(
+            "expected an unowned Pending row with {attempts} attempt(s) and no result, got {other:?}"
+        )),
+    })
+}
+
 fn job_handed_back_with_earlier_result()
 -> impl Fn(&Result<Outcome<ReleaseRun>, String>) -> AssertionResult {
     observe::<ReleaseRun, _>("recovered job keeps its result", |run| match &run.job {
@@ -820,9 +841,9 @@ lets_expect! { #tokio_test
         }
         when the_worker_still_holds_a_queued_task {
             let claim = Claim::QueuedWithBudget;
-            to hands_the_task_back_and_consumes_one_attempt {
+            to hands_the_task_back_without_consuming_an_attempt {
                 released(1),
-                job_handed_back("Pending", 2),
+                job_handed_back_untouched(1),
                 registration_released()
             }
         }

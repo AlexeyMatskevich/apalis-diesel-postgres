@@ -521,6 +521,18 @@ fn reenqueue_preserves_last_result()
     })
 }
 
+fn reenqueue_leaves_no_result() -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult
+{
+    observe::<ReenqueueRun, _>("reenqueue leaves last_result empty", |run| {
+        match &run.last_result_value {
+            None => Ok(()),
+            other => Err(format!(
+                "expected a handed-back claim that never ran to keep last_result empty, got {other:?}"
+            )),
+        }
+    })
+}
+
 fn reenqueue_writes_heartbeat_marker()
 -> impl Fn(&Result<Outcome<ReenqueueRun>, String>) -> AssertionResult {
     observe::<ReenqueueRun, _>("reenqueue writes marker", |run| {
@@ -1442,34 +1454,34 @@ lets_expect! { #tokio_test
         }
         when the_task_is_queued {
             let status="Queued";
-            to requeues_the_task_and_records_the_lost_attempt {
-                reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(1),
-                reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_writes_heartbeat_marker()
+            to hands_the_task_back_without_consuming_an_attempt {
+                reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(0),
+                reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_leaves_no_result()
             }
             when a_previous_result_exists {
                 let has_last_result=true;
-                to preserves_the_previous_result_while_requeuing {
-                    reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(1),
+                to preserves_the_previous_result_while_handing_back {
+                    reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(0),
                     reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_preserves_last_result()
                 }
             }
-            when the_lost_attempt_exhausts_the_budget {
+            when one_attempt_remains {
                 let attempts=2;
-                to exhausts_the_budget_and_records_the_lost_attempt {
-                    reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
-                    reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                to hands_the_task_back_with_that_attempt_intact {
+                    reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(2),
+                    reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_leaves_no_result()
                 }
                 when a_previous_result_exists {
                     let has_last_result=true;
-                    to replaces_the_previous_result_with_the_terminal_timeout {
-                        reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
-                        reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
+                    to preserves_the_previous_result_while_handing_back {
+                        reenqueue_touched_one_row(), reenqueue_row_status("Pending"), reenqueue_row_attempts(2),
+                        reenqueue_clears_lock_by(), reenqueue_left_done_at_null(), reenqueue_preserves_last_result()
                     }
                 }
             }
             when the_attempt_budget_is_already_exhausted {
                 let attempts=3;
-                to exhausts_the_budget_and_records_the_lost_attempt {
+                to kills_the_task_that_no_claim_can_take {
                     reenqueue_touched_one_row(), reenqueue_row_status("Killed"), reenqueue_row_attempts(3),
                     reenqueue_clears_lock_by(), reenqueue_writes_heartbeat_marker(), reenqueue_stamped_completion_timestamp()
                 }

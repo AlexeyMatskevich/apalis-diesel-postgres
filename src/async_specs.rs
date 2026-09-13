@@ -211,7 +211,7 @@ fn recovered(
         let sibling_delivered = outcome.sibling.as_ref().is_some_and(|sibling| {
             sibling.args == "healthy-sibling"
                 && sibling.parts.task_id == Some(outcome.expected_sibling_id)
-                && sibling.parts.status.load() == Status::Running
+                && sibling.parts.status.load() == Status::Queued
                 && sibling.parts.ctx.lock_by().as_deref() == Some(outcome.expected_worker.as_str())
                 && sibling.parts.ctx.lock_at().is_some()
                 && sibling.parts.attempt.current() == 0
@@ -226,7 +226,7 @@ fn recovered(
             Ok(())
         } else {
             Err(AssertionError::new(vec![format!(
-                "expected the codec error then the sibling, {expected_status} after exactly one failed attempt, the original healthy sibling with Running owner/lock and attempt zero, an active worker until the whole stream is dropped; got {result:?}"
+                "expected the codec error then the sibling, {expected_status} after exactly one failed attempt, the original healthy sibling claimed (Queued) with owner/lock and attempt zero, an active worker until the whole stream is dropped; got {result:?}"
             )]))
         }
     }
@@ -242,7 +242,7 @@ fn retired_with_the_claim_intact()
             return Ok(());
         };
         if outcome.errors == ["pool", "retired"]
-            && outcome.corrupt_state.status == "Running"
+            && outcome.corrupt_state.status == "Queued"
             && outcome.corrupt_state.attempts == 0
             && outcome.sibling.is_none()
             && outcome.retired_after_next
@@ -251,7 +251,7 @@ fn retired_with_the_claim_intact()
             Ok(())
         } else {
             Err(AssertionError::new(vec![format!(
-                "expected the database error then WorkerRetired, the corrupt row still Running with no attempt consumed, no sibling delivered and the worker retired by the failed release; got {result:?}"
+                "expected the database error then WorkerRetired, the corrupt row still claimed (Queued) with no attempt consumed, no sibling delivered and the worker retired by the failed release; got {result:?}"
             )]))
         }
     }
