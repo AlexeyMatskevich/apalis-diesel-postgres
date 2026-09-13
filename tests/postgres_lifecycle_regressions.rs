@@ -1828,7 +1828,7 @@ mod attempt_accounting {
     /// and the second must observe it instead of racing it to a stale result.
     async fn acknowledge_cloned_claim_concurrently() -> Result<support::Outcome<Value>, String> {
         support::with_isolated_database(|url| async move {
-            let (pool, storage) = fixture(url, 0, 3).await?;
+            let (pool, storage) = fixture(url, 0, 3, false).await?;
             let worker = WorkerContext::new::<()>("attempt-worker");
             let mut stream = storage.poll_compact(&worker);
             let parts = next_claim(&mut stream).await?.parts;

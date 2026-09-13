@@ -622,6 +622,10 @@ fn register_worker_admin(
         // leaves its `last_seen`, `layers` and `storage_name` untouched: the
         // admin path can neither keep a foreign worker fresh nor poison its
         // observability.
+        // `clock_timestamp()` samples the wall clock after the advisory lock
+        // and the row lock are acquired: `now()` is the transaction start,
+        // and a renewal that waited behind another registration for longer
+        // than `reenqueue_orphaned_after` would otherwise be stale on commit.
         // Unlike the worker path (`register_worker_blocking`), this statement
         // always upserts exactly one row: the advisory lock is the *blocking*
         // variant (no `acquired` filter) and the conflict UPDATE carries no
@@ -633,7 +637,7 @@ fn register_worker_admin(
                  SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))
              )
              INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at)
-             SELECT $1, $2, $3, '', now(), now()
+             SELECT $1, $2, $3, '', clock_timestamp(), clock_timestamp()
              FROM registration_lock
              ON CONFLICT (id, worker_type) DO UPDATE
              SET storage_name = CASE
@@ -648,7 +652,7 @@ fn register_worker_admin(
                  END,
                  last_seen = CASE
                      WHEN apalis.workers.lease_token IS NULL
-                         THEN now()
+                         THEN clock_timestamp()
                      ELSE apalis.workers.last_seen
                  END",
         )
