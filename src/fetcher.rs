@@ -32,14 +32,24 @@ use crate::{CompactType, Config, Error, PgContext, PgPool, PgTask, PgTaskId, que
 #[derive(Debug, Clone, Default)]
 pub struct PgNotify;
 
-/// Failed releases of an undecodable claim are retried this many times, with
-/// the delay doubling from [`RELEASE_RETRY_BASE_DELAY`], before the worker's
-/// local lease is retired: about three seconds in total.
+/// A failed release of an undecodable claim is retried with the delay doubling
+/// from [`RELEASE_RETRY_BASE_DELAY`] until either [`RELEASE_RETRY_LIMIT`]
+/// retries have failed or [`RELEASE_RETRY_BUDGET`] has elapsed since the
+/// first failure, whichever comes first; then the worker's local lease is
+/// retired. The budget bounds the window when each attempt is itself slow,
+/// such as a pool checkout that times out.
 const RELEASE_RETRY_LIMIT: u32 = 5;
 const RELEASE_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const RELEASE_RETRY_BUDGET: Duration = Duration::from_secs(3);
 
 fn release_retry_delay(failures: u32) -> Duration {
     RELEASE_RETRY_BASE_DELAY * 2u32.saturating_pow(failures.saturating_sub(1))
+}
+
+/// Whether a release that has failed `failures` times, the first failure
+/// `since_first_failure` ago, has exhausted its retries.
+fn release_exhausted(failures: u32, since_first_failure: Duration) -> bool {
+    failures > RELEASE_RETRY_LIMIT || since_first_failure >= RELEASE_RETRY_BUDGET
 }
 
 /// Gate `body` behind `register`: emit the registration outcome as the first
@@ -107,6 +117,7 @@ where
         attempts: i32,
         decode_error: Error,
         failures: u32,
+        first_failure: Option<std::time::Instant>,
     }
 
     stream::unfold(
@@ -136,7 +147,10 @@ where
                             Ok(_) => return Some((Err(obligation.decode_error), (compact, None))),
                             Err(error) => {
                                 obligation.failures += 1;
-                                if obligation.failures > RELEASE_RETRY_LIMIT {
+                                let first_failure = *obligation
+                                    .first_failure
+                                    .get_or_insert_with(std::time::Instant::now);
+                                if release_exhausted(obligation.failures, first_failure.elapsed()) {
                                     // The row cannot be released and must not stay
                                     // hidden behind a live heartbeat. Retiring stops
                                     // this worker's claims and heartbeats so orphan
@@ -169,6 +183,7 @@ where
                                             attempts,
                                             decode_error,
                                             failures: 0,
+                                            first_failure: None,
                                         });
                                     }
                                     _ => return Some((Err(decode_error), (compact, None))),
@@ -1088,6 +1103,27 @@ mod tests {
                         to leaves_both_workers_active { equal((true, true)) }
                     }
                 }
+            }
+        }
+        expect(release_exhausted(failures, since_first_failure)) as a_failed_release_of_an_undecodable_claim {
+            let failures = 1;
+            let since_first_failure = Duration::ZERO;
+            to is_retried { be_false }
+            when the_last_permitted_retry_has_failed {
+                let failures = RELEASE_RETRY_LIMIT;
+                to is_retried { be_false }
+            }
+            when one_more_retry_than_permitted_has_failed {
+                let failures = RELEASE_RETRY_LIMIT + 1;
+                to gives_up { be_true }
+            }
+            when the_budget_has_elapsed_since_the_first_failure {
+                let since_first_failure = RELEASE_RETRY_BUDGET;
+                to gives_up { be_true }
+            }
+            when the_budget_is_almost_spent {
+                let since_first_failure = RELEASE_RETRY_BUDGET - Duration::from_millis(1);
+                to is_retried { be_false }
             }
         }
         expect(retired_stream_ends_without_polling_inner()) as an_already_retired_worker_stream {
