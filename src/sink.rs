@@ -14,7 +14,8 @@ use crate::{CompactType, Config, Error, PgPool, PgTask, PostgresStorage, queries
 // Wrapped in `Mutex` upstream so `PgSink: Sync` even when the inner future
 // isn't (ntex's `BlockingResult` is `Send`-only). `Mutex::get_mut` keeps the
 // hot path lock-free.
-type FlushFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>;
+type FlushFuture =
+    Pin<Box<dyn Future<Output = Result<(), queries::FlushFailure>> + Send + 'static>>;
 
 /// Buffered task sink used internally by [`PostgresStorage`]. Not part of the
 /// public API: the `Sink<PgTask>` impl lives on `PostgresStorage` itself.
@@ -107,7 +108,8 @@ impl<Args, Codec> PgSink<Args, Codec> {
     }
 
     /// Try to enqueue a single task into the buffer, returning
-    /// `Error::SinkBufferFull` when capacity has been reached.
+    /// `Error::SinkBufferFull` when capacity has been reached and
+    /// `Error::InvalidArgument` for a task that no batch could write.
     fn try_push(&mut self, item: PgTask<CompactType>) -> Result<(), Error> {
         if self.failed {
             return Err(Error::SinkFailed);
@@ -116,6 +118,9 @@ impl<Args, Codec> PgSink<Args, Codec> {
         if self.buffer.len() >= cap {
             return Err(Error::SinkBufferFull(cap));
         }
+        // A rejected task never enters the buffer, so a buffered batch can
+        // only fail for database reasons.
+        queries::validate_task(&self.config, &item)?;
         self.buffer.push(item);
         Ok(())
     }
@@ -123,7 +128,11 @@ impl<Args, Codec> PgSink<Args, Codec> {
     /// Drive the buffered batch toward completion. Starts a new flush future
     /// when none is in flight and the buffer is non-empty; otherwise polls the
     /// existing future. Successful completion covers any tasks accepted while
-    /// that future was pending; a failed write permanently fails this pipeline.
+    /// that future was pending. A flush that issued its statement and failed
+    /// permanently fails this pipeline: the batch may have been written. A
+    /// flush that could not obtain a connection hands the batch back to the
+    /// buffer, and one refused by validation drops it; both leave the
+    /// pipeline usable because nothing was written.
     fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         if self.failed {
             return Poll::Ready(Err(Error::SinkFailed));
@@ -145,11 +154,23 @@ impl<Args, Codec> PgSink<Args, Codec> {
                 let pool = self.pool.clone();
                 let config = self.config.clone();
                 let buffer = std::mem::take(&mut self.buffer);
-                Box::pin(queries::push_tasks(pool, config, buffer))
+                Box::pin(queries::flush_tasks(pool, config, buffer))
             });
             match future.poll_unpin(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => {
+                Poll::Ready(Err(queries::FlushFailure::NotStarted { mut tasks, error })) => {
+                    // Nothing was issued: the batch precedes any task accepted
+                    // while it was in flight, so ordering is preserved.
+                    *flush_future = None;
+                    tasks.append(&mut self.buffer);
+                    self.buffer = tasks;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Err(queries::FlushFailure::Rejected(error))) => {
+                    *flush_future = None;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Err(queries::FlushFailure::Uncertain(error))) => {
                     self.failed = true;
                     *flush_future = None;
                     return Poll::Ready(Err(error));
@@ -253,8 +274,9 @@ mod tests {
 
     fn poll_ready_in_flight() -> ReadyObservation {
         let mut storage = storage(2);
-        storage.sink.flush_future =
-            Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
+        storage.sink.flush_future = Mutex::new(Some(Box::pin(future::pending::<
+            Result<(), queries::FlushFailure>,
+        >())));
         let mut cx = Context::from_waker(noop_waker_ref());
         let poll = Pin::new(&mut storage).poll_ready(&mut cx);
         let has_flush_future = storage
@@ -271,11 +293,14 @@ mod tests {
     }
 
     /// `poll_flush_observation` captures the state of `poll_flush_sink` after a
-    /// single poll: the poll result and whether the in-flight future was cleared.
+    /// single poll: the poll result, whether the in-flight future was cleared,
+    /// the buffer length and whether the pipeline failed permanently.
+    #[derive(Debug)]
     struct FlushObservation {
         poll: Poll<Result<(), Error>>,
         future_cleared: bool,
         buffer_len: usize,
+        failed: bool,
     }
 
     fn poll_flush_sink_with_state(
@@ -299,6 +324,7 @@ mod tests {
             poll,
             future_cleared,
             buffer_len: sink.buffer.len(),
+            failed: sink.failed,
         }
     }
 
@@ -306,12 +332,92 @@ mod tests {
         poll_flush_sink_with_state(1, 0, None)
     }
 
-    fn poll_flush_in_flight_ready(result: Result<(), Error>) -> FlushObservation {
-        poll_flush_sink_with_state(1, 0, Some(Box::pin(future::ready(result))))
+    #[derive(Clone, Copy)]
+    enum FlushOutcome {
+        Written,
+        ConnectionUnavailable,
+        RejectedBeforeStatement,
+        FailedAfterStatement,
+    }
+
+    /// An in-flight flush of a two-task batch resolves. For a failure, one
+    /// more task was accepted into the buffer behind it, so the observation
+    /// shows where the batch ends up relative to that task. A success
+    /// continues with buffered work on a runtime (`buffered_enqueue_flush`),
+    /// so it resolves with an empty buffer here.
+    fn poll_flush_in_flight_ready(outcome: FlushOutcome) -> FlushObservation {
+        let behind = usize::from(!matches!(outcome, FlushOutcome::Written));
+        let result = match outcome {
+            FlushOutcome::Written => Ok(()),
+            FlushOutcome::ConnectionUnavailable => Err(queries::FlushFailure::NotStarted {
+                tasks: vec![task(), task()],
+                error: Error::SinkBufferFull(1),
+            }),
+            FlushOutcome::RejectedBeforeStatement => {
+                Err(queries::FlushFailure::Rejected(Error::SinkBufferFull(1)))
+            }
+            FlushOutcome::FailedAfterStatement => {
+                Err(queries::FlushFailure::Uncertain(Error::SinkBufferFull(1)))
+            }
+        };
+        poll_flush_sink_with_state(4, behind, Some(Box::pin(future::ready(result))))
     }
 
     fn poll_flush_in_flight_pending() -> FlushObservation {
         poll_flush_sink_with_state(1, 0, Some(Box::pin(future::pending())))
+    }
+
+    #[derive(Clone, Copy)]
+    enum Cap {
+        None,
+        Payload,
+        Metadata,
+        IdempotencyKey,
+        RunAt,
+        QueueName,
+    }
+
+    /// `start_send` with a task that violates one cap, behind one already
+    /// buffered task. Returns the send result and the buffer length after it.
+    fn start_send_violating(cap: Cap) -> (Result<(), Error>, usize) {
+        let queue = if matches!(cap, Cap::QueueName) {
+            "q".repeat(queries::MAX_QUEUE_NAME_LEN + 1)
+        } else {
+            "sink-unit".to_owned()
+        };
+        let mut storage = PostgresStorage::<Vec<u8>>::new_with_config(
+            &unreachable_pool(),
+            &Config::new(&queue).set_buffer_size(4),
+        );
+        storage.sink.buffer.push(task());
+        let mut item = task();
+        match cap {
+            Cap::None | Cap::QueueName => {}
+            Cap::Payload => item.args = vec![0; queries::MAX_JOB_PAYLOAD_LEN + 1],
+            Cap::Metadata => {
+                let mut meta = item.parts.ctx.meta().clone();
+                meta.insert(
+                    "blob".to_owned(),
+                    serde_json::Value::String("m".repeat(queries::MAX_METADATA_PAYLOAD_LEN)),
+                );
+                item.parts.ctx = item.parts.ctx.with_meta(meta);
+            }
+            Cap::IdempotencyKey => {
+                item.parts.idempotency_key = Some("k".repeat(queries::MAX_IDEMPOTENCY_KEY_LEN + 1));
+            }
+            Cap::RunAt => item.parts.run_at = u64::MAX,
+        }
+        let result = Pin::new(&mut storage).start_send(item);
+        (result, storage.sink.buffer.len())
+    }
+
+    fn rejected_without_buffering(observation: &(Result<(), Error>, usize)) -> AssertionResult {
+        match observation {
+            (Err(Error::InvalidArgument(_)), 1) => Ok(()),
+            other => Err(AssertionError::new(vec![format!(
+                "expected InvalidArgument with the buffer unchanged, got {other:?}"
+            )])),
+        }
     }
 
     /// `poll_flush_creates_future` exercises the `flush_future.is_none() &&
@@ -347,7 +453,9 @@ mod tests {
     fn cloned_sink_state_drops_flush_future() -> bool {
         let mut sink = sink(3);
         sink.buffer.push(task());
-        sink.flush_future = Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
+        sink.flush_future = Mutex::new(Some(Box::pin(future::pending::<
+            Result<(), queries::FlushFailure>,
+        >())));
         sink.clone()
             .flush_future
             .get_mut()
@@ -380,8 +488,9 @@ mod tests {
                 .push(PgTask::new(RETYPE_SENTINEL.to_vec()));
         }
         if flush_in_flight {
-            storage.sink.flush_future =
-                Mutex::new(Some(Box::pin(future::pending::<Result<(), Error>>())));
+            storage.sink.flush_future = Mutex::new(Some(Box::pin(future::pending::<
+                Result<(), queries::FlushFailure>,
+            >())));
         }
         let mut retyped = storage.with_codec::<()>();
         let kept_in_flight_flush = retyped
@@ -484,18 +593,24 @@ mod tests {
         }
     }
 
-    /// Asserts the flush surfaced the *specific* error propagated out of the
-    /// flush future, with the future cleared. `poll_flush_inner` returns the
-    /// future's result verbatim (`Poll::Ready(result)`), so injecting
-    /// `SinkBufferFull(1)` must surface exactly that variant — a regression that
-    /// substitutes a different `Err` would slip past a wildcard `Err(_)` match.
+    /// Asserts the flush surfaced the *specific* error carried by the flush
+    /// failure, with the future cleared. Injecting `SinkBufferFull(1)` must
+    /// surface exactly that variant — a regression that substitutes a
+    /// different `Err` would slip past a wildcard `Err(_)` match. The buffer
+    /// length and the permanent-failure flag distinguish the phases.
     fn observation_surfaces_buffer_full_at(
         expected: usize,
+        buffer_len: usize,
+        failed: bool,
     ) -> impl Fn(&FlushObservation) -> AssertionResult {
-        move |obs| match (&obs.poll, obs.future_cleared) {
-            (Poll::Ready(Err(Error::SinkBufferFull(c))), true) if *c == expected => Ok(()),
-            other => Err(AssertionError::new(vec![format!(
-                "expected Ready(Err(SinkBufferFull({expected}))) with cleared future, got {other:?}"
+        move |obs| match (&obs.poll, obs.future_cleared, obs.buffer_len, obs.failed) {
+            (Poll::Ready(Err(Error::SinkBufferFull(c))), true, len, flag)
+                if *c == expected && len == buffer_len && flag == failed =>
+            {
+                Ok(())
+            }
+            _ => Err(AssertionError::new(vec![format!(
+                "expected Ready(Err(SinkBufferFull({expected}))) with cleared future, {buffer_len} buffered and failed={failed}, got {obs:?}"
             )])),
         }
     }
@@ -637,8 +752,8 @@ mod tests {
             }
         }
 
-        expect(poll_flush_in_flight_ready(result)) as completed_enqueue_flush {
-            let result = Ok(());
+        expect(poll_flush_in_flight_ready(outcome)) as completed_enqueue_flush {
+            let outcome = FlushOutcome::Written;
 
             when the_in_flight_flush_resolves_successfully {
                 to returns_ready_ok_and_clears_the_future {
@@ -646,11 +761,50 @@ mod tests {
                 }
             }
 
-            when the_in_flight_flush_resolves_with_an_error {
-                let result = Err(Error::SinkBufferFull(1));
-                to surfaces_the_error_and_clears_the_future {
-                    observation_surfaces_buffer_full_at(1)
+            when the_in_flight_flush_could_not_obtain_a_connection {
+                let outcome = FlushOutcome::ConnectionUnavailable;
+                to surfaces_the_error_once_and_keeps_the_batch_ahead_of_later_tasks {
+                    observation_surfaces_buffer_full_at(1, 3, false)
                 }
+            }
+
+            when the_in_flight_flush_was_rejected_before_any_statement {
+                let outcome = FlushOutcome::RejectedBeforeStatement;
+                to surfaces_the_error_and_keeps_the_pipeline_usable {
+                    observation_surfaces_buffer_full_at(1, 1, false)
+                }
+            }
+
+            when the_in_flight_flush_failed_after_its_statement_was_issued {
+                let outcome = FlushOutcome::FailedAfterStatement;
+                to surfaces_the_error_and_fails_the_pipeline {
+                    observation_surfaces_buffer_full_at(1, 1, true)
+                }
+            }
+        }
+
+        expect(start_send_violating(cap)) as validated_enqueue {
+            let cap = Cap::None;
+            to buffers_a_task_within_every_cap { have(1) equal(2) }
+            when the_payload_exceeds_its_cap {
+                let cap = Cap::Payload;
+                to rejects_the_task_without_buffering_it { rejected_without_buffering }
+            }
+            when the_metadata_exceeds_its_cap {
+                let cap = Cap::Metadata;
+                to rejects_the_task_without_buffering_it { rejected_without_buffering }
+            }
+            when the_idempotency_key_exceeds_its_cap {
+                let cap = Cap::IdempotencyKey;
+                to rejects_the_task_without_buffering_it { rejected_without_buffering }
+            }
+            when the_run_at_is_unrepresentable {
+                let cap = Cap::RunAt;
+                to rejects_the_task_without_buffering_it { rejected_without_buffering }
+            }
+            when the_queue_name_exceeds_its_cap {
+                let cap = Cap::QueueName;
+                to rejects_the_task_without_buffering_it { rejected_without_buffering }
             }
         }
 

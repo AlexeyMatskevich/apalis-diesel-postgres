@@ -83,9 +83,9 @@ async fn decode_cleanup(
     invalid.parts.ctx = crate::PgContext::new().with_max_attempts(max_attempts);
     let mut sibling = PgTask::new(serde_json::to_vec("healthy-sibling").unwrap());
     sibling.parts.task_id = Some(expected_sibling_id);
-    queries::push_tasks(pool.clone(), config.clone(), vec![invalid, sibling])
+    queries::flush_tasks(pool.clone(), config.clone(), vec![invalid, sibling])
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|failure| failure.into_error().to_string())?;
     let mut claimed = queries::fetch_next(
         pool.clone(),
         config.clone(),
