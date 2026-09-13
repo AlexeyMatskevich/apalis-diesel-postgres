@@ -107,7 +107,9 @@ async fn insert_running_row(
                 sql_query(
                     "INSERT INTO apalis.jobs (
                         id, job_type, job, status, attempts, max_attempts, run_at, lock_by, lock_at, last_result
-                    ) VALUES ($1, $2, $3, $4, $5, $6, now() - INTERVAL '1 second', $7, $8, $9)",
+                    ) VALUES ($1, $2, $3, $4, $5, $6, now() - INTERVAL '1 second',
+                        CASE WHEN $4 = 'Pending' THEN NULL ELSE $7 END,
+                        CASE WHEN $4 = 'Pending' THEN NULL ELSE $8 END, $9)",
                 )
                 .bind::<Text, _>(id.to_string())
                 .bind::<Text, _>(&queue)
@@ -125,7 +127,9 @@ async fn insert_running_row(
                 sql_query(
                     "INSERT INTO apalis.jobs (
                         id, job_type, job, status, attempts, max_attempts, run_at, lock_by, lock_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, now() - INTERVAL '1 second', $7, $8)",
+                    ) VALUES ($1, $2, $3, $4, $5, $6, now() - INTERVAL '1 second',
+                        CASE WHEN $4 = 'Pending' THEN NULL ELSE $7 END,
+                        CASE WHEN $4 = 'Pending' THEN NULL ELSE $8 END)",
                 )
                 .bind::<Text, _>(id.to_string())
                 .bind::<Text, _>(&queue)

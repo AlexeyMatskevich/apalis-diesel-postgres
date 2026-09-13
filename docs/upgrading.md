@@ -2,9 +2,21 @@
 
 ## Upgrading from 0.5.0
 
-No schema change. Two behaviours of the running system change; see the
+One schema change and two behaviours of the running system change; see the
 [lifecycle reference](lifecycle.md) for the protocol they belong to.
 
+- Migration `20260914000000_task_state_shape` adds the constraint
+  `jobs_state_shape_check`: a `Pending` row carries no owner columns, and a
+  `Queued` or `Running` row carries both `lock_by` and `lock_at`. Before
+  validating it, the migration clears stale owner columns from `Pending`
+  rows and recovers active rows whose claim has no timestamp as lost
+  executions, consuming one attempt within the budget (`Pending` or
+  `Killed`). Complete claims and terminal history are untouched. Run `setup`;
+  constraint validation scans `jobs` under the DDL lock until the series
+  commits, so plan a maintenance window for large tables. The down migration
+  removes the constraint and keeps the repaired rows. The current series
+  has fourteen versions; a journal-less thirteen-version catalog is adopted
+  like the eleven-version generation and completed.
 - A `Config` whose `keep_alive` is zero or not shorter than
   `reenqueue_orphaned_after` is refused at registration with
   `InvalidArgument`. Such a worker was stale between its own heartbeats and
@@ -128,8 +140,8 @@ async fn migrate(pool: &PgPool) -> Result<(), Error> {
 ```
 
 For the complete 0.4.1 schema, setup adopts eight known versions into its private
-journal and executes the five additional embedded migrations. The resulting
-current series has thirteen versions. Schema recognition determines this path;
+journal and executes the six additional embedded migrations. The resulting
+current series has fourteen versions. Schema recognition determines this path;
 changing the application's crate version alone does not migrate the database.
 
 Do not copy or move `public.__diesel_schema_migrations`, manually insert version
@@ -260,6 +272,22 @@ restores the pre-upgrade state. The down migration removes the new constraint
 and function guard, but cannot reconstruct ownership or history repaired by a
 previously committed upgrade.
 
+### Claim shape update
+
+Migration `20260914000000_task_state_shape` adds the invariant that a
+`Pending` row has no owner columns and that every `Queued` or `Running` row
+has both `lock_by` and `lock_at`. Before validating the constraint it clears
+stale owner columns from `Pending` rows, and treats an active row whose claim
+has no timestamp as a lost execution, like the ownership repairs above: one
+attempt is consumed within the retry budget and the row becomes `Pending` or
+`Killed`. Claims with a complete timestamp and all terminal history, including
+the last owner a completed row names, are preserved.
+
+Run `setup` to apply the migration. Constraint validation scans `jobs` under
+the DDL lock until the complete setup transaction commits; plan a maintenance
+window for large tables. The down migration removes the constraint and keeps
+the repaired rows; it cannot restore a claim timestamp that never existed.
+
 ## Direct middleware acknowledgement
 
 `PgMiddleware` now uses the attempt history returned by each SQL claim for
@@ -292,13 +320,14 @@ This acknowledgement change requires no schema migration.
   its required structure and adopt the fixed eleven known versions privately.
   Preserve application data and any public journal, then execute later migrations.
   This also works without a public journal. Even if a raw harness already applied
-  `20260912000000_worker_key_share` or
-  `20260912000001_require_active_owner`, setup adopts only the eleven-version
-  generation and safely reapplies both later, idempotent migrations. A missing
-  active-owner constraint without a journal is structurally indistinguishable
-  from the supported previous generation; adoption does not prove provenance.
-  An existing incorrect or unvalidated constraint is rejected. With a current
-  private journal, a missing constraint is also rejected.
+  `20260912000000_worker_key_share`, `20260912000001_require_active_owner` or
+  `20260914000000_task_state_shape`, setup adopts only the eleven-version
+  generation and safely reapplies the later, idempotent migrations. A missing
+  active-owner or state-shape constraint without a journal is structurally
+  indistinguishable from the supported previous generation; adoption does not
+  prove provenance. An existing incorrect or unvalidated constraint is
+  rejected. With a current private journal, a missing constraint is also
+  rejected.
 - That crate's initial schema, or the bytea/JSONB schema of
   `apalis-postgres 1.0.0-rc.8` after all 19 upstream migrations: run the guarded
   legacy transition. Older upstream JSONB job/`last_error` generations must first

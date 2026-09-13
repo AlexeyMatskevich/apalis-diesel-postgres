@@ -382,8 +382,9 @@ fn downgrade(conn: &mut PgConnection) -> Result<(), String> {
         conn.batch_execute("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('apalis_diesel_postgres'),pg_catalog.hashtext('migrations'));
             SET LOCAL search_path=apalis_diesel_postgres,pg_catalog,pg_temp")?;
         // Restore generation 11, whose SQL claim still owns the SHARE fence.
-        // Generation 13 adds the active-owner invariant above generation 12.
-        for expected in ["20260912000001", "20260912000000"] {
+        // Generation 13 adds the active-owner invariant above generation 12,
+        // and generation 14 the claim-shape invariant above that.
+        for expected in ["20260914000000", "20260912000001", "20260912000000"] {
             let reverted = conn.revert_last_migration(MIGRATIONS)?;
             if reverted.to_string() != expected {
                 return Err(format!("expected migration {expected}, reverted {reverted}").into());
@@ -572,10 +573,10 @@ lets_expect! {
         let generation = Generation::Current;
         let ready = false;
         when the_current_migrations_are_installed {
-            to allows_heartbeat_after_an_empty_claim { equals(compatibility_result(false,ready,13)) }
+            to allows_heartbeat_after_an_empty_claim { equals(compatibility_result(false,ready,14)) }
             when a_task_is_ready {
                 let ready = true;
-                to queues_the_task_and_allows_heartbeat { equals(compatibility_result(false,ready,13)) }
+                to queues_the_task_and_allows_heartbeat { equals(compatibility_result(false,ready,14)) }
             }
         }
         when the_new_migration_is_reverted {
@@ -588,10 +589,10 @@ lets_expect! {
         }
         when the_migration_is_reapplied {
             let generation = Generation::Reapplied;
-            to restores_concurrent_heartbeat_for_an_empty_claim { equals(compatibility_result(false,ready,13)) }
+            to restores_concurrent_heartbeat_for_an_empty_claim { equals(compatibility_result(false,ready,14)) }
             when a_task_is_ready {
                 let ready = true;
-                to restores_concurrent_heartbeat_and_preserves_queueing { equals(compatibility_result(false,ready,13)) }
+                to restores_concurrent_heartbeat_and_preserves_queueing { equals(compatibility_result(false,ready,14)) }
             }
         }
     }

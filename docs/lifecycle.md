@@ -46,14 +46,15 @@ Enforced by the schema, so no writer can violate them:
 - A `Queued` or `Running` row names an owner (`lock_by IS NOT NULL`), and
   that owner is a registration of the same queue (foreign key
   `jobs_lock_by_worker_type_fkey`).
+- A `Queued` or `Running` row carries the complete claim, `lock_by` and
+  `lock_at`, and a `Pending` row carries neither (`jobs_state_shape_check`).
 - `(job_type, idempotency_key)` is unique while the key is not null.
 
 Maintained by every operation of this crate, but not enforced by the schema
 (a writer with table access can break them; the claim and recovery
 predicates tolerate the result as described in section 3):
 
-- An active row (`Queued`, `Running`) also has `lock_at`.
-- A `Pending` row has no owner and no `done_at`.
+- A `Pending` row has no `done_at`.
 - `Done` and `Killed` rows have `done_at`.
 - `attempts` never decreases. A migration repair and an administrator
   restoring retry budget are the only writers that change it otherwise.

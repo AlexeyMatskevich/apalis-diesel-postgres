@@ -37,6 +37,17 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   `AbortError` before the handler runs again, and `PgAck` returns it for a
   repeated manual acknowledgement of the same claim snapshot.
 
+### Changed (breaking)
+
+- Migration `20260914000000_task_state_shape` adds the constraint
+  `jobs_state_shape_check`: a `Pending` row carries no owner columns and a
+  `Queued` or `Running` row carries both `lock_by` and `lock_at`. Existing
+  `Pending` rows lose stale owner columns, and active rows whose claim has no
+  timestamp are recovered as lost executions with one attempt consumed. Run
+  `setup` and follow the maintenance guidance in
+  [the upgrade guide](docs/upgrading.md). The series now has fourteen
+  versions; a journal-less thirteen-version catalog is adopted and completed.
+
 ### Changed
 
 - Registration and the heartbeat stream refuse a schedule that cannot keep

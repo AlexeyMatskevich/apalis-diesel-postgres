@@ -129,7 +129,7 @@ async fn migration_scenario(kind: Scenario) -> Result<Outcome<Observations>, Str
                 out.check("uninitialized verification fails", matches!(verify_schema(&pool).await, Err(Error::Migration(_))));
                 setup(&pool).await.map_err(|e| e.to_string())?;
                 out.check("verification accepts the completed schema", verify_schema(&pool).await.is_ok());
-                out.check("all migrations are recorded privately", count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+                out.check("all migrations are recorded privately", count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 14);
                 out.check("search_path is restored", count(&pool, "SELECT (current_setting('search_path') = '\"$user\", public')::integer::bigint AS n").await? == 1);
                 if matches!(kind, Scenario::ForeignHistory) {
                     out.check("foreign history is unchanged", count(&pool, "SELECT count(*)::bigint AS n FROM public.__diesel_schema_migrations WHERE version='00000000000000'").await? == 1);
@@ -166,15 +166,16 @@ async fn migration_scenario(kind: Scenario) -> Result<Outcome<Observations>, Str
                     out.check("retry succeeds after explicit dependency resolution", verify_schema(&pool).await.is_ok());
                 } else {
                     sql(&pool, "INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('worker','other','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,lock_by,done_at,last_result) SELECT s,'target',decode('22','hex'),s,3,3,'worker','2020-01-01'::timestamptz,'\"retained\"'::jsonb FROM unnest(ARRAY['Pending','Queued','Running','Done','Failed','Killed']) s; INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,lock_by) VALUES ('has-budget','target',decode('22','hex'),'Running',0,3,'worker'),('no-owner','target',decode('22','hex'),'Running',0,3,NULL)").await?;
-                    sql(&pool,"INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('healthy','target','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,lock_by) VALUES ('healthy','target',decode('22','hex'),'Running',0,3,'healthy')").await?;
+                    sql(&pool,"INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('healthy','target','fixture'); INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,lock_by,lock_at) VALUES ('healthy','target',decode('22','hex'),'Running',0,3,'healthy','2020-01-01'),('no-timestamp','target',decode('22','hex'),'Running',0,3,'healthy',NULL)").await?;
                     setup(&pool).await.map_err(|e| e.to_string())?;
-                    out.check("valid legacy attribution is retained",count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id='healthy' AND status='Running' AND attempts=0 AND lock_by='healthy'").await? == 1);
+                    out.check("valid legacy attribution is retained",count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id='healthy' AND status='Running' AND attempts=0 AND lock_by='healthy' AND lock_at='2020-01-01'::timestamptz").await? == 1);
+                    out.check("a claim without a timestamp is recovered as a lost execution",count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id='no-timestamp' AND status='Pending' AND attempts=1 AND lock_by IS NULL AND lock_at IS NULL AND done_at IS NULL AND last_result ? 'Err'").await? == 1);
                     out.check("upstream schema verifies after upgrade", verify_schema(&pool).await.is_ok());
                     out.check("terminal status and history survive", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id IN ('Done','Failed','Killed','Pending') AND status=id AND attempts=3 AND last_result='\"retained\"'::jsonb AND done_at='2020-01-01'::timestamptz AND lock_by IS NULL").await? == 4);
                     out.check("exhausted active executions become terminal", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id IN ('Running','Queued') AND status='Killed' AND attempts=3 AND done_at IS NOT NULL AND last_result ? 'Err' AND lock_by IS NULL").await? == 2);
                     out.check("lost active executions consume one attempt and recover", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id IN ('has-budget','no-owner') AND status='Pending' AND attempts=1 AND done_at IS NULL AND lock_by IS NULL").await? == 2);
                     sql(&pool,"INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES ('new','target','fixture')").await?;
-                    out.check("only jobs with remaining budget can be claimed", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.get_jobs('new','target',100)").await? == 2);
+                    out.check("only jobs with remaining budget can be claimed", count(&pool,"SELECT count(*)::bigint AS n FROM apalis.get_jobs('new','target',100)").await? == 3);
                 }
             }
             Scenario::Unsupported => {
@@ -204,7 +205,7 @@ async fn migration_scenario(kind: Scenario) -> Result<Outcome<Observations>, Str
                 }
                 for racer in racers { racer.await.map_err(|e|e.to_string())??; }
                 out.check("all racers produce one valid schema",verify_schema(&pool).await.is_ok());
-                out.check("history contains one copy of every migration",count(&pool,"SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+                out.check("history contains one copy of every migration",count(&pool,"SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 14);
             }
             Scenario::DowngradeCollision | Scenario::DowngradeUnique => {
                 setup(&pool).await.map_err(|e|e.to_string())?;
@@ -221,6 +222,7 @@ async fn migration_scenario(kind: Scenario) -> Result<Outcome<Observations>, Str
                     sql(&pool,include_str!("../migrations/20260910000001_listing_id_tie_breaker/up.sql")).await?;
                     sql(&pool,include_str!("../migrations/20260912000000_worker_key_share/up.sql")).await?;
                     sql(&pool,include_str!("../migrations/20260912000001_require_active_owner/up.sql")).await?;
+                    sql(&pool,include_str!("../migrations/20260914000000_task_state_shape/up.sql")).await?;
                     out.check("supported downgrade can be upgraded again",verify_schema(&pool).await.is_ok());
                 }
             }
@@ -414,7 +416,7 @@ async fn listing_index_upgrade(panics: bool) -> Result<Outcome<Observations>, St
         out.check("upgrade installs both complete descending listing indexes", listing_indexes_match(&observer, ", id DESC").await?);
         out.check("the upgraded schema verifies", verify_schema(&observer).await.is_ok());
         out.check("upgrade preserves all original data and journal timestamps", listing_data_and_history(&observer).await? == before);
-        out.check("upgrade records exactly thirteen migrations", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+        out.check("upgrade records exactly fourteen migrations", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 14);
         let upgraded_history = catalog_text(&observer, "SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM apalis_diesel_postgres.__diesel_schema_migrations h").await?;
         out.check("repeated setup succeeds on the same pool", setup(&migrator).await.is_ok());
         out.check("repeated setup preserves the complete index contract", listing_indexes_match(&observer, ", id DESC").await?);
@@ -429,7 +431,7 @@ async fn listing_index_upgrade(panics: bool) -> Result<Outcome<Observations>, St
             }).await?;
             out.check("down restores exactly both previous index definitions", listing_indexes_match(&observer, "").await?);
             out.check("down preserves data and all previous journal records", listing_data_and_history(&observer).await? == before);
-            out.check("down removes only the listing migration record", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 12);
+            out.check("down removes only the listing migration record", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
             setup(&migrator).await.map_err(|error| error.to_string())?;
             out.check("public setup upgrades the downgraded schema again", verify_schema(&observer).await.is_ok() && listing_indexes_match(&observer, ", id DESC").await?);
             out.check("reupgrade preserves application data and old history", listing_data_and_history(&observer).await? == before);
@@ -465,11 +467,12 @@ async fn reconciliation_downgrade(install: Install) -> Result<Outcome<Observatio
         let upgraded = catalog_text(&pool, dequeue).await?;
         with_conn(pool.clone(), |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                conn.batch_execute(include_str!("../migrations/20260914000000_task_state_shape/down.sql"))?;
                 conn.batch_execute(include_str!("../migrations/20260912000001_require_active_owner/down.sql"))?;
                 conn.batch_execute(include_str!("../migrations/20260912000000_worker_key_share/down.sql"))?;
                 conn.batch_execute(include_str!("../migrations/20260910000001_listing_id_tie_breaker/down.sql"))?;
                 conn.batch_execute(include_str!("../migrations/20260910000000_reconcile_schema_contract/down.sql"))?;
-                conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version IN ('20260912000001','20260912000000','20260910000001','20260910000000')")
+                conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version IN ('20260914000000','20260912000001','20260912000000','20260910000001','20260910000000')")
             }).map_err(|e| e.to_string())
         }).await?;
         out.check(
@@ -533,7 +536,7 @@ async fn listing_index_verification(
         }
         sql(&pool, change).await?;
         let mut out = Observations::new();
-        out.check("every migration remains recorded despite index drift", count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+        out.check("every migration remains recorded despite index drift", count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 14);
         let verification = verify_schema(&pool).await;
         out.check(&format!("verify identifies only the damaged listing index: {verification:?}"), reports_index_contract(&verification, index));
         let repeated_setup = setup(&pool).await;
@@ -788,6 +791,7 @@ lets_expect! { #tokio_test
 #[derive(Clone, Copy)]
 enum UnjournaledGeneration {
     KnownFinal,
+    ActiveOwner,
     Latest,
 }
 
@@ -795,11 +799,13 @@ enum UnjournaledGeneration {
 struct ObserveWorkerMigration {
     worker: Arc<AtomicUsize>,
     owner: Arc<AtomicUsize>,
+    shape: Arc<AtomicUsize>,
 }
 impl CustomizeConnection<PgConnection, diesel::r2d2::Error> for ObserveWorkerMigration {
     fn on_acquire(&self, conn: &mut PgConnection) -> Result<(), diesel::r2d2::Error> {
         let worker_calls = self.worker.clone();
         let owner_calls = self.owner.clone();
+        let shape_calls = self.shape.clone();
         conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
             if let InstrumentationEvent::FinishQuery {
                 query, error: None, ..
@@ -814,6 +820,9 @@ impl CustomizeConnection<PgConnection, diesel::r2d2::Error> for ObserveWorkerMig
                     } else {
                         worker_calls.fetch_add(1, Ordering::SeqCst);
                     }
+                }
+                if query.contains("ADD CONSTRAINT jobs_state_shape_check") {
+                    shape_calls.fetch_add(1, Ordering::SeqCst);
                 }
             }
         });
@@ -833,14 +842,20 @@ async fn unjournaled_final_schema(
         // calling setup and without manufacturing private migration records.
         with_conn(observer.clone(), move |conn| {
             let mut migrations = conn.pending_migrations(MIGRATIONS).map_err(|e| e.to_string())?;
-            if matches!(generation, UnjournaledGeneration::KnownFinal) {
-                migrations.retain(|migration| migration.name().version().to_string().as_str() <= LISTING_MIGRATION_VERSION);
+            match generation {
+                UnjournaledGeneration::KnownFinal => migrations.retain(|migration| migration.name().version().to_string().as_str() <= LISTING_MIGRATION_VERSION),
+                UnjournaledGeneration::ActiveOwner => migrations.retain(|migration| migration.name().version().to_string().as_str() <= ACTIVE_OWNER_MIGRATION_VERSION),
+                UnjournaledGeneration::Latest => {}
             }
             conn.run_migrations(&migrations).map_err(|e| e.to_string())?;
             Ok(())
         }).await?;
         let mut out = Observations::new();
-        let expected_public_count = if matches!(generation, UnjournaledGeneration::KnownFinal) { 11 } else { 13 };
+        let expected_public_count = match generation {
+            UnjournaledGeneration::KnownFinal => 11,
+            UnjournaledGeneration::ActiveOwner => 13,
+            UnjournaledGeneration::Latest => 14,
+        };
         out.check("raw harness applied the intended generation", count(&observer, "SELECT count(*)::bigint AS n FROM public.__diesel_schema_migrations").await? == expected_public_count);
         if !public_history {
             sql(&observer, "DROP TABLE public.__diesel_schema_migrations").await?;
@@ -856,13 +871,15 @@ async fn unjournaled_final_schema(
         out.check("fixture has no private namespace", absent_private_schema(&observer).await?);
         let migration_calls = Arc::new(AtomicUsize::new(0));
         let owner_migration_calls = Arc::new(AtomicUsize::new(0));
+        let shape_migration_calls = Arc::new(AtomicUsize::new(0));
         let callers = if concurrent { 4 } else { 1 };
         let barrier = Arc::new(tokio::sync::Barrier::new(callers));
         let mut racers = Vec::new();
         for _ in 0..callers {
             let calls = migration_calls.clone();
             let owner_calls = owner_migration_calls.clone();
-            let migrator = build_pool_with(&url, |builder| builder.max_size(1).connection_customizer(Box::new(ObserveWorkerMigration { worker: calls, owner: owner_calls }))).map_err(|e| e.to_string())?;
+            let shape_calls = shape_migration_calls.clone();
+            let migrator = build_pool_with(&url, |builder| builder.max_size(1).connection_customizer(Box::new(ObserveWorkerMigration { worker: calls, owner: owner_calls, shape: shape_calls }))).map_err(|e| e.to_string())?;
             let barrier = barrier.clone();
             racers.push(async move { barrier.wait().await; setup(&migrator).await });
         }
@@ -870,12 +887,12 @@ async fn unjournaled_final_schema(
         if damaged {
             out.check("unsupported damage is reported", results.iter().all(|result| matches!(result, Err(Error::Migration(error)) if error.to_string().contains("jobs_list_all_idx"))));
             out.check("rejected adoption rolls back its private namespace", absent_private_schema(&observer).await?);
-            out.check("rejected adoption never executes later migrations", migration_calls.load(Ordering::SeqCst) == 0 && owner_migration_calls.load(Ordering::SeqCst) == 0);
+            out.check("rejected adoption never executes later migrations", migration_calls.load(Ordering::SeqCst) == 0 && owner_migration_calls.load(Ordering::SeqCst) == 0 && shape_migration_calls.load(Ordering::SeqCst) == 0);
         } else {
             out.check("every setup accepts the complete catalog", results.iter().all(Result::is_ok));
             out.check("adopted schema verifies", verify_schema(&observer).await.is_ok());
-            out.check("fixed eleven-version adoption executes each later migration exactly once", migration_calls.load(Ordering::SeqCst) == 1 && owner_migration_calls.load(Ordering::SeqCst) == 1);
-            out.check("private history records all thirteen migrations", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 13);
+            out.check("fixed eleven-version adoption executes each later migration exactly once", migration_calls.load(Ordering::SeqCst) == 1 && owner_migration_calls.load(Ordering::SeqCst) == 1 && shape_migration_calls.load(Ordering::SeqCst) == 1);
+            out.check("private history records all fourteen migrations", count(&observer, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 14);
             out.check("the upgraded SQL function rejects NULL ownership", catalog_text(&observer, "SELECT pg_get_functiondef('apalis.get_jobs(text,text,integer)'::regprocedure)::text AS value").await?.contains("worker_id must not be null"));
             out.check("the upgraded SQL function uses the current worker lock", catalog_text(&observer, "SELECT pg_get_functiondef('apalis.get_jobs(text,text,integer)'::regprocedure)::text AS value").await?.contains("FOR KEY SHARE"));
             let private_query = "SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM apalis_diesel_postgres.__diesel_schema_migrations h";
@@ -965,6 +982,14 @@ lets_expect! { #tokio_test
                 to adopts_once_and_completes_every_replica { satisfies_contract() }
             }
         }
+        when the_raw_harness_has_already_applied_the_active_owner_generation {
+            let generation = UnjournaledGeneration::ActiveOwner;
+            to safely_reapplies_only_migrations_after_the_known_adoption_generation { satisfies_contract() }
+            when no_public_history_exists {
+                let public_history = false;
+                to adopts_from_the_verified_catalog { satisfies_contract() }
+            }
+        }
         when the_raw_harness_has_already_applied_later_migrations {
             let generation = UnjournaledGeneration::Latest;
             to safely_reapplies_only_migrations_after_the_known_adoption_generation { satisfies_contract() }
@@ -1011,10 +1036,12 @@ lets_expect! { #tokio_test
 
 const ACTIVE_OWNER_MIGRATION_VERSION: &str = "20260912000001";
 
-// Apply the real previous embedded generation before inserting states that the
-// next migration deliberately makes unrepresentable. A public journal models
-// the formerly supported raw Diesel harness; setup must leave it untouched.
-async fn previous_owner_generation(pool: &PgPool, private: bool) -> Result<(), String> {
+const SHAPE_MIGRATION_VERSION: &str = "20260914000000";
+
+// Apply the real embedded generation that precedes `next` before inserting
+// states that migration deliberately makes unrepresentable. A public journal
+// models the formerly supported raw Diesel harness; setup must leave it untouched.
+async fn generation_before(pool: &PgPool, private: bool, next: &'static str) -> Result<(), String> {
     with_conn(pool.clone(), move |conn| {
         conn.transaction::<_, Error, _>(|conn| {
             if private {
@@ -1022,11 +1049,15 @@ async fn previous_owner_generation(pool: &PgPool, private: bool) -> Result<(), S
                     .map_err(|e| Error::Migration(Box::new(e)))?;
             }
             let mut migrations=conn.pending_migrations(MIGRATIONS).map_err(Error::Migration)?;
-            migrations.retain(|migration|migration.name().version().to_string().as_str()<ACTIVE_OWNER_MIGRATION_VERSION);
+            migrations.retain(|migration|migration.name().version().to_string().as_str()<next);
             conn.run_migrations(&migrations).map_err(Error::Migration)?;
             Ok(())
         }).map_err(|e|e.to_string())
     }).await
+}
+
+async fn previous_owner_generation(pool: &PgPool, private: bool) -> Result<(), String> {
+    generation_before(pool, private, ACTIVE_OWNER_MIGRATION_VERSION).await
 }
 
 async fn owner_rows(pool: &PgPool) -> Result<serde_json::Value, String> {
@@ -1108,11 +1139,12 @@ async fn owner_schema_scenario(kind: OwnerScenario) -> Result<Outcome<Observatio
             OwnerScenario::LatestDown=>{
                 let function=catalog_text(&pool,function_query).await?;
                 with_conn(pool.clone(),|conn|conn.transaction::<_,diesel::result::Error,_>(|conn|{
+                    conn.batch_execute(include_str!("../migrations/20260914000000_task_state_shape/down.sql"))?;
                     conn.batch_execute(include_str!("../migrations/20260912000001_require_active_owner/down.sql"))?;
-                    conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version='20260912000001'")
+                    conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version IN ('20260914000000','20260912000001')")
                 }).map_err(|e|e.to_string())).await?;
                 out.check("verification detects the pending active-owner migration",matches!(verify_schema(&pool).await,Err(Error::Migration(_))));
-                out.check("down removes only the new constraint",count(&pool,"SELECT count(*)::bigint AS n FROM pg_constraint WHERE conrelid='apalis.jobs'::regclass AND conname='jobs_active_owner_check'").await?==0);
+                out.check("down removes only the new constraints",count(&pool,"SELECT count(*)::bigint AS n FROM pg_constraint WHERE conrelid='apalis.jobs'::regclass AND conname IN ('jobs_active_owner_check','jobs_state_shape_check')").await?==0);
                 out.check("down restores the complete previous function before reupgrade",previous_function==catalog_text(&pool,function_query).await?);
                 setup(&pool).await.map_err(|e|e.to_string())?;
                 out.check("reapplying restores the complete current function body",function==catalog_text(&pool,function_query).await?);
@@ -1137,6 +1169,117 @@ async fn owner_schema_scenario(kind: OwnerScenario) -> Result<Outcome<Observatio
         out.check("no migration lock survives",locks(&pool).await?==0);
         Ok(out)
     }).await
+}
+
+const SHAPE_ROWS:&str="INSERT INTO apalis.workers(id,worker_type,storage_name) VALUES('shape-owner','shape-queue','fixture');
+INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,lock_by,lock_at,done_at,last_result) VALUES
+('pending-owned','shape-queue',decode('2222','hex'),'Pending',0,3,'2000-01-01','shape-owner','2000-01-01',NULL,NULL),
+('pending-stamped','shape-queue',decode('2222','hex'),'Pending',1,3,'2000-01-01',NULL,'2000-01-01',NULL,'{\"Err\":\"kept\"}'),
+('running-untimed','shape-queue',decode('2222','hex'),'Running',0,3,'2000-01-01','shape-owner',NULL,NULL,NULL),
+('queued-untimed-exhausted','shape-queue',decode('2222','hex'),'Queued',2,3,'2000-01-01','shape-owner',NULL,NULL,'{\"Err\":\"earlier\"}'),
+('valid','shape-queue',decode('2222','hex'),'Running',1,3,'2000-01-01','shape-owner','2000-01-01',NULL,'{\"Ok\":\"retained\"}'),
+('failed-owned','shape-queue',decode('2222','hex'),'Failed',1,3,'2000-01-01','shape-owner','2000-01-01','2000-01-02','{\"Err\":\"history\"}'),
+('done','shape-queue',decode('2222','hex'),'Done',1,3,'2000-01-01','shape-owner','2000-01-01','2000-01-02','{\"Ok\":\"history\"}');";
+
+/// Both shapes the constraint forbids: a pending row with an owner, and an
+/// active row whose claim has an owner but no timestamp. Each must be
+/// refused by name without inserting a row.
+async fn rejects_malformed_shapes(pool: &PgPool) -> Result<bool, String> {
+    let owned_pending=sql(pool,"INSERT INTO apalis.jobs(id,job_type,job,status,lock_by,lock_at) VALUES('invalid-pending','shape-queue',decode('2222','hex'),'Pending','shape-owner','2000-01-01')").await.err();
+    let untimed_active=sql(pool,"INSERT INTO apalis.jobs(id,job_type,job,status,lock_by) VALUES('invalid-active','shape-queue',decode('2222','hex'),'Running','shape-owner')").await.err();
+    Ok(owned_pending.is_some_and(|error| error.contains("jobs_state_shape_check"))
+        && untimed_active.is_some_and(|error| error.contains("jobs_state_shape_check"))
+        && count(pool,"SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id IN ('invalid-pending','invalid-active')").await? == 0)
+}
+
+async fn shape_schema_scenario(kind: OwnerScenario) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move|url|async move{
+        let pool=pool(&url)?;
+        let private=!matches!(kind,OwnerScenario::PublicPrevious);
+        generation_before(&pool,private,SHAPE_MIGRATION_VERSION).await?;
+        let foreign_history=if private{None}else{Some(catalog_text(&pool,"SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM public.__diesel_schema_migrations h").await?)};
+        sql(&pool,SHAPE_ROWS).await?;
+        let before=owner_rows(&pool).await?;
+        setup(&pool).await.map_err(|e|e.to_string())?;
+        let after=owner_rows(&pool).await?;
+        let mut out=Observations::new();
+        out.check("the upgraded schema verifies",verify_schema(&pool).await.is_ok());
+        out.check("a pending row loses its stale owner columns and nothing else",
+            after["pending-owned"]["status"]=="Pending"&&after["pending-owned"]["attempts"]==0&&after["pending-owned"]["lock_by"].is_null()
+            &&after["pending-owned"]["lock_at"].is_null()&&after["pending-owned"]["done_at"].is_null()&&after["pending-owned"]["last_result"].is_null());
+        out.check("a pending row loses a stray claim timestamp and keeps its result",
+            after["pending-stamped"]["status"]=="Pending"&&after["pending-stamped"]["attempts"]==1&&after["pending-stamped"]["lock_at"].is_null()
+            &&after["pending-stamped"]["last_result"]==before["pending-stamped"]["last_result"]);
+        out.check("an active claim without a timestamp and with budget is recovered as lost",
+            after["running-untimed"]["status"]=="Pending"&&after["running-untimed"]["attempts"]==1&&after["running-untimed"]["lock_by"].is_null()
+            &&after["running-untimed"]["lock_at"].is_null()&&after["running-untimed"]["done_at"].is_null()&&after["running-untimed"]["last_result"]["Err"].is_string());
+        out.check("an active claim without a timestamp and without budget terminates",
+            after["queued-untimed-exhausted"]["status"]=="Killed"&&after["queued-untimed-exhausted"]["attempts"]==3&&after["queued-untimed-exhausted"]["lock_by"].is_null()
+            &&after["queued-untimed-exhausted"]["lock_at"].is_null()&&after["queued-untimed-exhausted"]["done_at"].is_string()&&after["queued-untimed-exhausted"]["last_result"]["Err"].is_string());
+        out.check("a complete claim and terminal history with their last owner remain unchanged",
+            before["valid"]==after["valid"]&&before["failed-owned"]==after["failed-owned"]&&before["done"]==after["done"]);
+        out.check("the current schema rejects both malformed shapes without inserting a row",rejects_malformed_shapes(&pool).await?);
+        let history_query="SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM apalis_diesel_postgres.__diesel_schema_migrations h";
+        let history=catalog_text(&pool,history_query).await?;
+        setup(&pool).await.map_err(|e|e.to_string())?;
+        out.check("repeated setup preserves every row and journal timestamp",after==owner_rows(&pool).await?&&history==catalog_text(&pool,history_query).await?);
+        if let Some(foreign_history)=foreign_history{
+            out.check("adoption preserves all foreign versions and timestamps",foreign_history==catalog_text(&pool,"SELECT jsonb_agg(to_jsonb(h) ORDER BY version)::text AS value FROM public.__diesel_schema_migrations h").await?);
+        }
+        match kind{
+            OwnerScenario::PrivatePrevious|OwnerScenario::PublicPrevious=>{},
+            OwnerScenario::LatestDown=>{
+                with_conn(pool.clone(),|conn|conn.transaction::<_,diesel::result::Error,_>(|conn|{
+                    conn.batch_execute(include_str!("../migrations/20260914000000_task_state_shape/down.sql"))?;
+                    conn.batch_execute("DELETE FROM apalis_diesel_postgres.__diesel_schema_migrations WHERE version='20260914000000'")
+                }).map_err(|e|e.to_string())).await?;
+                out.check("verification detects the pending state-shape migration",matches!(verify_schema(&pool).await,Err(Error::Migration(_))));
+                out.check("down removes only the state-shape constraint",count(&pool,"SELECT count(*)::bigint AS n FROM pg_constraint WHERE conrelid='apalis.jobs'::regclass AND conname='jobs_state_shape_check'").await?==0
+                    &&count(&pool,"SELECT count(*)::bigint AS n FROM pg_constraint WHERE conrelid='apalis.jobs'::regclass AND conname='jobs_active_owner_check'").await?==1);
+                out.check("down keeps the repaired rows",after==owner_rows(&pool).await?);
+                setup(&pool).await.map_err(|e|e.to_string())?;
+                out.check("reapplying validates the constraint without changing repaired history",verify_schema(&pool).await.is_ok()&&after==owner_rows(&pool).await?&&rejects_malformed_shapes(&pool).await?);
+            },
+            _=>{
+                sql(&pool,"ALTER TABLE apalis.jobs DROP CONSTRAINT jobs_state_shape_check").await?;
+                match kind{
+                    OwnerScenario::WrongConstraint|OwnerScenario::WrongUnjournaledConstraint=>sql(&pool,"ALTER TABLE apalis.jobs ADD CONSTRAINT jobs_state_shape_check CHECK(true)").await?,
+                    OwnerScenario::UnvalidatedConstraint|OwnerScenario::UnvalidatedUnjournaledConstraint=>sql(&pool,"ALTER TABLE apalis.jobs ADD CONSTRAINT jobs_state_shape_check CHECK((status <> 'Pending' OR (lock_by IS NULL AND lock_at IS NULL)) AND (status NOT IN ('Queued', 'Running') OR (lock_by IS NOT NULL AND lock_at IS NOT NULL))) NOT VALID").await?,
+                    _=>{},
+                }
+                let unjournaled=matches!(kind,OwnerScenario::WrongUnjournaledConstraint|OwnerScenario::UnvalidatedUnjournaledConstraint);
+                if unjournaled{sql(&pool,"DROP SCHEMA apalis_diesel_postgres CASCADE").await?;}
+                out.check("verification rejects the damaged invariant",matches!(verify_schema(&pool).await,Err(Error::Migration(_))));
+                out.check("setup refuses the damaged invariant",matches!(setup(&pool).await,Err(Error::Migration(_))));
+                out.check("refusal leaves all job history unchanged",after==owner_rows(&pool).await?);
+                if unjournaled{out.check("refused adoption leaves no private namespace",absent_private_schema(&pool).await?);}
+                else{out.check("refusal preserves the current private history",history==catalog_text(&pool,history_query).await?);}
+            }
+        }
+        out.check("no migration lock survives",locks(&pool).await?==0);
+        Ok(out)
+    }).await
+}
+
+/// A thirteen-version catalog without a private journal, with the missing
+/// state-shape constraint as its only difference from the current one, is
+/// adopted like the eleven-version generation and then completed.
+async fn unjournaled_thirteen_version_schema() -> Result<Outcome<Observations>, String> {
+    with_isolated_database(|url| async move {
+        let pool = pool(&url)?;
+        generation_before(&pool, false, SHAPE_MIGRATION_VERSION).await?;
+        sql(&pool, "DROP TABLE public.__diesel_schema_migrations").await?;
+        sql(&pool, SHAPE_ROWS).await?;
+        let mut out = Observations::new();
+        out.check("the thirteen-version catalog is not yet current", matches!(verify_schema(&pool).await, Err(Error::Migration(_))));
+        setup(&pool).await.map_err(|e| e.to_string())?;
+        out.check("adoption completes the current generation", verify_schema(&pool).await.is_ok());
+        out.check("private history records all fourteen migrations", count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 14);
+        out.check("the adopted catalog repairs and then rejects malformed shapes", count(&pool, "SELECT count(*)::bigint AS n FROM apalis.jobs WHERE id='pending-owned' AND lock_by IS NULL AND lock_at IS NULL").await? == 1 && rejects_malformed_shapes(&pool).await?);
+        out.check("no migration lock survives", locks(&pool).await? == 0);
+        Ok(out)
+    })
+    .await
 }
 
 async fn runtime_catalog(pool: &PgPool) -> Result<String, String> {
@@ -1234,6 +1377,31 @@ lets_expect! { #tokio_test
     }
     expect(owner_schema_scenario(OwnerScenario::LatestDown).await) as downgrading_active_owner_invariants{
         to restores_the_current_function_and_constraint_on_reupgrade{satisfies_contract()}
+    }
+    expect(shape_schema_scenario(kind).await) as upgrading_state_shape_invariants{
+        let kind=OwnerScenario::PrivatePrevious;
+        to repairs_only_malformed_claim_shapes_and_preserves_other_history{satisfies_contract()}
+        when the_previous_generation_has_only_a_public_journal{
+            let kind=OwnerScenario::PublicPrevious;
+            to adopts_then_repairs_without_rewriting_foreign_history{satisfies_contract()}
+        }
+    }
+    expect(shape_schema_scenario(kind).await) as verifying_state_shape_invariants{
+        let kind=OwnerScenario::MissingConstraint;
+        to rejects_the_missing_constraint_without_changing_history{satisfies_contract()}
+        when the_constraint_definition_is_wrong{let kind=OwnerScenario::WrongConstraint;to rejects_the_wrong_definition{satisfies_contract()}}
+        when the_constraint_is_not_validated{let kind=OwnerScenario::UnvalidatedConstraint;to refuses_to_treat_unchecked_rows_as_valid{satisfies_contract()}}
+    }
+    expect(shape_schema_scenario(kind).await) as adopting_an_invalid_state_shape_invariant{
+        let kind=OwnerScenario::WrongUnjournaledConstraint;
+        to refuses_the_wrong_definition_without_blessing_history{satisfies_contract()}
+        when the_constraint_is_not_validated{let kind=OwnerScenario::UnvalidatedUnjournaledConstraint;to refuses_without_creating_private_history{satisfies_contract()}}
+    }
+    expect(shape_schema_scenario(OwnerScenario::LatestDown).await) as downgrading_state_shape_invariants{
+        to restores_the_constraint_on_reupgrade_without_touching_repaired_rows{satisfies_contract()}
+    }
+    expect(unjournaled_thirteen_version_schema().await) as an_unjournaled_thirteen_version_catalog{
+        to is_adopted_and_completed{satisfies_contract()}
     }
     expect(released_and_fresh_equivalence().await) as the_released_and_fresh_schema{
         to converges_to_the_same_complete_runtime_catalog{satisfies_contract()}

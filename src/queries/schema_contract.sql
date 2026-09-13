@@ -1,7 +1,8 @@
 -- Catalog shape, not a checksum of arbitrary function bodies. $1 selects the
 -- final generation; $2 checks just the common columns of a recognized legacy
 -- generation (lease/snapshot absent and nullable priority permitted).
--- $3 requires the current active-owner constraint.
+-- $3 is the generation whose constraints are required: 13 adds the
+-- active-owner constraint, 14 adds the state-shape constraint.
 WITH expected_columns(table_name, column_name, type_name, required) AS (VALUES
     ('jobs', 'job', 'bytea', true),
     ('jobs', 'id', 'text', true),
@@ -51,6 +52,7 @@ WITH expected_columns(table_name, column_name, type_name, required) AS (VALUES
       OR c.relkind != CASE WHEN e.table_name = 'queue_stats_snapshot' THEN 'm'::"char" ELSE 'r'::"char" END)
 ), expected_constraints(table_name, constraint_name, definition) AS (VALUES
  ('jobs', 'jobs_active_owner_check', $$CHECK (((status <> ALL (ARRAY['Queued'::text, 'Running'::text])) OR (lock_by IS NOT NULL)))$$),
+ ('jobs', 'jobs_state_shape_check', $$CHECK ((((status <> 'Pending'::text) OR ((lock_by IS NULL) AND (lock_at IS NULL))) AND ((status <> ALL (ARRAY['Queued'::text, 'Running'::text])) OR ((lock_by IS NOT NULL) AND (lock_at IS NOT NULL)))))$$),
  ('jobs', 'jobs_pkey', 'PRIMARY KEY (id)'),
  ('workers', 'workers_pkey', 'PRIMARY KEY (id, worker_type)'),
  ('jobs', 'jobs_lock_by_worker_type_fkey', 'FOREIGN KEY (lock_by, job_type) REFERENCES apalis.workers(id, worker_type)'),
@@ -63,7 +65,9 @@ WITH expected_columns(table_name, column_name, type_name, required) AS (VALUES
  SELECT 'constraint ' || e.table_name || '.' || e.constraint_name AS problem
  FROM expected_constraints e
  LEFT JOIN pg_constraint c ON c.conrelid = to_regclass('apalis.' || e.table_name) AND c.conname = e.constraint_name
- WHERE NOT $2 AND ($3 OR e.constraint_name != 'jobs_active_owner_check') AND (c.oid IS NULL OR NOT c.convalidated OR c.condeferrable
+ WHERE NOT $2 AND ($3 >= 13 OR e.constraint_name != 'jobs_active_owner_check')
+  AND ($3 >= 14 OR e.constraint_name != 'jobs_state_shape_check')
+  AND (c.oid IS NULL OR NOT c.convalidated OR c.condeferrable
   OR (pg_get_constraintdef(c.oid) != e.definition
     AND NOT (e.constraint_name = 'jobs_priority_check' AND pg_get_constraintdef(c.oid) = 'CHECK (((priority IS NULL) OR (priority >= 0)))')))
 ), expected_indexes(index_name, definition) AS (VALUES
