@@ -439,14 +439,29 @@ async fn listing_index_upgrade(panics: bool) -> Result<Outcome<Observations>, St
     }).await
 }
 
+#[derive(Clone, Copy)]
+enum Install {
+    Fresh,
+    Released,
+}
+
 /// Reverting the migrations that follow the released 0.4.1 generation must
-/// leave the schema of that generation, index predicate included.
-async fn reconciliation_downgrade() -> Result<Outcome<Observations>, String> {
-    with_isolated_database(|url| async move {
+/// leave the schema of that generation: the index predicate, and for a
+/// database installed by that release, its own function definitions.
+async fn reconciliation_downgrade(install: Install) -> Result<Outcome<Observations>, String> {
+    with_isolated_database(move |url| async move {
         let pool = pool(&url)?;
-        setup(&pool).await.map_err(|e| e.to_string())?;
         let mut out = Observations::new();
         let dequeue = "SELECT pg_get_indexdef(to_regclass('apalis.jobs_dequeue_idx')) AS value";
+        let functions = "SELECT string_agg(pg_get_functiondef(p.oid) || ' CONFIG ' || coalesce(array_to_string(p.proconfig, ','), ''), E'\n' ORDER BY p.proname) AS value \
+            FROM pg_proc p WHERE p.oid IN (to_regprocedure('apalis.get_jobs(text,text,integer)'), to_regprocedure('apalis.notify_new_jobs()'))";
+        let released = if matches!(install, Install::Released) {
+            sql(&pool, include_str!("fixtures/apalis-diesel-postgres-0.4.1.sql")).await?;
+            Some(catalog_text(&pool, functions).await?)
+        } else {
+            None
+        };
+        setup(&pool).await.map_err(|e| e.to_string())?;
         let upgraded = catalog_text(&pool, dequeue).await?;
         with_conn(pool.clone(), |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
@@ -465,6 +480,21 @@ async fn reconciliation_downgrade() -> Result<Outcome<Observations>, String> {
             "down leaves the nine records of the previous generation",
             count(&pool, "SELECT count(*)::bigint AS n FROM apalis_diesel_postgres.__diesel_schema_migrations").await? == 9,
         );
+        let downgraded_functions = catalog_text(&pool, functions).await?;
+        match released {
+            Some(released) => out.check(
+                "down restores the function definitions the release installed",
+                downgraded_functions == released,
+            ),
+            None => out.check(
+                "down installs the released function definitions",
+                downgraded_functions.matches("CONFIG search_path=pg_catalog, apalis\n").count() == 1
+                    && downgraded_functions.ends_with("CONFIG search_path=pg_catalog, apalis")
+                    && downgraded_functions.contains("(status = 'Pending' OR (status = 'Failed' AND attempts < max_attempts))")
+                    && !downgraded_functions.contains("FOR SHARE")
+                    && !downgraded_functions.contains("pg_temp"),
+            ),
+        }
         setup(&pool).await.map_err(|e| e.to_string())?;
         out.check(
             "setup upgrades the downgraded schema again",
@@ -587,9 +617,14 @@ lets_expect! { #tokio_test
             to restores_the_previous_schema_and_allows_the_same_pool_to_retry { satisfies_contract() }
         }
     }
-    expect(reconciliation_downgrade().await) as schema_contract_downgrade {
+    expect(reconciliation_downgrade(install).await) as schema_contract_downgrade {
+        let install = Install::Fresh;
         when the_reconciliation_series_is_reverted {
-            to restores_the_previous_dequeue_index_and_upgrades_again { satisfies_contract() }
+            to restores_the_previous_generation_and_upgrades_again { satisfies_contract() }
+            when the_database_was_installed_by_the_released_crate {
+                let install = Install::Released;
+                to restores_exactly_the_schema_that_release_installed { satisfies_contract() }
+            }
         }
     }
     expect(listing_index_verification(index, drift).await) as listing_index_verification {
