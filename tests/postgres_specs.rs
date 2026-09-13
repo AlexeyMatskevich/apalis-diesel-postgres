@@ -222,11 +222,12 @@ fn failed_exhausted_not_reclaimed()
 // two concurrent admin registrations serialize and both succeed (UPSERT
 // idempotency).
 //
-// The conflict UPDATE deliberately does NOT refresh `last_seen` — only
-// `storage_name`/`layers` are merged. Heartbeats are owned by the worker
-// stream (lease-token gated); if the admin path also refreshed `last_seen`,
-// a caller with admin-API access could keep a foreign worker's row fresh
-// indefinitely and prevent `reenqueue_orphaned` from reclaiming its jobs.
+// The conflict UPDATE refreshes `last_seen`, `storage_name` and `layers`
+// only for a row without a lease token: re-registering is how a token-free
+// registration renews its liveness. A row owned by a heartbeating worker
+// (lease token present) is left untouched, so a caller with admin-API access
+// cannot keep a foreign worker's row fresh and prevent `reenqueue_orphaned`
+// from reclaiming its jobs.
 // This spec pins only the observable contract: both calls succeed and exactly
 // one row exists. If a future redesign of admin registration changes either
 // of those, update the expectations here.

@@ -155,6 +155,20 @@ where
     PostgresStorage<Args, D, F>:
         BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
 {
+    /// Register a worker name for this storage's queue without a lease token.
+    ///
+    /// The registration has no heartbeat: each call sets `last_seen`, and the
+    /// orphan sweep treats the name as dead `reenqueue_orphaned_after` after
+    /// the last call. Callers claiming under this name through [`lock_task`],
+    /// [`lock_task_in_queue`] or `apalis.get_jobs` re-register within that
+    /// window to keep their `Running` and `Queued` tasks. A worker stream
+    /// registering the same name receives [`Error::AlreadyRegistered`] while
+    /// this registration is fresh. A row owned by a worker stream (lease token
+    /// present) is left untouched, so this path cannot keep a foreign worker
+    /// fresh.
+    ///
+    /// [`lock_task`]: crate::lock_task
+    /// [`lock_task_in_queue`]: crate::lock_task_in_queue
     fn register_worker(
         &mut self,
         worker_id: String,

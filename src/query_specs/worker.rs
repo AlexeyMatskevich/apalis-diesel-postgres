@@ -806,6 +806,16 @@ fn register_was_blocked() -> impl Fn(&Result<Outcome<RegisterRun>, String>) -> A
     })
 }
 
+fn register_stored_token_equals_none()
+-> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
+    observe::<RegisterRun, _>("register stored token", |run| {
+        match &run.stored_lease_token {
+            None => Ok(()),
+            other => Err(format!("expected no stored lease_token, got {other:?}")),
+        }
+    })
+}
+
 fn register_stored_token_equals(
     expected: &'static str,
 ) -> impl Fn(&Result<Outcome<RegisterRun>, String>) -> AssertionResult {
@@ -1549,16 +1559,31 @@ lets_expect! { #tokio_test
             }
         }
 
-        when an_incumbent_row_exists_with_null_lease_token {
-            // Legacy / dashboard-side row: `lease_token IS NULL` allows
-            // registration to recover prior claims and bind the new token.
+        when an_incumbent_row_exists_without_a_lease_token {
+            // A token-free registration (admin `register_worker`, legacy
+            // clients) renews `last_seen` by re-registering; while fresh it
+            // holds the name like any live registration.
             let setup = RegisterSetup {
                 incumbent_lease_token: Some(None),
+                incumbent_age_secs: 0,
                 ..REGISTER_DEFAULT
             };
-            to upserts_and_binds_the_lease {
-                register_inserted_one_row(),
-                register_stored_token_equals("new-token")
+            to refuses_to_replace_the_live_registration {
+                register_was_blocked(),
+                register_stored_token_equals_none()
+            }
+
+            when that_registration_is_stale_past_the_threshold {
+                let setup = RegisterSetup {
+                    incumbent_lease_token: Some(None),
+                    incumbent_age_secs: 120,
+                    stale_after_secs: 30,
+                    ..REGISTER_DEFAULT
+                };
+                to takes_over_and_binds_the_lease {
+                    register_inserted_one_row(),
+                    register_stored_token_equals("new-token")
+                }
             }
         }
 

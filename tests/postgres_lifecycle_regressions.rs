@@ -1365,6 +1365,195 @@ mod redispatched_claim {
     }
 }
 
+// A token-free registration is live until `reenqueue_orphaned_after` passes
+// since its last `register_worker` call; a worker stream honours that window.
+mod token_free_registration {
+    use apalis_core::{
+        backend::{BackendExt, RegisterWorker, TaskSink},
+        error::BoxDynError,
+        task::{attempt::Attempt, builder::TaskBuilder},
+        worker::{context::WorkerContext, ext::ack::Acknowledge},
+    };
+    use apalis_diesel_postgres::{
+        Config, Error, PgAck, PgContext, PgPool, PgTaskId, PostgresStorage, build_pool,
+        lock_task_in_queue, setup,
+    };
+    use diesel::{
+        QueryableByName, RunQueryDsl, sql_query,
+        sql_types::{BigInt, Nullable, Text},
+    };
+    use futures::StreamExt;
+    use lets_expect::*;
+    use std::time::Duration;
+    #[derive(Clone, Copy)]
+    enum Liveness {
+        Fresh,
+        Stale,
+    }
+    #[derive(QueryableByName)]
+    struct JobState {
+        #[diesel(sql_type = Text)]
+        status: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        lock_by: Option<String>,
+        #[diesel(sql_type = BigInt)]
+        attempts: i64,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        lock_at: Option<i64>,
+    }
+    #[derive(Debug)]
+    struct Observation {
+        registration: &'static str,
+        status: String,
+        owner: Option<String>,
+        attempts: i64,
+        token_free_ack: &'static str,
+    }
+    async fn job_state(pool: &PgPool, id: PgTaskId) -> JobState {
+        let pool = pool.clone();
+        tokio::task::spawn_blocking(move || {
+            sql_query(
+                "SELECT status, lock_by, attempts::bigint AS attempts, \
+                 EXTRACT(EPOCH FROM lock_at)::bigint AS lock_at FROM apalis.jobs WHERE id=$1",
+            )
+            .bind::<Text, _>(id.to_string())
+            .get_result::<JobState>(&mut pool.get().unwrap())
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+    async fn native_registration_over(liveness: Liveness) -> Observation {
+        let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
+        setup(&pool).await.unwrap();
+        let queue = format!("lifecycle_token_free_{}", ulid::Ulid::new());
+        let config = Config::new(&queue)
+            .set_keep_alive(Duration::from_millis(10))
+            .set_reenqueue_orphaned_after(Duration::from_secs(60));
+        let mut admin = PostgresStorage::<String>::new_with_config(&pool, &config);
+        admin
+            .register_worker("shared-name".to_owned())
+            .await
+            .unwrap();
+        let id = PgTaskId::new(ulid::Ulid::new());
+        admin
+            .push_task(
+                TaskBuilder::new("work".to_owned())
+                    .with_task_id(id)
+                    .with_ctx(PgContext::new().with_max_attempts(3))
+                    .build(),
+            )
+            .await
+            .unwrap();
+        // The token-free consumer claims the task and keeps working on it.
+        lock_task_in_queue(&pool, &id, "shared-name", &queue)
+            .await
+            .unwrap();
+        let claimed = job_state(&pool, id).await;
+        if matches!(liveness, Liveness::Stale) {
+            let aging_pool = pool.clone();
+            let aging_queue = queue.clone();
+            tokio::task::spawn_blocking(move || {
+                sql_query(
+                    "UPDATE apalis.workers SET last_seen=clock_timestamp()-interval '2 minutes' \
+                     WHERE worker_type=$1 AND id='shared-name'",
+                )
+                .bind::<Text, _>(aging_queue)
+                .execute(&mut aging_pool.get().unwrap())
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        }
+        let native = PostgresStorage::<String>::new_with_config(&pool, &config);
+        let worker = WorkerContext::new::<()>("shared-name");
+        let mut stream = native.clone().poll_compact(&worker);
+        let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a registration outcome within five seconds");
+        let registration = match &item {
+            Some(Ok(None)) => "registered",
+            Some(Err(Error::AlreadyRegistered { .. })) => "already_registered",
+            other => {
+                eprintln!("token-free registration: unexpected first item {other:?}");
+                "other"
+            }
+        };
+        let after = job_state(&pool, id).await;
+        // The token-free consumer finishes with the manual acknowledgement contract.
+        let mut parts = TaskBuilder::new("work".to_owned())
+            .with_task_id(id)
+            .with_ctx(
+                PgContext::new()
+                    .with_queue(queue.clone())
+                    .with_max_attempts(3)
+                    .with_lock_by(Some("shared-name".to_owned()))
+                    .with_lock_at(claimed.lock_at),
+            )
+            .build()
+            .parts;
+        parts.attempt = Attempt::new_with_value(1);
+        let result: Result<String, BoxDynError> = Ok("done".to_owned());
+        let token_free_ack = match PgAck::new(&pool).ack(&result, &parts).await {
+            Ok(()) => "acknowledged",
+            Err(Error::StaleAcknowledgement { .. }) => "stale",
+            Err(_) => "other",
+        };
+        drop(stream);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().unwrap();
+            sql_query("DELETE FROM apalis.jobs WHERE job_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+            sql_query("DELETE FROM apalis.workers WHERE worker_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        Observation {
+            registration,
+            status: after.status,
+            owner: after.lock_by,
+            attempts: after.attempts,
+            token_free_ack,
+        }
+    }
+    fn observes(
+        registration: &'static str,
+        status: &'static str,
+        owner: Option<&'static str>,
+        attempts: i64,
+        token_free_ack: &'static str,
+    ) -> impl Fn(&Result<crate::support::Outcome<Observation>, String>) -> AssertionResult {
+        crate::satisfies(move |o: &Observation| {
+            o.registration == registration
+                && o.status == status
+                && o.owner.as_deref() == owner
+                && o.attempts == attempts
+                && o.token_free_ack == token_free_ack
+        })
+    }
+    async fn run(liveness: Liveness) -> Result<crate::support::Outcome<Observation>, String> {
+        crate::database_case(|| native_registration_over(liveness)).await
+    }
+    lets_expect! {#tokio_test
+      expect(run(liveness).await) as a_worker_stream_registering_a_token_free_name {
+        let liveness=Liveness::Fresh;
+        to waits_and_leaves_the_running_task_with_its_consumer {
+          observes("already_registered","Running",Some("shared-name"),0,"acknowledged")
+        }
+        when the_token_free_registration_is_stale {let liveness=Liveness::Stale;
+          to takes_the_name_over_and_recovers_the_task {
+            observes("registered","Pending",None,1,"stale")
+          }
+        }
+      }
+    }
+}
+
 // Claim identity and runtime execution counts have separate responsibilities.
 mod attempt_accounting {
     use crate::support;
@@ -1482,10 +1671,14 @@ mod attempt_accounting {
         expected_handler_attempts: Vec<usize>,
     }
 
+    /// A token-free entry needs an admin registration for the worker name; a
+    /// worker stream registers the name itself and would be refused while
+    /// such a registration is fresh.
     async fn fixture(
         url: String,
         previous: i32,
         budget: i32,
+        token_free_registration: bool,
     ) -> Result<(apalis_diesel_postgres::PgPool, PostgresStorage<String>), String> {
         let pool =
             apalis_diesel_postgres::build_pool_with(url, |b| b.max_size(2).min_idle(Some(1)))
@@ -1495,10 +1688,12 @@ mod attempt_accounting {
             .map_err(|e| e.to_string())?;
         let mut storage =
             PostgresStorage::<String>::new_with_config(&pool, &Config::new("attempt-queue"));
-        storage
-            .register_worker("attempt-worker".to_owned())
-            .await
-            .map_err(|e| e.to_string())?;
+        if token_free_registration {
+            storage
+                .register_worker("attempt-worker".to_owned())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         support::with_conn(pool.clone(), move |conn| {
             sql_query("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,last_result)
               VALUES('01ARZ3NDEKTSV4RRFFQ69G5FAV','attempt-queue',convert_to('\"payload\"','UTF8'),
@@ -1534,7 +1729,8 @@ mod attempt_accounting {
         budget: i32,
     ) -> Result<support::Outcome<Run>, String> {
         support::with_isolated_database(move |url| async move {
-        let (pool, storage) = fixture(url, previous, budget).await?;
+        let (pool, storage) =
+            fixture(url, previous, budget, !matches!(entry, Entry::PreclaimedDirect)).await?;
         let observed = Arc::new(Mutex::new(Vec::new()));
         let worker=WorkerContext::new::<()>("attempt-worker");
         let mut stream=matches!(entry,Entry::PreclaimedDirect).then(||storage.clone().poll_compact(&worker));
@@ -1606,7 +1802,7 @@ mod attempt_accounting {
     }
     async fn acknowledge_cloned_claim() -> Result<support::Outcome<Value>, String> {
         support::with_isolated_database(|url| async move {
-            let (pool, storage) = fixture(url, 0, 3).await?;
+            let (pool, storage) = fixture(url, 0, 3, false).await?;
             let worker = WorkerContext::new::<()>("attempt-worker");
             let mut stream = storage.poll_compact(&worker);
             let task = next_claim(&mut stream).await?;
@@ -1632,7 +1828,7 @@ mod attempt_accounting {
     /// and the second must observe it instead of racing it to a stale result.
     async fn acknowledge_cloned_claim_concurrently() -> Result<support::Outcome<Value>, String> {
         support::with_isolated_database(|url| async move {
-            let (pool, storage) = fixture(url, 0, 3).await?;
+            let (pool, storage) = fixture(url, 0, 3, false).await?;
             let worker = WorkerContext::new::<()>("attempt-worker");
             let mut stream = storage.poll_compact(&worker);
             let parts = next_claim(&mut stream).await?.parts;

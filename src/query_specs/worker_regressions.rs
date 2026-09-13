@@ -232,7 +232,8 @@ enum Incarnation {
     SameStale,
     DifferentFresh,
     DifferentStale,
-    Legacy,
+    LegacyFresh,
+    LegacyStale,
 }
 
 fn startup_snapshot(conn: &mut PgConnection) -> Result<Value, String> {
@@ -254,8 +255,10 @@ async fn startup(
             worker_fixture(conn)?;
             if matches!(incarnation, Incarnation::Absent) {
                 sql(conn, "UPDATE apalis.workers SET id='orphan', last_seen=clock_timestamp()-interval '1day'")?;
-            } else if matches!(incarnation, Incarnation::Legacy) {
+            } else if matches!(incarnation, Incarnation::LegacyFresh) {
                 sql(conn, "UPDATE apalis.workers SET lease_token=NULL")?;
+            } else if matches!(incarnation, Incarnation::LegacyStale) {
+                sql(conn, "UPDATE apalis.workers SET lease_token=NULL, last_seen=clock_timestamp()-interval '1day'")?;
             } else if !matches!(incarnation, Incarnation::SameFresh | Incarnation::DifferentFresh) {
                 sql(conn, "UPDATE apalis.workers SET last_seen=clock_timestamp()-interval '1day'")?;
             }
@@ -270,13 +273,13 @@ async fn startup(
             }
             Ok(())
         }).await?;
-        let token = if matches!(incarnation, Incarnation::DifferentFresh | Incarnation::DifferentStale | Incarnation::Legacy) { "replacement" } else { "current" };
+        let token = if matches!(incarnation, Incarnation::DifferentFresh | Incarnation::DifferentStale | Incarnation::LegacyFresh | Incarnation::LegacyStale) { "replacement" } else { "current" };
         let result = worker::initial_heartbeat(pool.clone(), config(), worker_context(), "regression", Arc::from(token)).await;
         let exact_error = matches!(&result, Err(Error::Database { source: diesel::result::Error::DatabaseError(_, info), .. })
             if info.message() == "owned startup sweep failure");
         let snapshot = with_conn(pool.clone(), startup_snapshot).await?;
         let error = result.as_ref().err().map(ToString::to_string);
-        if matches!(incarnation, Incarnation::DifferentFresh) {
+        if matches!(incarnation, Incarnation::DifferentFresh | Incarnation::LegacyFresh) {
             let rejected = matches!(&result, Err(Error::AlreadyRegistered { worker_id, queue })
                 if worker_id == "worker" && queue == "fence-queue");
             Ok(json!({"exact_registration_error":rejected,"snapshot":snapshot}))
@@ -526,9 +529,18 @@ lets_expect! {
             }
         }
         when the_incumbent_has_no_lease_token {
-            let incarnation = Incarnation::Legacy;
-            to recovers_its_attempt_before_adopting_the_worker {
-                equals(active_snapshot("replacement", count, false))
+            // A token-free registration renews `last_seen` by re-registering;
+            // while fresh it holds the name like a heartbeating worker.
+            let incarnation = Incarnation::LegacyFresh;
+            to rejects_registration_and_preserves_the_incumbent_attempt {
+                equals(json!({"exact_registration_error":true,
+                    "snapshot":{"token":null,"jobs":1,"pending":0,"running":1}}))
+            }
+            when it_is_stale {
+                let incarnation = Incarnation::LegacyStale;
+                to recovers_its_attempt_before_adopting_the_worker {
+                    equals(active_snapshot("replacement", count, false))
+                }
             }
         }
         when another_fresh_incarnation_owns_the_claims {
