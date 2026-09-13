@@ -1,7 +1,12 @@
-//! Database specifications for releasing a worker registration. SQL is used
-//! only for fixtures and observations.
+//! Database specifications for the operations that end a registration or
+//! remove queue data: releasing a worker, purging terminal tasks and pruning
+//! stale registrations. SQL is used only for fixtures and observations.
 
-use crate::{PgPool, queries::worker, test_support as support};
+use crate::{
+    PgPool,
+    queries::{retention, worker},
+    test_support as support,
+};
 use apalis_core::worker::context::WorkerContext;
 use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
@@ -139,6 +144,28 @@ fn worker_after(
         diesel::result::Error::NotFound => Ok(None),
         other => Err(other.to_string()),
     })
+}
+
+#[derive(QueryableByName)]
+struct Count {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+fn count_jobs(conn: &mut PgConnection, queue: &str) -> Result<i64, String> {
+    sql_query("SELECT count(*)::bigint AS n FROM apalis.jobs WHERE job_type = $1")
+        .bind::<Text, _>(queue)
+        .get_result::<Count>(conn)
+        .map(|row| row.n)
+        .map_err(|e| e.to_string())
+}
+
+fn count_workers(conn: &mut PgConnection, queue: &str) -> Result<i64, String> {
+    sql_query("SELECT count(*)::bigint AS n FROM apalis.workers WHERE worker_type = $1")
+        .bind::<Text, _>(queue)
+        .get_result::<Count>(conn)
+        .map(|row| row.n)
+        .map_err(|e| e.to_string())
 }
 
 // --------------------------------------------------------------------------
@@ -414,6 +441,355 @@ fn job_untouched(
     })
 }
 
+// --------------------------------------------------------------------------
+// purge_terminal_tasks
+// --------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Row {
+    Pending,
+    Queued,
+    Running,
+    Done,
+    FailedWithBudget,
+    FailedExhausted,
+    Killed,
+    /// A `Done` row written outside this crate, without a completion time.
+    DoneWithoutCompletionTime,
+}
+
+#[derive(Clone, Copy)]
+enum Age {
+    /// Completed (or scheduled) just now.
+    Fresh,
+    /// Completed (or scheduled) an hour ago.
+    Old,
+}
+
+#[derive(Clone, Copy)]
+enum Window {
+    Zero,
+    OneMinute,
+}
+
+#[derive(Clone, Copy)]
+enum Scope {
+    SameQueue,
+    OtherQueue,
+}
+
+#[derive(Debug)]
+struct PurgeRun {
+    deleted: usize,
+    remaining: i64,
+}
+
+async fn run_purge(
+    row: Row,
+    age: Age,
+    window: Window,
+    scope: Scope,
+) -> Result<Outcome<PurgeRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-purge-{}", Ulid::new());
+    let other_queue = format!("{queue}-other");
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    cleanup_queue(pool.clone(), other_queue.clone()).await?;
+    let run = {
+        let (queue, other_queue) = (queue.clone(), other_queue.clone());
+        with_conn(pool.clone(), move |conn| {
+            let row_queue = match scope {
+                Scope::SameQueue => queue.as_str(),
+                Scope::OtherQueue => other_queue.as_str(),
+            };
+            let age_secs = match age {
+                Age::Fresh => 0,
+                Age::Old => 3_600,
+            };
+            let owner = format!("purge-owner-{}", Ulid::new());
+            let (status, attempts, max_attempts, owned, done) = match row {
+                Row::Pending => ("Pending", 0, 3, false, false),
+                Row::Queued => ("Queued", 0, 3, true, false),
+                Row::Running => ("Running", 0, 3, true, false),
+                Row::Done => ("Done", 1, 3, true, true),
+                Row::FailedWithBudget => ("Failed", 1, 3, true, true),
+                Row::FailedExhausted => ("Failed", 3, 3, true, true),
+                Row::Killed => ("Killed", 3, 3, true, true),
+                Row::DoneWithoutCompletionTime => ("Done", 1, 3, false, false),
+            };
+            if owned {
+                seed_worker(conn, row_queue, &owner, Some("purge-token"), 0)?;
+            }
+            seed_job(
+                conn,
+                row_queue,
+                &JobSeed {
+                    status,
+                    attempts,
+                    max_attempts,
+                    owner: owned.then_some(owner.as_str()),
+                    done_at_age_secs: done.then_some(age_secs),
+                    run_at_age_secs: age_secs,
+                    last_result: None,
+                },
+            )?;
+            let completed_before = match window {
+                Window::Zero => Duration::ZERO,
+                Window::OneMinute => Duration::from_secs(60),
+            };
+            let deleted = retention::purge_terminal_batch(conn, &queue, completed_before, 100)
+                .map_err(|e| e.to_string())?;
+            let remaining = count_jobs(conn, row_queue)?;
+            Ok(PurgeRun { deleted, remaining })
+        })
+        .await
+    };
+    cleanup_queue(pool.clone(), queue).await?;
+    cleanup_queue(pool, other_queue).await?;
+    run.map(Outcome::Completed)
+}
+
+fn purged() -> impl Fn(&Result<Outcome<PurgeRun>, String>) -> AssertionResult {
+    observe::<PurgeRun, _>("purge", |run| {
+        if run.deleted == 1 && run.remaining == 0 {
+            Ok(())
+        } else {
+            Err(format!("expected the row to be deleted, got {run:?}"))
+        }
+    })
+}
+
+fn kept() -> impl Fn(&Result<Outcome<PurgeRun>, String>) -> AssertionResult {
+    observe::<PurgeRun, _>("purge", |run| {
+        if run.deleted == 0 && run.remaining == 1 {
+            Ok(())
+        } else {
+            Err(format!("expected the row to be kept, got {run:?}"))
+        }
+    })
+}
+
+#[derive(Debug)]
+struct BatchedPurgeRun {
+    first_batch: usize,
+    total: usize,
+    remaining: i64,
+}
+
+async fn run_batched_purge() -> Result<Outcome<BatchedPurgeRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-purge-batch-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let run = async {
+        let seeded_queue = queue.clone();
+        with_conn(pool.clone(), move |conn| {
+            for _ in 0..5 {
+                seed_job(
+                    conn,
+                    &seeded_queue,
+                    &JobSeed {
+                        status: "Done",
+                        attempts: 1,
+                        max_attempts: 3,
+                        owner: None,
+                        done_at_age_secs: Some(0),
+                        run_at_age_secs: 1,
+                        last_result: None,
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .await?;
+        let first_queue = queue.clone();
+        let first_batch = with_conn(pool.clone(), move |conn| {
+            retention::purge_terminal_batch(conn, &first_queue, Duration::ZERO, 2)
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+        let total =
+            retention::purge_terminal_tasks_batched(pool.clone(), queue.clone(), Duration::ZERO, 2)
+                .await
+                .map_err(|e| e.to_string())?;
+        let count_queue = queue.clone();
+        let remaining = with_conn(pool.clone(), move |conn| count_jobs(conn, &count_queue)).await?;
+        Ok(BatchedPurgeRun {
+            first_batch,
+            total,
+            remaining,
+        })
+    }
+    .await;
+    cleanup_queue(pool, queue).await?;
+    run.map(Outcome::Completed)
+}
+
+fn drains_in_batches() -> impl Fn(&Result<Outcome<BatchedPurgeRun>, String>) -> AssertionResult {
+    observe::<BatchedPurgeRun, _>("batched purge", |run| {
+        if run.first_batch == 2 && run.total == 3 && run.remaining == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one batch of 2, then 3 more across repeated batches, and no rows left; got {run:?}"
+            ))
+        }
+    })
+}
+
+// --------------------------------------------------------------------------
+// prune_workers_blocking
+// --------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Freshness {
+    Fresh,
+    Stale,
+}
+
+#[derive(Clone, Copy)]
+enum Reference {
+    None,
+    ActiveClaim,
+    CompletedTask,
+}
+
+#[derive(Clone, Copy)]
+enum Hold {
+    Free,
+    /// A peer transaction holds the row as an in-flight claim does.
+    HeldByPeer,
+}
+
+#[derive(Debug)]
+struct PruneRun {
+    deleted: usize,
+    remaining: i64,
+}
+
+async fn run_prune(
+    freshness: Freshness,
+    reference: Reference,
+    scope: Scope,
+    hold: Hold,
+) -> Result<Outcome<PruneRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-prune-{}", Ulid::new());
+    let other_queue = format!("{queue}-other");
+    let worker = format!("prune-worker-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    cleanup_queue(pool.clone(), other_queue.clone()).await?;
+    let run = {
+        let (pool, queue, other_queue, worker) = (
+            pool.clone(),
+            queue.clone(),
+            other_queue.clone(),
+            worker.clone(),
+        );
+        tokio::task::spawn_blocking(move || -> Result<PruneRun, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            let row_queue = match scope {
+                Scope::SameQueue => queue.as_str(),
+                Scope::OtherQueue => other_queue.as_str(),
+            };
+            let age = match freshness {
+                Freshness::Fresh => 0,
+                Freshness::Stale => 3_600,
+            };
+            seed_worker(&mut conn, row_queue, &worker, Some("prune-token"), age)?;
+            match reference {
+                Reference::None => {}
+                Reference::ActiveClaim => {
+                    seed_job(
+                        &mut conn,
+                        row_queue,
+                        &JobSeed {
+                            status: "Running",
+                            attempts: 0,
+                            max_attempts: 3,
+                            owner: Some(&worker),
+                            done_at_age_secs: None,
+                            run_at_age_secs: age,
+                            last_result: None,
+                        },
+                    )?;
+                }
+                Reference::CompletedTask => {
+                    seed_job(
+                        &mut conn,
+                        row_queue,
+                        &JobSeed {
+                            status: "Done",
+                            attempts: 1,
+                            max_attempts: 3,
+                            owner: Some(&worker),
+                            done_at_age_secs: Some(age),
+                            run_at_age_secs: age,
+                            last_result: None,
+                        },
+                    )?;
+                }
+            }
+            let mut peer = pool.get().map_err(|e| e.to_string())?;
+            if matches!(hold, Hold::HeldByPeer) {
+                sql_query("BEGIN")
+                    .execute(&mut peer)
+                    .map_err(|e| e.to_string())?;
+                sql_query(
+                    "SELECT 1 FROM apalis.workers WHERE id = $1 AND worker_type = $2 FOR KEY SHARE",
+                )
+                .bind::<Text, _>(&worker)
+                .bind::<Text, _>(row_queue)
+                .execute(&mut peer)
+                .map_err(|e| e.to_string())?;
+            }
+            let pruned =
+                retention::prune_workers_blocking(&mut conn, &queue, Duration::from_secs(60))
+                    .map_err(|e| e.to_string());
+            if matches!(hold, Hold::HeldByPeer) {
+                sql_query("ROLLBACK")
+                    .execute(&mut peer)
+                    .map_err(|e| e.to_string())?;
+            }
+            let deleted = pruned?;
+            let remaining = count_workers(&mut conn, row_queue)?;
+            Ok(PruneRun { deleted, remaining })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
+    cleanup_queue(pool.clone(), queue).await?;
+    cleanup_queue(pool, other_queue).await?;
+    run.map(Outcome::Completed)
+}
+
+fn pruned() -> impl Fn(&Result<Outcome<PruneRun>, String>) -> AssertionResult {
+    observe::<PruneRun, _>("prune", |run| {
+        if run.deleted == 1 && run.remaining == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the registration to be deleted, got {run:?}"
+            ))
+        }
+    })
+}
+
+fn retained() -> impl Fn(&Result<Outcome<PruneRun>, String>) -> AssertionResult {
+    observe::<PruneRun, _>("prune", |run| {
+        if run.deleted == 0 && run.remaining == 1 {
+            Ok(())
+        } else {
+            Err(format!("expected the registration to be kept, got {run:?}"))
+        }
+    })
+}
+
 lets_expect! { #tokio_test
     expect(run_release(ownership, claim).await) as releasing_a_registration {
         let ownership = Ownership::Owned;
@@ -503,6 +879,90 @@ lets_expect! { #tokio_test
                 registration_untouched(None),
                 successor("refused")
             }
+        }
+    }
+
+    expect(run_purge(row, age, window, scope).await) as purging_terminal_tasks {
+        let row = Row::Done;
+        let age = Age::Old;
+        let window = Window::OneMinute;
+        let scope = Scope::SameQueue;
+        to deletes_a_completed_task_older_than_the_window { purged() }
+        when the_task_completed_inside_the_window {
+            let age = Age::Fresh;
+            to keeps_it { kept() }
+            when the_window_is_zero {
+                let window = Window::Zero;
+                to deletes_it { purged() }
+            }
+        }
+        when the_task_was_killed {
+            let row = Row::Killed;
+            to deletes_it { purged() }
+        }
+        when the_task_failed_with_no_retry_budget_left {
+            let row = Row::FailedExhausted;
+            to deletes_it { purged() }
+        }
+        when the_task_failed_with_retry_budget_left {
+            let row = Row::FailedWithBudget;
+            to keeps_the_retryable_task { kept() }
+        }
+        when the_task_is_pending {
+            let row = Row::Pending;
+            to keeps_the_active_task { kept() }
+        }
+        when the_task_is_queued {
+            let row = Row::Queued;
+            to keeps_the_active_task { kept() }
+        }
+        when the_task_is_running {
+            let row = Row::Running;
+            to keeps_the_active_task { kept() }
+        }
+        when the_task_has_no_completion_time {
+            let row = Row::DoneWithoutCompletionTime;
+            to ages_it_by_its_schedule_instead { purged() }
+            when that_schedule_is_inside_the_window {
+                let age = Age::Fresh;
+                to keeps_it { kept() }
+            }
+        }
+        when the_task_belongs_to_another_queue {
+            let scope = Scope::OtherQueue;
+            to keeps_it { kept() }
+        }
+    }
+
+    expect(run_batched_purge().await) as a_purge_larger_than_one_batch {
+        to drains_the_backlog_across_batches { drains_in_batches() }
+    }
+
+    expect(run_prune(freshness, reference, scope, hold).await) as pruning_stale_registrations {
+        let freshness = Freshness::Stale;
+        let reference = Reference::None;
+        let scope = Scope::SameQueue;
+        let hold = Hold::Free;
+        to deletes_a_stale_unreferenced_registration { pruned() }
+        when the_registration_is_fresh {
+            let freshness = Freshness::Fresh;
+            to keeps_it { retained() }
+        }
+        when a_running_task_still_names_the_registration {
+            let reference = Reference::ActiveClaim;
+            to keeps_it { retained() }
+        }
+        when a_completed_task_still_names_the_registration {
+            let reference = Reference::CompletedTask;
+            to keeps_it_until_that_task_is_purged { retained() }
+        }
+        when the_registration_belongs_to_another_queue {
+            let scope = Scope::OtherQueue;
+            to keeps_it { retained() }
+        }
+        when another_transaction_holds_the_registration {
+            let hold = Hold::HeldByPeer;
+            to skips_it_without_waiting { retained() }
         }
     }
 }

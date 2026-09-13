@@ -8,7 +8,7 @@
 use apalis_core::{
     backend::{
         BackendExt, FetchById, Filter, ListAllTasks, ListQueues, ListTasks, ListWorkers, Metrics,
-        QueueInfo, RegisterWorker, RunningWorker, Statistic, TaskResult, WaitForCompletion,
+        QueueInfo, RegisterWorker, RunningWorker, Statistic, TaskResult, Vacuum, WaitForCompletion,
         codec::Codec,
     },
     task::{Task, task_id::TaskId},
@@ -177,6 +177,25 @@ where
             self.pool.clone(),
             worker_id,
             self.config.queue().to_string(),
+        )
+    }
+}
+
+impl<Args, D, F> Vacuum for PostgresStorage<Args, D, F>
+where
+    PostgresStorage<Args, D, F>:
+        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+{
+    /// Delete every terminal task of this storage's queue, whatever its age:
+    /// [`PostgresStorage::purge_terminal_tasks`] with a zero window. A result
+    /// that a `WaitForCompletion` consumer has not read yet is lost, and every
+    /// `idempotency_key` of a deleted task becomes free again; prefer the
+    /// windowed method for scheduled retention.
+    fn vacuum(&mut self) -> impl Future<Output = Result<usize, Self::Error>> + Send {
+        queries::purge_terminal_tasks(
+            self.pool.clone(),
+            self.config.queue().to_string(),
+            std::time::Duration::ZERO,
         )
     }
 }

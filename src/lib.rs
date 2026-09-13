@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
-use std::{fmt::Debug, marker::PhantomData};
+use std::{fmt::Debug, marker::PhantomData, time::Duration};
 
 pub use apalis_codec::json::JsonCodec;
 use apalis_core::{
@@ -272,7 +272,8 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// before stopping is not touched. With Apalis's graceful shutdown the
     /// worker drains its handlers first, so nothing is left to recover. The
     /// registration row itself is kept because completed tasks reference it
-    /// as their last owner.
+    /// as their last owner; [`Self::prune_workers`] removes it once nothing
+    /// references it any more.
     ///
     /// Returns the number of tasks handed back.
     ///
@@ -290,6 +291,59 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
             self.config.clone(),
             worker_id.to_owned(),
             std::sync::Arc::clone(&self.lease_token),
+        )
+        .await
+    }
+
+    /// Delete the terminal tasks of this storage's queue (`Done`, `Killed`,
+    /// and `Failed` with no retry budget left) that completed at least
+    /// `completed_before` ago, and return how many rows were deleted.
+    ///
+    /// Completed rows are never removed by the worker protocol; this is the
+    /// retention step of the task lifecycle. Deletion runs in bounded batches,
+    /// each its own transaction. A deleted task is no longer observable
+    /// through `FetchById`, `WaitForCompletion` or the listings, and its
+    /// `idempotency_key` becomes free for a new task, so keep
+    /// `completed_before` longer than any consumer still waiting on results
+    /// and than the deduplication horizon the application relies on.
+    /// [`apalis_core::backend::Vacuum::vacuum`] is this method with a zero
+    /// window.
+    ///
+    /// # Errors
+    /// - [`Error::Pool`], [`Error::Database`], [`Error::Blocking`] for
+    ///   connection, SQL and executor failures. Batches already deleted stay
+    ///   deleted.
+    pub async fn purge_terminal_tasks(&self, completed_before: Duration) -> Result<usize, Error> {
+        queries::purge_terminal_tasks(
+            self.pool.clone(),
+            self.config.queue().to_string(),
+            completed_before,
+        )
+        .await
+    }
+
+    /// Delete the registrations of this storage's queue that have been stale
+    /// for at least `stale_for` and that no task references any more, and
+    /// return how many rows were deleted.
+    ///
+    /// Registration rows are kept by the worker protocol so completed tasks
+    /// can name their last owner; workers with unique names (one per process
+    /// or pod) otherwise accumulate forever. A registration still referenced
+    /// by a task, even a completed one, is kept until
+    /// [`Self::purge_terminal_tasks`] removes that task. A registration in use
+    /// by another transaction is skipped, and a live one is never stale, so
+    /// this cannot remove a working registration. Pass a window no shorter
+    /// than the longest `reenqueue_orphaned_after` any worker of the queue
+    /// uses, so a merely slow heartbeat is never mistaken for an abandoned one.
+    ///
+    /// # Errors
+    /// - [`Error::Pool`], [`Error::Database`], [`Error::Blocking`] for
+    ///   connection, SQL and executor failures.
+    pub async fn prune_workers(&self, stale_for: Duration) -> Result<usize, Error> {
+        queries::prune_workers(
+            self.pool.clone(),
+            self.config.queue().to_string(),
+            stale_for,
         )
         .await
     }

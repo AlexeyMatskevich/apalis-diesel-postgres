@@ -10,6 +10,7 @@ pub(crate) mod fetch;
 mod metrics;
 mod notify;
 mod push;
+pub(crate) mod retention;
 pub(crate) mod worker;
 
 pub(crate) use metrics::refresh_queue_stats_snapshot;
@@ -26,6 +27,7 @@ pub(crate) use push::{FlushFailure, flush_tasks, push_tasks_on_conn, validate_ta
 pub(crate) use push::{
     MAX_IDEMPOTENCY_KEY_LEN, MAX_JOB_PAYLOAD_LEN, MAX_METADATA_PAYLOAD_LEN, MAX_QUEUE_NAME_LEN,
 };
+pub(crate) use retention::{prune_workers, purge_terminal_tasks};
 pub(crate) use worker::{
     initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream, release_worker,
     validate_liveness,

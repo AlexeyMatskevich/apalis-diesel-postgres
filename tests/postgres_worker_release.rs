@@ -1,6 +1,7 @@
 //! The end of a worker's life through the public API: releasing a
-//! registration after the worker stops, restarting the same name at once, and
-//! refusing a heartbeat schedule that cannot keep a registration fresh.
+//! registration after the worker stops, restarting the same name at once,
+//! refusing a heartbeat schedule that cannot keep a registration fresh, and
+//! removing completed history.
 
 #![cfg(feature = "tokio")]
 
@@ -16,7 +17,7 @@ use std::{
 
 use apalis::prelude::*;
 use apalis_core::{
-    backend::{Backend, BackendExt, FetchById, TaskSink},
+    backend::{Backend, BackendExt, FetchById, TaskSink, Vacuum},
     task::status::Status,
     worker::context::WorkerContext,
 };
@@ -424,6 +425,98 @@ fn is_refused_before_registering()
     })
 }
 
+// --------------------------------------------------------------------------
+// Removing completed history
+// --------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RetentionObservation {
+    kept_by_window: usize,
+    vacuumed: usize,
+    remaining: Vec<Option<Status>>,
+    pruned_workers: usize,
+    workers_left: i64,
+}
+
+async fn retention_after_a_run() -> Result<Outcome<RetentionObservation>, String> {
+    let Some(pool) = pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("worker-release-retention-{}", ulid::Ulid::new());
+    cleanup(pool.clone(), queue.clone()).await?;
+    let observation = async {
+        let handled = Arc::new(AtomicUsize::new(0));
+        let storage = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
+        let mut producer = storage.clone();
+        let done = push_with_id(&mut producer, "to complete", None).await?;
+        run_until_done(storage.clone(), "retention-worker", done, handled.clone()).await?;
+        storage
+            .release_worker("retention-worker")
+            .await
+            .map_err(|e| e.to_string())?;
+        // A task scheduled far ahead stays active and must survive both steps.
+        let pending = push_with_id(&mut producer, "still pending", Some(4_000_000_000)).await?;
+        let kept_by_window = storage
+            .purge_terminal_tasks(Duration::from_secs(3_600))
+            .await
+            .map_err(|e| e.to_string())?;
+        let vacuumed = producer.vacuum().await.map_err(|e| e.to_string())?;
+        let mut remaining = Vec::new();
+        for id in [done, pending] {
+            remaining.push(
+                producer
+                    .fetch_by_id(&id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map(|task| task.parts.status.load()),
+            );
+        }
+        // The released registration is stale and, once its task is gone,
+        // unreferenced.
+        let pruned_workers = storage
+            .prune_workers(Duration::from_secs(60))
+            .await
+            .map_err(|e| e.to_string())?;
+        let count_queue = queue.clone();
+        let workers_left = support::with_conn(pool.clone(), move |conn| {
+            sql_query("SELECT count(*)::bigint AS n FROM apalis.workers WHERE worker_type = $1")
+                .bind::<Text, _>(&count_queue)
+                .get_result::<Count>(conn)
+                .map(|row| row.n)
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+        Ok::<_, String>(RetentionObservation {
+            kept_by_window,
+            vacuumed,
+            remaining,
+            pruned_workers,
+            workers_left,
+        })
+    }
+    .await;
+    cleanup(pool, queue).await?;
+    observation.map(Outcome::Completed)
+}
+
+fn removes_only_completed_history()
+-> impl Fn(&Result<Outcome<RetentionObservation>, String>) -> AssertionResult {
+    observe::<RetentionObservation, _>("retention", |o| {
+        if o.kept_by_window == 0
+            && o.vacuumed == 1
+            && o.remaining == [None, Some(Status::Pending)]
+            && o.pruned_workers == 1
+            && o.workers_left == 0
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the window to keep the fresh result, vacuum to remove exactly it, the scheduled task to survive, and the released registration to be pruned afterwards; got {o:?}"
+            ))
+        }
+    })
+}
+
 lets_expect! { #tokio_test
     expect(release_with_unfinished_claim().await) as a_released_registration {
         when the_worker_stopped_with_an_unfinished_claim {
@@ -444,5 +537,9 @@ lets_expect! { #tokio_test
 
     expect(misconfigured_liveness().await) as a_heartbeat_slower_than_the_stale_deadline {
         to is_refused_before_registering { is_refused_before_registering() }
+    }
+
+    expect(retention_after_a_run().await) as completed_history {
+        to is_removed_only_by_explicit_retention { removes_only_completed_history() }
     }
 }
