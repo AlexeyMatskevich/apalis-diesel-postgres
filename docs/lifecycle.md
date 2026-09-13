@@ -205,9 +205,12 @@ these states; the columns in parentheses are what other actors read.
    and returns both results. Apalis drains handlers before a graceful stop,
    so a graceful release usually recovers nothing; after a fail-stop it hands
    unfinished claims back at once instead of after the stale deadline.
-7. **Prune.** `prune_workers` deletes registrations that have been stale for
-   the given window and that no task references. A registration named by a
-   completed task stays until `purge_terminal_tasks` removes that task.
+7. **Prune.** `prune_workers` deletes, in bounded batches, registrations
+   that have been stale for the given window and that no task references.
+   The window must be at least `reenqueue_orphaned_after`, the deadline
+   after which the protocol itself treats a registration as stale; a shorter
+   window is refused. A registration named by a completed task stays until
+   `purge_terminal_tasks` removes that task.
 
 ### Recovery latency
 
@@ -272,11 +275,15 @@ retention with three operations, in this order:
 1. `purge_terminal_tasks(completed_before)` deletes `Done`, `Killed` and
    budget-exhausted `Failed` rows of the queue whose completion (or, when
    unset, schedule) is at least `completed_before` old, in batches of 10 000
-   rows, each batch its own transaction. `Vacuum::vacuum` is the same with a
+   rows, each batch its own transaction on its own pooled connection, against
+   a cutoff sampled once at the start. `Vacuum::vacuum` is the same with a
    zero window.
 2. `prune_workers(stale_for)` deletes registrations stale for at least
-   `stale_for` that no task references. Choose `stale_for` no shorter than
-   the longest `reenqueue_orphaned_after` any worker of the queue uses.
+   `stale_for` that no task references, in batches of 1000. `stale_for`
+   must be at least the storage's `reenqueue_orphaned_after`; use the
+   longest deadline any worker of the queue runs with when they differ.
+   Every deleted row runs the foreign-key probe over the queue's history,
+   which no index serves, so the call is slow on large queues.
 3. `refresh_queue_stats_snapshot` if dashboards read the snapshot.
 
 Consequences of a purge:

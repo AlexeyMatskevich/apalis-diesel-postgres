@@ -20,11 +20,14 @@ pub(crate) fn mint_lease_token() -> String {
 /// stay hidden behind a live registration.
 pub(crate) const REENQUEUE_ORPHANED_BATCH_LIMIT: i32 = 1000;
 
-// Compare elapsed seconds as a numeric value instead of constructing an interval:
-// even Duration::MAX is representable, and subsecond deadlines are preserved.
-fn timeout_seconds(duration: Duration) -> f64 {
+/// Compare elapsed seconds as a numeric value instead of constructing an
+/// interval: even `Duration::MAX` is representable, and subsecond deadlines
+/// are preserved. Shared by every window the queries compare against the
+/// server clock.
+pub(crate) fn timeout_seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
+
 #[derive(QueryableByName)]
 struct WorkerIdentity {
     #[diesel(sql_type = Text)]

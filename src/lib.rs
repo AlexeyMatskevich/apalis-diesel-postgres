@@ -374,29 +374,33 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     }
 
     /// Delete the registrations of this storage's queue that have been stale
-    /// for at least `stale_for` and that no task references any more, and
-    /// return how many rows were deleted.
+    /// for at least `stale_for` and that no task references any more, in
+    /// bounded batches, and return how many rows were deleted.
     ///
     /// Registration rows are kept by the worker protocol so completed tasks
     /// can name their last owner; workers with unique names (one per process
     /// or pod) otherwise accumulate forever. A registration still referenced
     /// by a task, even a completed one, is kept until
-    /// [`Self::purge_terminal_tasks`] removes that task. A registration in use
-    /// by another transaction is skipped, and a live one is never stale, so
-    /// this cannot remove a working registration. Pass a window no shorter
-    /// than the longest `reenqueue_orphaned_after` any worker of the queue
-    /// uses, so a merely slow heartbeat is never mistaken for an abandoned one.
+    /// [`Self::purge_terminal_tasks`] removes that task, and a registration in
+    /// use by another transaction is skipped. `stale_for` must be at least
+    /// this storage's `reenqueue_orphaned_after`: a registration is stale
+    /// only after that deadline, and pruning it earlier would remove a live
+    /// worker whose heartbeat merely lags, so that its next renewal reports
+    /// `WorkerNotRegistered`. Use the longest deadline any worker of the queue
+    /// runs with when they differ. A released registration passes any window.
+    ///
+    /// Every deleted row runs the foreign-key probe over the queue's history,
+    /// which no index serves; treat this as a slow maintenance call on large
+    /// queues.
     ///
     /// # Errors
+    /// - [`Error::InvalidArgument`] if `stale_for` is shorter than
+    ///   `reenqueue_orphaned_after`; nothing is deleted.
     /// - [`Error::Pool`], [`Error::Database`], [`Error::Blocking`] for
-    ///   connection, SQL and executor failures.
+    ///   connection, SQL and executor failures. Batches already deleted stay
+    ///   deleted.
     pub async fn prune_workers(&self, stale_for: Duration) -> Result<usize, Error> {
-        queries::prune_workers(
-            self.pool.clone(),
-            self.config.queue().to_string(),
-            stale_for,
-        )
-        .await
+        queries::prune_workers(self.pool.clone(), self.config.clone(), stale_for).await
     }
 
     /// Change the task codec while retaining pool, config, fetcher, and the

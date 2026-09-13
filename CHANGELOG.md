@@ -19,10 +19,13 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   on every exit path, returning both results as `ReleasedRun`.
 - Retention for the queue's data: `PostgresStorage::purge_terminal_tasks`
   deletes `Done`, `Killed` and budget-exhausted `Failed` tasks completed
-  longer ago than a window, in bounded batches; the apalis `Vacuum` trait is
-  implemented as that purge with a zero window; and
-  `PostgresStorage::prune_workers` deletes registrations that have been
-  stale for a window and that no task references.
+  longer ago than a window, in bounded batches that each borrow a pooled
+  connection; the apalis `Vacuum` trait is implemented as that purge with a
+  zero window; and `PostgresStorage::prune_workers` deletes, in bounded
+  batches, registrations that have been stale for a window and that no task
+  references. A prune window shorter than `reenqueue_orphaned_after` is
+  refused with `InvalidArgument`, because a registration is stale only after
+  that deadline.
 - `docs/lifecycle.md` documents every task state and transition, the worker
   registration protocol, recovery latency after each kind of failure, and
   retention.

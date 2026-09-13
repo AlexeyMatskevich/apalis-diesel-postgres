@@ -670,14 +670,12 @@ pub(crate) fn completed_task_rows(
     ids: Vec<String>,
 ) -> impl Future<Output = Result<Vec<TaskResultRow>, Error>> + Send {
     with_conn(pool, move |conn| {
-        sql_query(
+        sql_query(format!(
             "SELECT id, status, last_result AS result
              FROM apalis.jobs
-             WHERE id = ANY($1)
-                 AND (status = 'Done'
-                      OR (status = 'Failed' AND attempts >= max_attempts)
-                      OR status = 'Killed')",
-        )
+             WHERE id = ANY($1) AND {}",
+            crate::queries::TERMINAL_PREDICATE
+        ))
         .bind::<Array<Text>, _>(ids)
         .load::<TaskResultRow>(conn)
         .map_err(Error::database("fetching completed task results"))

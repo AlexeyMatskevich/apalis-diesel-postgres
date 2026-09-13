@@ -539,7 +539,9 @@ async fn run_purge(
                 Window::Zero => Duration::ZERO,
                 Window::OneMinute => Duration::from_secs(60),
             };
-            let deleted = retention::purge_terminal_batch(conn, &queue, completed_before, 100)
+            let cutoff =
+                retention::server_cutoff(conn, completed_before).map_err(|e| e.to_string())?;
+            let deleted = retention::purge_terminal_batch(conn, &queue, cutoff, 100)
                 .map_err(|e| e.to_string())?;
             let remaining = count_jobs(conn, row_queue)?;
             Ok(PurgeRun { deleted, remaining })
@@ -607,7 +609,9 @@ async fn run_batched_purge() -> Result<Outcome<BatchedPurgeRun>, String> {
         .await?;
         let first_queue = queue.clone();
         let first_batch = with_conn(pool.clone(), move |conn| {
-            retention::purge_terminal_batch(conn, &first_queue, Duration::ZERO, 2)
+            let cutoff =
+                retention::server_cutoff(conn, Duration::ZERO).map_err(|e| e.to_string())?;
+            retention::purge_terminal_batch(conn, &first_queue, cutoff, 2)
                 .map_err(|e| e.to_string())
         })
         .await?;
@@ -736,21 +740,27 @@ async fn run_prune(
                 }
             }
             let mut peer = pool.get().map_err(|e| e.to_string())?;
-            if matches!(hold, Hold::HeldByPeer) {
-                sql_query("BEGIN")
-                    .execute(&mut peer)
+            // Everything between BEGIN and ROLLBACK runs in a closure so the
+            // peer's transaction is rolled back on every path: a connection
+            // handed back to the shared pool inside an open transaction would
+            // poison later scenarios.
+            let held = |peer: &mut PgConnection, conn: &mut PgConnection| -> Result<usize, String> {
+                if matches!(hold, Hold::HeldByPeer) {
+                    sql_query("BEGIN")
+                        .execute(peer)
+                        .map_err(|e| e.to_string())?;
+                    sql_query(
+                        "SELECT 1 FROM apalis.workers WHERE id = $1 AND worker_type = $2 FOR KEY SHARE",
+                    )
+                    .bind::<Text, _>(&worker)
+                    .bind::<Text, _>(row_queue)
+                    .execute(peer)
                     .map_err(|e| e.to_string())?;
-                sql_query(
-                    "SELECT 1 FROM apalis.workers WHERE id = $1 AND worker_type = $2 FOR KEY SHARE",
-                )
-                .bind::<Text, _>(&worker)
-                .bind::<Text, _>(row_queue)
-                .execute(&mut peer)
-                .map_err(|e| e.to_string())?;
-            }
-            let pruned =
-                retention::prune_workers_blocking(&mut conn, &queue, Duration::from_secs(60))
-                    .map_err(|e| e.to_string());
+                }
+                retention::prune_workers_batch(conn, &queue, Duration::from_secs(60), 100)
+                    .map_err(|e| e.to_string())
+            };
+            let pruned = held(&mut peer, &mut conn);
             if matches!(hold, Hold::HeldByPeer) {
                 sql_query("ROLLBACK")
                     .execute(&mut peer)

@@ -33,6 +33,13 @@ pub(crate) use worker::{
     validate_liveness,
 };
 
+/// SQL predicate for a row that will never run again: `Done`, `Killed`, or
+/// `Failed` with no retry budget left (a shape only other writers produce).
+/// Shared by `WaitForCompletion` and retention so the rows a waiter can
+/// observe and the rows a purge removes are the same set.
+pub(crate) const TERMINAL_PREDICATE: &str =
+    "(status IN ('Done', 'Killed') OR (status = 'Failed' AND attempts >= max_attempts))";
+
 pub(super) fn with_conn<F, T>(
     pool: PgPool,
     work: F,
