@@ -444,6 +444,12 @@ within `reenqueue_orphaned_after`, or their `Running` and `Queued` tasks are
 recovered as orphans. While that registration is fresh, a worker stream
 registering the same name receives `AlreadyRegistered`; once it is stale, the
 stream takes the name over and recovers its claims first.
+The middleware returned by `Backend::middleware()` and the acknowledger from
+`PostgresStorage::acknowledger()` carry that storage's registration token and
+local liveness. `PgMiddleware::new`, `PgMiddleware::with_lease_token`,
+`PgAck::new` and `PgAck::with_lease_token` bind at most a token: like
+`lock_task`, they do not manage local retirement, so a dropped or failed
+acknowledgement through them leaves the worker's heartbeat running.
 Dropping a polling stream after it has yielded its registration also retires
 that registration. A stream whose registration failed, for example with
 `AlreadyRegistered` or a pool error, owns no claim; dropping it leaves the

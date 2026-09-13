@@ -379,3 +379,7 @@ be refused until the old database registration becomes stale. Do not force it
 stale while prior handlers or SQL can still be active. Low-level `lock_task` and
 `lock_task_in_queue` callers must resolve `ClaimOutcomeUnknown` or stop their own
 heartbeat and allow orphan recovery; these APIs do not manage local retirement.
+The same applies to `PgMiddleware::new`, `PgMiddleware::with_lease_token`,
+`PgAck::new` and `PgAck::with_lease_token`: they bind at most a token. The
+middleware of a storage-registered worker is `Backend::middleware()`, and its
+manual acknowledger is `PostgresStorage::acknowledger()`.

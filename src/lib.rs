@@ -235,6 +235,23 @@ impl<Args> PostgresStorage<Args> {
     pub fn config(&self) -> &Config {
         &self.config
     }
+
+    /// An acknowledger bound to this storage's registration token and local
+    /// liveness, for manual acknowledgement of tasks claimed by this
+    /// storage's worker streams.
+    ///
+    /// A failed acknowledgement retires the worker's local registration the
+    /// same way the automatic middleware does, so orphan recovery can reclaim
+    /// the task. [`PgAck::new`] and [`PgAck::with_lease_token`] bind no
+    /// liveness and leave the heartbeat running after a failure.
+    #[must_use]
+    pub fn acknowledger(&self) -> PgAck {
+        PgAck::with_lease_registry(
+            &self.pool,
+            std::sync::Arc::clone(&self.lease_token),
+            self.leases.clone(),
+        )
+    }
 }
 
 impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
