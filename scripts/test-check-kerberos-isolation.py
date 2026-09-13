@@ -122,9 +122,19 @@ class WholeSuiteCheck(unittest.TestCase):
             "test unit::case ... ok\n", "test unit::case ... background diagnostic\n")
         self.assert_rejected(self.run_check())
 
+    def test_a_success_line_split_by_status_like_output_is_still_counted(self):
+        for noise in ["ignored by the component", "FAILED to open a trace", "FAILED"]:
+            with self.subTest(noise=noise):
+                self.settings["run_output"] = "".join(block(t, n) for t, n in self.targets).replace(
+                    "test unit::case ... ok\n", f"test unit::case ... {noise}\nok\n")
+                result = self.run_check()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("checked 3 tests", result.stdout)
+
     def test_a_failed_test_is_rejected_even_when_later_output_ends_with_ok(self):
         self.settings["run_output"] = self.settings["run_output"].replace(
-            "test unit::case ... ok\n", "test unit::case ... FAILED\nlooks ok\n")
+            "test unit::case ... ok\n", "test unit::case ... FAILED\nlooks ok\n").replace(
+            "test result: ok. 2 passed; 0 failed", "test result: FAILED. 1 passed; 1 failed")
         self.assert_rejected(self.run_check())
 
     def test_discovery_with_an_incorrect_summary_is_rejected(self):

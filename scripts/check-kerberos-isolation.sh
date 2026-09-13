@@ -120,7 +120,10 @@ test_roster() {
       count++; total++
       next
     }
-    phase == "run" && /^test .* \.\.\. / && !/ \.\.\. (ok|FAILED|ignored.*)$/ {
+    # Any verdict other than a complete `ok` is held: a real failure or an
+    # ignored test is still rejected, by the harness summary counts and by
+    # the roster comparison, whatever text follows the dots.
+    phase == "run" && /^test .* \.\.\. / {
       if (target == "" || !started || complete) bad = 1
       sub(/^test /, ""); sub(/ \.\.\. .*$/, "")
       sub(/ - should panic$/, "")
