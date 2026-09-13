@@ -139,6 +139,20 @@ pub enum Error {
         worker_id: String,
     },
 
+    /// A claim was already acknowledged in this process, so a repeated
+    /// dispatch of the same claim was refused before the handler ran again.
+    #[error(
+        "task {task_id} in queue {queue} was already acknowledged by worker {worker_id} for its current claim; the database retry budget schedules any further attempt, so an in-process re-dispatch is refused"
+    )]
+    AlreadyAcknowledged {
+        /// Task id involved in the acknowledgement.
+        task_id: String,
+        /// Queue involved in the acknowledgement.
+        queue: String,
+        /// Worker id involved in the acknowledgement.
+        worker_id: String,
+    },
+
     /// A worker heartbeat could not be recorded because the worker row is absent.
     #[error(
         "worker not registered while {operation} (worker_id: {worker_id}, queue: {queue}); {hint}"
@@ -231,6 +245,18 @@ impl Error {
         worker_id: impl Into<String>,
     ) -> Self {
         Self::StaleAcknowledgement {
+            task_id: task_id.into(),
+            queue: queue.into(),
+            worker_id: worker_id.into(),
+        }
+    }
+
+    pub(crate) fn already_acknowledged(
+        task_id: impl Into<String>,
+        queue: impl Into<String>,
+        worker_id: impl Into<String>,
+    ) -> Self {
+        Self::AlreadyAcknowledged {
             task_id: task_id.into(),
             queue: queue.into(),
             worker_id: worker_id.into(),

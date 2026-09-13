@@ -1206,6 +1206,165 @@ mod dropped_stream {
     }
 }
 
+// The persisted retry budget schedules attempts; an in-process re-dispatch of
+// an acknowledged claim is refused instead of running and reporting stale.
+mod redispatched_claim {
+    use apalis::layers::{WorkerBuilderExt, retry::RetryPolicy};
+    use apalis_core::{
+        backend::{FetchById, TaskSink, poll_strategy::IntervalStrategy},
+        error::{BoxDynError, WorkerError},
+        task::builder::TaskBuilder,
+        worker::builder::WorkerBuilder,
+    };
+    use apalis_diesel_postgres::{
+        Config, Error, PgContext, PgTaskId, PostgresStorage, build_pool, setup,
+    };
+    use diesel::{RunQueryDsl, sql_query, sql_types::Text};
+    use futures::{FutureExt, future::BoxFuture};
+    use lets_expect::*;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    #[derive(Clone, Copy)]
+    enum Retries {
+        DatabaseBudget,
+        InProcessLayer,
+    }
+    #[derive(Debug)]
+    struct Observation {
+        run: &'static str,
+        handler_runs: usize,
+        status: String,
+        attempts: usize,
+    }
+    fn run_kind(result: &Result<(), WorkerError>) -> &'static str {
+        match result {
+            Ok(()) => "completed",
+            Err(WorkerError::StreamError(error))
+                if matches!(
+                    error.downcast_ref::<Error>(),
+                    Some(Error::WorkerRetired { .. })
+                ) =>
+            {
+                "retired"
+            }
+            Err(_) => "other_error",
+        }
+    }
+    async fn failing_handler_under(retries: Retries) -> Observation {
+        let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
+        setup(&pool).await.unwrap();
+        let queue = format!("lifecycle_redispatch_{}", ulid::Ulid::new());
+        let config = Config::new(&queue)
+            .set_keep_alive(Duration::from_millis(10))
+            .set_reenqueue_orphaned_after(Duration::from_secs(60));
+        let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config)
+            .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
+        // One attempt makes the first failure terminal, so the fetcher cannot
+        // legitimately claim the row a second time during the run.
+        let id = PgTaskId::new(ulid::Ulid::new());
+        storage
+            .push_task(
+                TaskBuilder::new("work".to_owned())
+                    .with_task_id(id)
+                    .with_ctx(PgContext::new().with_max_attempts(1))
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let handler_runs = Arc::new(AtomicUsize::new(0));
+        let counter = handler_runs.clone();
+        let handler = move |_args: String| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err::<(), BoxDynError>("handler intentionally failed".into())
+            }
+        };
+        let mut observer = storage.clone();
+        let signal = async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let terminal = observer
+                    .fetch_by_id(&id)
+                    .await
+                    .map_err(|error| WorkerError::StreamError(Box::new(error)))?
+                    .is_some_and(|task| task.parts.status.load().to_string() == "Killed");
+                if terminal {
+                    // Leave room for any re-dispatch the retry layer attempts.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(WorkerError::PanicError("terminal state timeout".into()));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let builder = WorkerBuilder::new("redispatch-worker").backend(storage.clone());
+        let run: BoxFuture<'static, Result<(), WorkerError>> = match retries {
+            Retries::DatabaseBudget => builder.build(handler).run_until(signal).boxed(),
+            Retries::InProcessLayer => builder
+                .retry(RetryPolicy::retries(2))
+                .build(handler)
+                .run_until(signal)
+                .boxed(),
+        };
+        let run = run_kind(&run.await);
+        let task = storage.fetch_by_id(&id).await.unwrap().unwrap();
+        let status = task.parts.status.load().to_string();
+        let attempts = task.parts.attempt.current();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().unwrap();
+            sql_query("DELETE FROM apalis.jobs WHERE job_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+            sql_query("DELETE FROM apalis.workers WHERE worker_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        Observation {
+            run,
+            handler_runs: handler_runs.load(Ordering::SeqCst),
+            status,
+            attempts,
+        }
+    }
+    fn observes(
+        run: &'static str,
+        handler_runs: usize,
+        status: &'static str,
+        attempts: usize,
+    ) -> impl Fn(&Result<crate::support::Outcome<Observation>, String>) -> AssertionResult {
+        crate::satisfies(move |o: &Observation| {
+            o.run == run
+                && o.handler_runs == handler_runs
+                && o.status == status
+                && o.attempts == attempts
+        })
+    }
+    async fn run(retries: Retries) -> Result<crate::support::Outcome<Observation>, String> {
+        crate::database_case(|| failing_handler_under(retries)).await
+    }
+    lets_expect! {#tokio_test
+      expect(run(retries).await) as a_failing_handler_under_the_backend_middleware {
+        let retries=Retries::DatabaseBudget;
+        to records_one_attempt_and_completes_the_run {observes("completed",1,"Killed",1)}
+        when an_in_process_retry_layer_wraps_the_middleware {let retries=Retries::InProcessLayer;
+          to refuses_the_re_dispatch_and_completes_the_run {observes("completed",1,"Killed",1)}
+        }
+      }
+    }
+}
+
 // Claim identity and runtime execution counts have separate responsibilities.
 mod attempt_accounting {
     use crate::support;
@@ -1462,7 +1621,7 @@ mod attempt_accounting {
             let second_row = row(pool).await?;
             Ok(
                 json!({"input_attempt":input_attempt,"first_succeeded":first.is_ok(),
-                "repeated_ack_is_stale":matches!(second, Err(Error::StaleAcknowledgement{..})),
+                "repeated_ack_is_refused_locally":matches!(second, Err(Error::AlreadyAcknowledged{..})),
                 "first_row":first_row,"second_row":second_row}),
             )
         })
@@ -1475,7 +1634,7 @@ mod attempt_accounting {
             let row = json!({"status":"Done","attempts":1,"max_attempts":3,
                 "last_result":{"Ok":"accepted"},"owner":"attempt-worker","locked":true,"done":true});
             let expected = json!({"input_attempt":0,"first_succeeded":true,
-                "repeated_ack_is_stale":true,"first_row":row,"second_row":row});
+                "repeated_ack_is_refused_locally":true,"first_row":row,"second_row":row});
             if actual == &expected {
                 Ok(())
             } else {

@@ -412,6 +412,11 @@ branch. It cannot authorize further polling. A finite custom strategy must
 explicitly define how polling continues; creating fresh configuration or using
 the factory is the upgrade path for previously shared one-shot strategies.
 
+Each claim is acknowledged at most once. An in-process re-dispatch of an
+already acknowledged claim, for example by a retry layer placed outside the
+backend middleware, is refused with `AlreadyAcknowledged` before the handler
+runs again; the persisted retry budget schedules the next attempt, and the
+worker registration stays active.
 If automatic acknowledgement loses its result through a database or
 serialization error, the affected worker registration is retired locally.
 A claim whose transaction produced tasks but whose commit cannot be confirmed

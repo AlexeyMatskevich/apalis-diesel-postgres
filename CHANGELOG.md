@@ -7,8 +7,24 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `Error::AlreadyAcknowledged` reports an in-process re-dispatch of a claim
+  whose acknowledgement already committed. `PgMiddleware` returns it inside an
+  `AbortError` before the handler runs again, and `PgAck` returns it for a
+  repeated manual acknowledgement of the same claim snapshot.
+
 ### Fixed
 
+- A retry layer composed outside the backend middleware, such as apalis's
+  `.retry(RetryPolicy::retries(n))`, re-dispatched a task whose claim was
+  already acknowledged. The handler ran again, the second acknowledgement was
+  reported as `StaleAcknowledgement`, and that stale result retired the worker
+  registration, ending every task in flight on that worker. Each claim now
+  carries an acknowledgement marker shared by all clones of the task: the
+  repeat is refused without running the handler, counts as a dispatch on the
+  task's attempt counter so counter-based retry policies terminate, and keeps
+  the registration active.
 - A worker stream whose registration failed (`AlreadyRegistered`, a pool
   error) retired the worker name locally when it was dropped, so every clone
   of that storage answered `WorkerRetired` and a same-name restart from a
