@@ -98,8 +98,29 @@ test_roster() {
       complete = 1
     }
     phase == "run" && /^running [0-9]+ tests?$/ {
-      if (target == "" || started || complete) bad = 1
+      if (target == "" || started || complete || pending != "") bad = 1
       declared = $2; started = 1
+    }
+    # Output that escapes libtest capture (a native library, a thread without
+    # capture) can land between the name of a test and its verdict. The
+    # verdict then ends a later line; the name is held until it arrives, and
+    # any other report line while it is held is an incomplete report.
+    # Only complete libtest report lines end a held name early: a new test
+    # line, a full summary, or a target header. Diagnostic text may begin with
+    # the same words ("running cleanup hook", "test result: cache warmed") and
+    # is not a report line.
+    phase == "run" && pending != "" && (/^test .* \.\.\. / ||
+        /^test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out; finished in / ||
+        /^running [0-9]+ tests?$/) {
+      bad = 1
+    }
+    # The verdict may be glued to a diagnostic written without a trailing
+    # newline ("backgroundok"); the summary counts still have to agree.
+    phase == "run" && pending != "" && /ok$/ {
+      if (target == "" || !started || complete) bad = 1
+      print "case\t" target "\t" pending
+      count++; total++; pending = ""
+      next
     }
     phase == "run" && /^test .* \.\.\. ok$/ {
       if (target == "" || !started || complete) bad = 1
@@ -107,14 +128,34 @@ test_roster() {
       sub(/ - should panic$/, "")
       print "case\t" target "\t" $0
       count++; total++
+      next
+    }
+    # A diagnostic without a trailing newline glues the verdict to the same
+    # line ("... backgroundok"); the summary counts still have to agree.
+    phase == "run" && /^test .* \.\.\. .*ok$/ {
+      if (target == "" || !started || complete) bad = 1
+      sub(/^test /, ""); sub(/ \.\.\. .*$/, "")
+      sub(/ - should panic$/, "")
+      print "case\t" target "\t" $0
+      count++; total++
+      next
+    }
+    # Any verdict other than a complete `ok` is held: a real failure or an
+    # ignored test is still rejected, by the harness summary counts and by
+    # the roster comparison, whatever text follows the dots.
+    phase == "run" && /^test .* \.\.\. / {
+      if (target == "" || !started || complete) bad = 1
+      sub(/^test /, ""); sub(/ \.\.\. .*$/, "")
+      sub(/ - should panic$/, "")
+      pending = $0
     }
     phase == "run" && /^test result: ok\./ {
-      if (target == "" || !started || complete || $4 != declared || $4 != count ||
+      if (target == "" || !started || complete || pending != "" || $4 != declared || $4 != count ||
           $6 != 0 || $8 != 0 || $10 != 0 || $12 != 0) bad = 1
       complete = 1
     }
     END {
-      if (bad || !complete || total == 0) {
+      if (bad || !complete || pending != "" || total == 0) {
         print "incomplete or empty " phase " test report" > "/dev/stderr"
         exit 1
       }
