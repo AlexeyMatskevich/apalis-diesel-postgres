@@ -98,23 +98,41 @@ test_roster() {
       complete = 1
     }
     phase == "run" && /^running [0-9]+ tests?$/ {
-      if (target == "" || started || complete) bad = 1
+      if (target == "" || started || complete || pending != "") bad = 1
       declared = $2; started = 1
     }
+    # Output that escapes libtest capture (a native library, a thread without
+    # capture) can land between the name of a test and its verdict. The
+    # verdict then ends a later line; the name is held until it arrives, and
+    # any other report line while it is held is an incomplete report.
+    phase == "run" && pending != "" && /(^|[^[:alnum:]_])ok$/ {
+      if (target == "" || !started || complete) bad = 1
+      print "case\t" target "\t" pending
+      count++; total++; pending = ""
+      next
+    }
+    phase == "run" && pending != "" && (/^test / || /^test result:/ || /^running /) { bad = 1 }
     phase == "run" && /^test .* \.\.\. ok$/ {
       if (target == "" || !started || complete) bad = 1
       sub(/^test /, ""); sub(/ \.\.\. ok$/, "")
       sub(/ - should panic$/, "")
       print "case\t" target "\t" $0
       count++; total++
+      next
+    }
+    phase == "run" && /^test .* \.\.\. / && !/ \.\.\. (ok|FAILED|ignored.*)$/ {
+      if (target == "" || !started || complete) bad = 1
+      sub(/^test /, ""); sub(/ \.\.\. .*$/, "")
+      sub(/ - should panic$/, "")
+      pending = $0
     }
     phase == "run" && /^test result: ok\./ {
-      if (target == "" || !started || complete || $4 != declared || $4 != count ||
+      if (target == "" || !started || complete || pending != "" || $4 != declared || $4 != count ||
           $6 != 0 || $8 != 0 || $10 != 0 || $12 != 0) bad = 1
       complete = 1
     }
     END {
-      if (bad || !complete || total == 0) {
+      if (bad || !complete || pending != "" || total == 0) {
         print "incomplete or empty " phase " test report" > "/dev/stderr"
         exit 1
       }

@@ -110,6 +110,23 @@ class WholeSuiteCheck(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_a_success_line_split_by_uncaptured_output_is_still_counted(self):
+        self.settings["run_output"] = self.settings["run_output"].replace(
+            "test unit::case ... ok\n", "test unit::case ... background diagnostic\nok\n")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("checked 3 tests", result.stdout)
+
+    def test_a_split_success_line_without_its_verdict_is_rejected(self):
+        self.settings["run_output"] = self.settings["run_output"].replace(
+            "test unit::case ... ok\n", "test unit::case ... background diagnostic\n")
+        self.assert_rejected(self.run_check())
+
+    def test_a_failed_test_is_rejected_even_when_later_output_ends_with_ok(self):
+        self.settings["run_output"] = self.settings["run_output"].replace(
+            "test unit::case ... ok\n", "test unit::case ... FAILED\nlooks ok\n")
+        self.assert_rejected(self.run_check())
+
     def test_discovery_with_an_incorrect_summary_is_rejected(self):
         self.settings["list_output"] = self.settings["list_output"].replace("2 tests,", "3 tests,")
         self.assert_rejected(self.run_check())
