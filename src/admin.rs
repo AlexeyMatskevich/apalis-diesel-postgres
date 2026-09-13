@@ -211,6 +211,15 @@ where
 
     /// Wait for the given tasks to complete, yielding each result as it lands.
     ///
+    /// The tasks must exist: an id no row carries on two consecutive polls,
+    /// at least one backoff interval apart, yields
+    /// [`Error::TaskNotFound`] for that id and is no longer waited for,
+    /// whether it was never enqueued or was removed by
+    /// [`PostgresStorage::purge_terminal_tasks`]. One absent poll is
+    /// tolerated so an enqueue committing right after the wait began is not
+    /// mistaken for a missing task; wait for the enqueue transaction to
+    /// commit before waiting on its ids.
+    ///
     /// # Error handling
     ///
     /// A transient database error during polling does **not** abandon the

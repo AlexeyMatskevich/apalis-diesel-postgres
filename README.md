@@ -644,6 +644,9 @@ worker logs point at the failed lifecycle step:
   already locked, out of retry attempts, or in another queue.
 - Acknowledgement races: `stale acknowledgement` when the stored lock no
   longer matches the worker/attempt/lock timestamp being ack'd.
+- Waiting on an id no row carries: `task not found while waiting for
+  completion` once the id is absent on two consecutive polls, for ids that
+  were never enqueued or tasks that retention removed.
 - Heartbeat failures for missing worker rows: `worker not registered`,
   instead of a generic update-count mismatch. `release_worker` reports the
   same error when the registration is absent, token-free, or owned by

@@ -68,6 +68,11 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Changed
 
+- `WaitForCompletion::wait_for` reports an id that no row carries on two
+  consecutive polls as `TaskNotFound` and stops waiting for it, instead of
+  polling forever. This covers ids that were never enqueued and tasks that
+  `purge_terminal_tasks` or `Vacuum` removed; an enqueue that commits before
+  the second poll is still awaited.
 - Tasks recovered by `release_worker` record
   `Re-enqueued because the worker released its registration.` as their
   result when they had none; the sweep and takeover keep the heartbeat

@@ -296,9 +296,10 @@ retention with three operations, in this order:
 
 Consequences of a purge:
 
-- The task is no longer visible to `FetchById`, the listings, `check_status`
-  or `wait_for`; a `wait_for` that has not observed the result yet never
-  will. Keep the window longer than any waiter.
+- The task is no longer visible to `FetchById`, the listings or
+  `check_status`; a `wait_for` that has not observed the result yet reports
+  the id as `TaskNotFound` once it is absent on two consecutive polls. Keep
+  the window longer than any waiter.
 - Its `idempotency_key` becomes free: a new task with the same key is
   accepted. Keep the window longer than the deduplication horizon.
 - Its registration becomes prunable if nothing else references it.
