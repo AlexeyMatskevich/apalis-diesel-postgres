@@ -57,12 +57,12 @@ use std::{
 };
 
 use apalis_core::{
-    backend::{Filter, ListAllTasks, ListQueues, ListTasks, Metrics},
+    backend::{Filter, ListAllTasks, ListQueues, ListTasks, Metrics, RegisterWorker},
     task::{status::Status, task_id::TaskId},
 };
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 use diesel::{
-    RunQueryDsl, sql_query,
+    QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 use lets_expect::{AssertionResult, *};
@@ -1573,7 +1573,153 @@ fn global_done_grows_by_both_queues()
 // expectations
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// RegisterWorker (admin trait): liveness of a token-free registration
+// --------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum ExistingRegistration {
+    NoRow,
+    WithoutLeaseToken,
+    WithLeaseToken,
+}
+
+#[derive(Debug, QueryableByName)]
+struct RegisteredWorkerRow {
+    #[diesel(sql_type = BigInt)]
+    age_secs: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    lease_token: Option<String>,
+    #[diesel(sql_type = Text)]
+    storage_name: String,
+}
+
+#[derive(Debug)]
+struct AdminRegisterRun {
+    rows: usize,
+    refreshed: bool,
+    lease_token: Option<String>,
+    storage_name: String,
+}
+
+async fn insert_aged_worker(
+    pool: PgPool,
+    queue: String,
+    worker_id: String,
+    lease_token: Option<&'static str>,
+) -> Result<(), String> {
+    with_conn(pool, move |conn| {
+        sql_query(
+            "INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at, lease_token)
+             VALUES ($1, $2, 'Elsewhere', '', now() - INTERVAL '120 seconds', now(), $3)",
+        )
+        .bind::<Text, _>(&worker_id)
+        .bind::<Text, _>(&queue)
+        .bind::<Nullable<Text>, _>(lease_token)
+        .execute(conn)
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+}
+
+async fn run_admin_register(
+    existing: ExistingRegistration,
+) -> Result<Outcome<AdminRegisterRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-register-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let worker_id = format!("spec-admin-register-{queue}");
+    match existing {
+        ExistingRegistration::NoRow => {}
+        ExistingRegistration::WithoutLeaseToken => {
+            insert_aged_worker(pool.clone(), queue.clone(), worker_id.clone(), None).await?;
+        }
+        ExistingRegistration::WithLeaseToken => {
+            insert_aged_worker(
+                pool.clone(),
+                queue.clone(),
+                worker_id.clone(),
+                Some("held-token"),
+            )
+            .await?;
+        }
+    }
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    storage
+        .register_worker(worker_id.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let q = queue.clone();
+    let rows = with_conn(pool.clone(), move |conn| {
+        sql_query(
+            "SELECT EXTRACT(EPOCH FROM clock_timestamp() - last_seen)::bigint AS age_secs, lease_token, storage_name
+             FROM apalis.workers WHERE worker_type = $1 AND id = $2",
+        )
+        .bind::<Text, _>(q)
+        .bind::<Text, _>(worker_id)
+        .load::<RegisteredWorkerRow>(conn)
+        .map_err(|e| e.to_string())
+    })
+    .await?;
+    cleanup_queue(pool, queue).await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| "register_worker left no worker row".to_owned())?;
+    Ok(Outcome::Completed(AdminRegisterRun {
+        rows: rows.len(),
+        refreshed: row.age_secs < 60,
+        lease_token: row.lease_token.clone(),
+        storage_name: row.storage_name.clone(),
+    }))
+}
+
+fn admin_registration_is(
+    refreshed: bool,
+    lease_token: Option<&'static str>,
+    storage_name: &'static str,
+) -> impl Fn(&Result<Outcome<AdminRegisterRun>, String>) -> AssertionResult {
+    observe::<AdminRegisterRun, _>("admin register_worker", move |run| {
+        if run.rows == 1
+            && run.refreshed == refreshed
+            && run.lease_token.as_deref() == lease_token
+            && run.storage_name == storage_name
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one row with refreshed={refreshed}, lease_token={lease_token:?}, storage_name={storage_name}; got {run:?}"
+            ))
+        }
+    })
+}
+
 lets_expect! { #tokio_test
+    // ----- RegisterWorker (admin trait): token-free liveness --------------
+    expect(run_admin_register(existing).await) as admin_register_worker {
+        let existing = ExistingRegistration::NoRow;
+
+        to creates_a_fresh_registration_without_a_lease_token {
+            admin_registration_is(true, None, "PostgresStorage")
+        }
+
+        when a_stale_registration_without_a_lease_token_exists {
+            let existing = ExistingRegistration::WithoutLeaseToken;
+            to renews_its_liveness_and_ownership {
+                admin_registration_is(true, None, "PostgresStorage")
+            }
+        }
+
+        when a_stale_registration_owned_by_a_worker_stream_exists {
+            let existing = ExistingRegistration::WithLeaseToken;
+            to leaves_that_registration_untouched {
+                admin_registration_is(false, Some("held-token"), "Elsewhere")
+            }
+        }
+    }
+
     // ----- list_tasks status filter matrix --------------------------------
     expect(run_status_filter(setup).await) as status_filter {
         let setup = StatusFilterSetup { filter_status: Status::Pending };

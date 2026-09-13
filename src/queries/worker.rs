@@ -137,13 +137,17 @@ pub(crate) fn register_worker_blocking(
         // Materialize the locked row before sampling the server clock. A caller
         // waiting behind a heartbeat must use its updated row, and a caller
         // waiting across the stale deadline must decide after that wait.
+        // Liveness is judged by `last_seen` alone. A registration without a
+        // lease token renews it through the admin `register_worker` path, so
+        // while it is fresh its claims belong to a live consumer and this
+        // registration must wait for the stale deadline like any other.
         let existing=sql_query("WITH locked AS MATERIALIZED (
                 SELECT lease_token,last_seen FROM apalis.workers
                 WHERE id=$1 AND worker_type=$2 FOR UPDATE
             ), sampled AS MATERIALIZED (
                 SELECT lease_token,last_seen,clock_timestamp() AS observed_at FROM locked
             )
-            SELECT lease_token IS NULL OR lease_token=$3
+            SELECT lease_token IS NOT DISTINCT FROM $3
                     OR EXTRACT(EPOCH FROM(observed_at-last_seen)) >= $4 AS allowed,
                 lease_token IS DISTINCT FROM $3
                     OR EXTRACT(EPOCH FROM(observed_at-last_seen)) >= $4 AS lost

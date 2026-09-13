@@ -429,6 +429,15 @@ stream consumer can continue after that error; Apalis treats stream errors as
 fatal. Errors before a claim and empty fetches also do not retire the local
 registration. Low-level token-free callers
 must resolve `ClaimOutcomeUnknown` before renewing that worker's heartbeat.
+
+A registration created through the admin `RegisterWorker` trait carries no
+lease token and has no heartbeat: its liveness is the time of its last
+`register_worker` call. Callers that claim through `lock_task`,
+`lock_task_in_queue` or `apalis.get_jobs` under such a name must re-register
+within `reenqueue_orphaned_after`, or their `Running` and `Queued` tasks are
+recovered as orphans. While that registration is fresh, a worker stream
+registering the same name receives `AlreadyRegistered`; once it is stale, the
+stream takes the name over and recovers its claims first.
 Dropping a polling stream after it has yielded its registration also retires
 that registration. A stream whose registration failed, for example with
 `AlreadyRegistered` or a pool error, owns no claim; dropping it leaves the

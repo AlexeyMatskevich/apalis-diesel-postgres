@@ -615,10 +615,13 @@ fn register_worker_admin(
         // queue) advisory lock so concurrent registrations from a
         // dashboard and a live worker serialize.
         //
-        // The conflict UPDATE deliberately does NOT touch `last_seen`
-        // (heartbeat-spoofing through admin path is closed) and uses
-        // `CASE WHEN lease_token IS NULL` so live worker's `layers` /
-        // `storage_name` are preserved (observability-poisoning closed).
+        // A registration without a lease token has no heartbeat: re-registering
+        // is how it renews `last_seen`, and the orphan sweep and native
+        // registration judge its liveness by that column. A row that carries a
+        // lease token is owned by a heartbeating worker, so the conflict UPDATE
+        // leaves its `last_seen`, `layers` and `storage_name` untouched: the
+        // admin path can neither keep a foreign worker fresh nor poison its
+        // observability.
         // Unlike the worker path (`register_worker_blocking`), this statement
         // always upserts exactly one row: the advisory lock is the *blocking*
         // variant (no `acquired` filter) and the conflict UPDATE carries no
@@ -642,6 +645,11 @@ fn register_worker_admin(
                      WHEN apalis.workers.lease_token IS NULL
                          THEN EXCLUDED.layers
                      ELSE apalis.workers.layers
+                 END,
+                 last_seen = CASE
+                     WHEN apalis.workers.lease_token IS NULL
+                         THEN now()
+                     ELSE apalis.workers.last_seen
                  END",
         )
         .bind::<Text, _>(&worker_id)

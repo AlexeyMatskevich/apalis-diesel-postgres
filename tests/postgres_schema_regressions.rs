@@ -45,13 +45,25 @@ async fn row(pool: PgPool) -> Result<Value, String> {
     })
     .await
 }
-async fn fixture(url: String, status: &str) -> Result<(PgPool, PostgresStorage<String>), String> {
+/// The token-free worker row is fresh for manual acknowledgements. A worker
+/// stream registers the name itself, so the row is inserted stale for it:
+/// a fresh token-free registration would refuse the stream.
+async fn fixture(
+    url: String,
+    status: &str,
+    stream_registers: bool,
+) -> Result<(PgPool, PostgresStorage<String>), String> {
     let pool =
         build_pool_with(url, |b| b.max_size(2).min_idle(Some(0))).map_err(|e| e.to_string())?;
     setup(&pool).await.map_err(|e| e.to_string())?;
     let status = status.to_owned();
+    let last_seen = if stream_registers {
+        "clock_timestamp()-interval '1 day'"
+    } else {
+        "clock_timestamp()"
+    };
     support::with_conn(pool.clone(),move|c|{
- c.batch_execute("INSERT INTO apalis.workers(id,worker_type,storage_name,layers,last_seen,started_at) VALUES('schema-worker','schema-queue','fixture','',clock_timestamp(),clock_timestamp())").map_err(|e|e.to_string())?;
+ c.batch_execute(&format!("INSERT INTO apalis.workers(id,worker_type,storage_name,layers,last_seen,started_at) VALUES('schema-worker','schema-queue','fixture','',{last_seen},clock_timestamp())")).map_err(|e|e.to_string())?;
  sql_query("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,lock_by,lock_at) VALUES('01ARZ3NDEKTSV4RRFFQ69G5FAV','schema-queue',convert_to('\"payload\"','UTF8'),$1,2,10,clock_timestamp()-interval '1second','schema-worker',date_trunc('second',clock_timestamp()))").bind::<Text,_>(status).execute(c).map(|_|()).map_err(|e|e.to_string())
  }).await?;
     Ok((
@@ -61,7 +73,7 @@ async fn fixture(url: String, status: &str) -> Result<(PgPool, PostgresStorage<S
 }
 async fn read_ack(source: Read, coherent: bool) -> Result<support::Outcome<Value>, String> {
     support::with_isolated_database(move|url|async move{
- let (pool,mut storage)=fixture(url,if matches!(source,Read::Claim){"Failed"}else{"Running"}).await?;
+ let (pool,mut storage)=fixture(url,if matches!(source,Read::Claim){"Failed"}else{"Running"},matches!(source,Read::Claim)).await?;
  let id=PgTaskId::new(ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap());
  let filter=Filter{status:Some(Status::Running),page:1,page_size:Some(1)};
  let mut held_stream=None;
@@ -117,7 +129,7 @@ enum Worker {
 }
 async fn compatibility(worker: Worker) -> Result<support::Outcome<Value>, String> {
     support::with_isolated_database(move|url|async move{
- let (pool,_)=fixture(url,"Pending").await?;
+ let (pool,_)=fixture(url,"Pending",false).await?;
  let arg=match worker{Worker::Registered=>Some("schema-worker"),Worker::Missing=>Some("missing-worker"),Worker::Null=>None};
  let before=row(pool.clone()).await?;
  let result=support::with_conn(pool.clone(),move|c|sql_query("SELECT count(*)::integer AS count FROM apalis.get_jobs($1,'schema-queue',1)").bind::<Nullable<Text>,_>(arg).get_result::<Count>(c).map(|r|r.count).map_err(|e|e.to_string())).await;

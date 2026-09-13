@@ -14,6 +14,17 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   `AbortError` before the handler runs again, and `PgAck` returns it for a
   repeated manual acknowledgement of the same claim snapshot.
 
+### Changed
+
+- A registration without a lease token (the admin `RegisterWorker` trait,
+  legacy clients of `apalis.get_jobs`) now renews `last_seen` on every
+  `register_worker` call, and a worker stream registering the same name
+  receives `AlreadyRegistered` while that registration is fresh instead of
+  recovering its `Running` and `Queued` tasks immediately. Liveness is judged
+  by `last_seen` for every registration; a stale token-free registration is
+  still taken over. Rows that carry a lease token are unchanged: the admin
+  path leaves their `last_seen` untouched.
+
 ### Fixed
 
 - A retry layer composed outside the backend middleware, such as apalis's

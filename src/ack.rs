@@ -1738,6 +1738,10 @@ pub(crate) fn calculate_status<Res>(
 /// or `Queued`/`Running` owned by the same worker. A manual retry must restore
 /// retry budget before making an exhausted task `Pending`.
 ///
+/// A registration created through the admin `RegisterWorker` trait has no
+/// heartbeat: re-register within `reenqueue_orphaned_after` of the previous
+/// call, or the locked task is recovered as an orphan.
+///
 /// # Cross-queue semantics
 ///
 /// This entry point does **not** filter by `job_type`: a caller holding a
