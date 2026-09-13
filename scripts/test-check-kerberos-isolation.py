@@ -117,6 +117,20 @@ class WholeSuiteCheck(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("checked 3 tests", result.stdout)
 
+    def test_multiline_diagnostics_that_resemble_report_lines_are_still_counted(self):
+        self.settings["run_output"] = self.settings["run_output"].replace(
+            "test unit::case ... ok\n",
+            "test unit::case ... background diagnostic\nrunning cleanup hook\ntest harness note\nok\n")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("checked 3 tests", result.stdout)
+
+    def test_a_second_test_line_while_a_verdict_is_pending_is_rejected(self):
+        self.settings["run_output"] = self.settings["run_output"].replace(
+            "test shared::case ... ok\ntest unit::case ... ok\n",
+            "test shared::case ... background diagnostic\ntest unit::case ... ok\nok\n")
+        self.assert_rejected(self.run_check())
+
     def test_a_split_success_line_without_its_verdict_is_rejected(self):
         self.settings["run_output"] = self.settings["run_output"].replace(
             "test unit::case ... ok\n", "test unit::case ... background diagnostic\n")

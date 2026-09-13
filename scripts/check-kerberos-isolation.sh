@@ -105,13 +105,18 @@ test_roster() {
     # capture) can land between the name of a test and its verdict. The
     # verdict then ends a later line; the name is held until it arrives, and
     # any other report line while it is held is an incomplete report.
+    # Only complete libtest report lines end a held name early: a new test
+    # line, a summary, or a target header. Diagnostic text may begin with the
+    # same words ("running cleanup hook") and is not a report line.
+    phase == "run" && pending != "" && (/^test .* \.\.\. / || /^test result: / || /^running [0-9]+ tests?$/) {
+      bad = 1
+    }
     phase == "run" && pending != "" && /(^|[^[:alnum:]_])ok$/ {
       if (target == "" || !started || complete) bad = 1
       print "case\t" target "\t" pending
       count++; total++; pending = ""
       next
     }
-    phase == "run" && pending != "" && (/^test / || /^test result:/ || /^running /) { bad = 1 }
     phase == "run" && /^test .* \.\.\. ok$/ {
       if (target == "" || !started || complete) bad = 1
       sub(/^test /, ""); sub(/ \.\.\. ok$/, "")
