@@ -1366,6 +1366,39 @@ mod tests {
             }
         }
 
+        #[derive(Clone, Copy)]
+        enum Acknowledger {
+            Storage,
+            TokenFree,
+            TokenOnly,
+        }
+
+        /// A manual acknowledgement fails against an unreachable pool. Only
+        /// the storage-bound acknowledger retires the worker's registration.
+        async fn failed_manual_ack(acknowledger: Acknowledger) -> bool {
+            let storage = crate::PostgresStorage::<()>::new_with_config(
+                &unreachable_pool(),
+                &crate::Config::new("manual-ack-queue"),
+            );
+            let mut parts = parts_for_ack(0, 3);
+            parts.ctx = parts
+                .ctx
+                .with_queue("manual-ack-queue".to_owned())
+                .with_lock_by(Some("manual-ack-worker".to_owned()))
+                .with_lock_at(Some(1_700_000_000));
+            record_claim(&mut parts);
+            let mut ack = match acknowledger {
+                Acknowledger::Storage => storage.acknowledger(),
+                Acknowledger::TokenFree => PgAck::new(storage.pool()),
+                Acknowledger::TokenOnly => {
+                    PgAck::with_lease_token(storage.pool(), Arc::from("held-token"))
+                }
+            };
+            let result: Result<(), BoxDynError> = Ok(());
+            assert!(ack.ack(&result, &parts).await.is_err());
+            storage.leases.for_worker("manual-ack-worker").is_retired()
+        }
+
         fn already_acknowledged(error: &crate::Error) -> AssertionResult {
             match error {
                 crate::Error::AlreadyAcknowledged { .. } => Ok(()),
@@ -1513,6 +1546,19 @@ mod tests {
                 }
             }
 
+            expect(failed_manual_ack(acknowledger).await) as a_failed_manual_acknowledgement {
+                let acknowledger = Acknowledger::Storage;
+                to retires_the_storages_registration_for_that_worker { be_true }
+                when the_acknowledger_binds_no_token {
+                    let acknowledger = Acknowledger::TokenFree;
+                    to leaves_the_registration_active { be_false }
+                }
+                when the_acknowledger_binds_only_a_token {
+                    let acknowledger = Acknowledger::TokenOnly;
+                    to leaves_the_registration_active { be_false }
+                }
+            }
+
             expect(manual_ack_of_claim(acknowledged).await) as a_manual_acknowledgement_of_a_claim {
                 let acknowledged = false;
                 to reaches_the_database_and_retires_the_worker_when_that_fails {
@@ -1546,6 +1592,14 @@ impl PgAck {
     /// [`PgAck::with_lease_token`] for the defense-in-depth variant that also
     /// checks the storage registration token. This constructor exists for test harnesses
     /// and admin tooling that do not own a lease token.
+    ///
+    /// Like [`lock_task`], this acknowledger does not manage local worker
+    /// retirement: a failed acknowledgement leaves the worker's heartbeat
+    /// running. Acknowledge tasks of a storage-registered worker through
+    /// [`PostgresStorage::acknowledger`] or the middleware returned by
+    /// `Backend::middleware`, which carry that registration's liveness.
+    ///
+    /// [`PostgresStorage::acknowledger`]: crate::PostgresStorage::acknowledger
     #[must_use]
     pub fn new(pool: &PgPool) -> Self {
         Self {
@@ -1558,15 +1612,32 @@ impl PgAck {
     /// Create a PostgreSQL acknowledger bound to a specific worker lease token.
     ///
     /// The token is checked while holding a shared row lock on
-    /// `apalis.workers.lease_token`, mirroring the heartbeat path. A storage
-    /// handle's `middleware()` wires this automatically; manual callers should
-    /// reuse the token they passed to `initial_heartbeat`/`keep_alive`.
+    /// `apalis.workers.lease_token`, mirroring the heartbeat path. This is for
+    /// callers that registered the worker outside this crate's storage and
+    /// hold its token; a storage's own token is not exposed, and its
+    /// acknowledger comes from [`PostgresStorage::acknowledger`]. This
+    /// constructor binds the token only and does not manage local worker
+    /// retirement.
+    ///
+    /// [`PostgresStorage::acknowledger`]: crate::PostgresStorage::acknowledger
     #[must_use]
     pub fn with_lease_token(pool: &PgPool, lease_token: Arc<str>) -> Self {
         Self {
             pool: pool.clone(),
             lease_token: Some(lease_token),
             leases: None,
+        }
+    }
+
+    pub(crate) fn with_lease_registry(
+        pool: &PgPool,
+        lease_token: Arc<str>,
+        leases: crate::lease::LeaseRegistry,
+    ) -> Self {
+        Self {
+            pool: pool.clone(),
+            lease_token: Some(lease_token),
+            leases: Some(leases),
         }
     }
 }
@@ -1871,7 +1942,16 @@ pub struct PgMiddleware {
 }
 
 impl PgMiddleware {
-    /// Create the PostgreSQL backend middleware.
+    /// Create the PostgreSQL backend middleware without a registration token.
+    ///
+    /// A fallback claim checks only that the worker is registered for the
+    /// task's queue, and an acknowledgement is gated by `(lock_by, lock_at,
+    /// attempts)` alone; neither is fenced by a registration token. Like
+    /// [`lock_task`], this middleware does not manage local worker
+    /// retirement: a dropped or failed acknowledgement leaves the worker's
+    /// heartbeat running. The middleware for a storage-registered worker is
+    /// `Backend::middleware`, which carries that registration's token and
+    /// liveness.
     #[must_use]
     pub fn new(pool: &PgPool, auto_ack: bool) -> Self {
         Self {
@@ -1883,6 +1963,11 @@ impl PgMiddleware {
     /// Bind new fallback claims and automatic acknowledgements to a worker
     /// registration token. Existing preclaimed work may still finish; its
     /// acknowledgement must match the registration that owns the claim.
+    ///
+    /// This is for callers that registered the worker outside this crate's
+    /// storage and hold its token. It binds the token only and does not
+    /// manage local worker retirement; `Backend::middleware` does both for a
+    /// storage-registered worker.
     #[must_use]
     pub fn with_lease_token(pool: &PgPool, auto_ack: bool, lease_token: Arc<str>) -> Self {
         let mut lock = LockTaskLayer::new(pool.clone());
@@ -1900,8 +1985,7 @@ impl PgMiddleware {
         lease_token: Arc<str>,
         leases: crate::lease::LeaseRegistry,
     ) -> Self {
-        let mut acknowledger = PgAck::with_lease_token(pool, lease_token.clone());
-        acknowledger.leases = Some(leases.clone());
+        let acknowledger = PgAck::with_lease_registry(pool, lease_token.clone(), leases.clone());
         let mut lock = LockTaskLayer::new(pool.clone());
         lock.leases = Some(leases);
         lock.lease_token = Some(ClaimToken(lease_token));

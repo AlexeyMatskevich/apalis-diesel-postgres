@@ -9,6 +9,12 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Added
 
+- `PostgresStorage::acknowledger()` returns a `PgAck` bound to the storage's
+  registration token and local liveness, so a manual acknowledgement that
+  fails retires the worker's registration like the automatic middleware
+  does. The public `PgMiddleware` and `PgAck` constructors bind at most a
+  token; their documentation now states that they do not manage local
+  retirement.
 - `Error::AlreadyAcknowledged` reports an in-process re-dispatch of a claim
   whose acknowledgement already committed. `PgMiddleware` returns it inside an
   `AbortError` before the handler runs again, and `PgAck` returns it for a
