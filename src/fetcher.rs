@@ -83,14 +83,24 @@ where
         .boxed()
 }
 
+/// The decode error of a row whose codec panicked on its payload.
+fn codec_panic(payload: Box<dyn std::any::Any + Send>) -> Error {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "the panic carried no message".to_owned());
+    Error::Decode(format!("the codec panicked: {message}").into())
+}
+
 /// Decode a compact task stream into an `Args`-typed task stream by mapping
 /// every yielded row through the configured codec. Shared between the polling
 /// and notify backends so the decode logic exists in exactly one place.
 ///
 /// Decode runs *after* the dequeue SQL has already claimed the row as
-/// `Running`, so a decode failure must not just surface the error: it also
+/// `Queued`, so a decode failure must not just surface the error: it also
 /// fails the claimed row via `fail_undecodable_task`, otherwise
-/// the row would stay `Running` for as long as this worker keeps heartbeating
+/// the row would stay claimed for as long as this worker keeps heartbeating
 /// — unackable (ack needs a decoded task) and invisible to orphan recovery
 /// (which only reclaims rows of stale workers).
 /// A failed release remains owned by this stream: it is retried with bounded
@@ -184,9 +194,18 @@ where
                                 *task.parts.ctx.lock_at(),
                                 i32::try_from(task.parts.attempt.current()),
                             );
-                            match task.try_map(|t| {
-                                Decode::decode(&t).map_err(|e| Error::Decode(e.into()))
-                            }) {
+                            // A codec that panics on a corrupt payload fails that
+                            // row like a reported decode error: the claim is
+                            // released through its budget and the batch goes
+                            // on, instead of the panic taking the worker down.
+                            let decoded =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                    task.try_map(|t| {
+                                        Decode::decode(&t).map_err(|e| Error::Decode(e.into()))
+                                    })
+                                }))
+                                .unwrap_or_else(|panic| Err(codec_panic(panic)));
+                            match decoded {
                                 Ok(decoded) => return Some((Ok(Some(decoded)), (compact, None))),
                                 Err(decode_error) => match identity {
                                     (Some(task_id), Some(lock_at), Ok(attempts)) => {
@@ -371,7 +390,17 @@ pub(crate) struct LeaseStream<S> {
     lease: Arc<crate::lease::WorkerLease>,
     _guard: Option<crate::lease::LeaseGuard>,
     retire_on_drop: bool,
+    /// Where the registration attempt, settled by the first item, stands.
+    registration: RegistrationProgress,
     ended: bool,
+}
+
+/// A task stream's registration attempt: begun on the first poll, settled by
+/// the first item, the registration outcome.
+enum RegistrationProgress {
+    NotBegun,
+    Pending(crate::lease::RegistrationAttempt),
+    Settled,
 }
 
 impl<S> LeaseStream<S> {
@@ -385,6 +414,7 @@ impl<S> LeaseStream<S> {
             lease,
             _guard: None,
             retire_on_drop,
+            registration: RegistrationProgress::NotBegun,
             ended: false,
         }
     }
@@ -404,6 +434,12 @@ where
             this.ended = true;
             return Poll::Ready(Some(Err(error)));
         }
+        if this.retire_on_drop && matches!(this.registration, RegistrationProgress::NotBegun) {
+            // The registration statement runs on this first poll. Heartbeats
+            // of the name wait for the attempt to settle, and a refusal
+            // releases them only once no other attempt of the name is pending.
+            this.registration = RegistrationProgress::Pending(this.lease.begin_registration());
+        }
         let result = this.stream.as_mut().poll_next(cx);
         // Registration is the first item and assigns no task; claim SQL can
         // only be dispatched by later polls. Arm the guard as that item
@@ -411,11 +447,27 @@ where
         // is cancelled while its claim is queued and may still commit. A
         // stream whose registration fails or that is never registered owns no
         // claim and leaves the name free for its siblings.
-        if this.retire_on_drop
-            && this._guard.is_none()
-            && matches!(&result, Poll::Ready(Some(Ok(_))))
-        {
-            this._guard = Some(this.lease.guard());
+        if matches!(this.registration, RegistrationProgress::Pending(_)) {
+            let succeeded = match &result {
+                Poll::Ready(Some(Ok(_))) => {
+                    this._guard = Some(this.lease.guard());
+                    // The heartbeat stream of this name waits for this
+                    // moment: a renewal before the registration would update
+                    // no row and end the worker with `WorkerNotRegistered`.
+                    Some(true)
+                }
+                // A refused or failed registration settles the attempt too,
+                // so a heartbeat waiting on it reports the refusal instead of
+                // waiting for a registration that never comes.
+                Poll::Ready(Some(Err(_))) => Some(false),
+                Poll::Ready(None) | Poll::Pending => None,
+            };
+            if let Some(succeeded) = succeeded
+                && let RegistrationProgress::Pending(attempt) =
+                    std::mem::replace(&mut this.registration, RegistrationProgress::Settled)
+            {
+                attempt.settle(succeeded);
+            }
         }
         if matches!(
             &result,

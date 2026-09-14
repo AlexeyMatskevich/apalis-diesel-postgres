@@ -8,7 +8,7 @@
 use apalis_core::{
     backend::{
         BackendExt, FetchById, Filter, ListAllTasks, ListQueues, ListTasks, ListWorkers, Metrics,
-        QueueInfo, RegisterWorker, RunningWorker, Statistic, TaskResult, WaitForCompletion,
+        QueueInfo, RegisterWorker, RunningWorker, Statistic, TaskResult, Vacuum, WaitForCompletion,
         codec::Codec,
     },
     task::{Task, task_id::TaskId},
@@ -181,6 +181,25 @@ where
     }
 }
 
+impl<Args, D, F> Vacuum for PostgresStorage<Args, D, F>
+where
+    PostgresStorage<Args, D, F>:
+        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+{
+    /// Delete every terminal task of this storage's queue, whatever its age:
+    /// [`PostgresStorage::purge_terminal_tasks`] with a zero window. A result
+    /// that a `WaitForCompletion` consumer has not read yet is lost, and every
+    /// `idempotency_key` of a deleted task becomes free again; prefer the
+    /// windowed method for scheduled retention.
+    fn vacuum(&mut self) -> impl Future<Output = Result<usize, Self::Error>> + Send {
+        queries::purge_terminal_tasks(
+            self.pool.clone(),
+            self.config.queue().to_string(),
+            std::time::Duration::ZERO,
+        )
+    }
+}
+
 impl<O, Args, F, Decode> WaitForCompletion<O> for PostgresStorage<Args, Decode, F>
 where
     O: 'static + Send,
@@ -191,6 +210,16 @@ where
     type ResultStream = BoxStream<'static, Result<TaskResult<O, Ulid>, Error>>;
 
     /// Wait for the given tasks to complete, yielding each result as it lands.
+    ///
+    /// The tasks must exist: an id that no row carries on a poll, and still on
+    /// a poll at least one backoff interval later, yields
+    /// [`Error::TaskNotFound`] for that id and is no longer waited for,
+    /// whether it was never enqueued or was removed by
+    /// [`PostgresStorage::purge_terminal_tasks`]. That interval of absence is
+    /// tolerated so an enqueue committing right after the wait began is not
+    /// mistaken for a missing task; wait for the enqueue transaction to
+    /// commit before waiting on its ids. An id passed more than once is
+    /// waited for once and yields one result.
     ///
     /// # Error handling
     ///

@@ -64,7 +64,7 @@ async fn fixture(
     };
     support::with_conn(pool.clone(),move|c|{
  c.batch_execute(&format!("INSERT INTO apalis.workers(id,worker_type,storage_name,layers,last_seen,started_at) VALUES('schema-worker','schema-queue','fixture','',{last_seen},clock_timestamp())")).map_err(|e|e.to_string())?;
- sql_query("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,lock_by,lock_at) VALUES('01ARZ3NDEKTSV4RRFFQ69G5FAV','schema-queue',convert_to('\"payload\"','UTF8'),$1,2,10,clock_timestamp()-interval '1second','schema-worker',date_trunc('second',clock_timestamp()))").bind::<Text,_>(status).execute(c).map(|_|()).map_err(|e|e.to_string())
+ sql_query("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at,lock_by,lock_at) VALUES('01ARZ3NDEKTSV4RRFFQ69G5FAV','schema-queue',convert_to('\"payload\"','UTF8'),$1,2,10,clock_timestamp()-interval '1second',CASE WHEN $1='Pending' THEN NULL ELSE 'schema-worker' END,CASE WHEN $1='Pending' THEN NULL ELSE date_trunc('second',clock_timestamp()) END)").bind::<Text,_>(status).execute(c).map(|_|()).map_err(|e|e.to_string())
  }).await?;
     Ok((
         pool.clone(),

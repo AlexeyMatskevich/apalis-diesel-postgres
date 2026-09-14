@@ -454,15 +454,16 @@ fn returned_ids_match_seeded_order()
     })
 }
 
-fn claimed_row_transitioned_to_running()
--> impl Fn(&Result<Outcome<FetchRun>, String>) -> AssertionResult {
-    observe::<FetchRun, _>("H4 invariant", |run| {
+/// A claim is `Queued`: owned by the worker, with the claim timestamp set and
+/// no completion timestamp. `Running` is written only when a handler starts.
+fn claimed_row_is_queued() -> impl Fn(&Result<Outcome<FetchRun>, String>) -> AssertionResult {
+    observe::<FetchRun, _>("claim shape", |run| {
         if run.rows.is_empty() {
             return Err("expected at least one claimed row to inspect".into());
         }
         for row in &run.rows {
-            if row.status != "Running" {
-                return Err(format!("expected status=Running, got {:?}", row.status));
+            if row.status != "Queued" {
+                return Err(format!("expected status=Queued, got {:?}", row.status));
             }
             match &row.lock_by {
                 Some(lb) if *lb == run.worker_id => {}
@@ -505,7 +506,7 @@ lets_expect! { #tokio_test
             to returns_all_available_rows_without_padding {
                 fetched_row_count(2),
                 all_seeded_ids_returned(),
-                claimed_row_transitioned_to_running()
+                claimed_row_is_queued()
             }
         }
 
@@ -555,10 +556,10 @@ lets_expect! { #tokio_test
         let attempts=0;
         let run_at_offset_secs=-10;
         let setup=StatusSetup{status,attempts,max_attempts:3,run_at_offset_secs};
-        to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+        to records_the_queued_claim { fetched_row_count(1), claimed_row_is_queued() }
         when exactly_one_attempt_remains {
             let attempts=2;
-            to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_is_queued() }
         }
         when the_attempt_budget_is_exhausted {
             let attempts=3;
@@ -570,10 +571,10 @@ lets_expect! { #tokio_test
         }
         when the_task_failed_previously {
             let status="Failed";
-            to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            to records_the_queued_claim { fetched_row_count(1), claimed_row_is_queued() }
             when exactly_one_attempt_remains {
                 let attempts=2;
-                to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+                to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_is_queued() }
             }
             when the_attempt_budget_is_exhausted {
                 let attempts=3;
@@ -884,10 +885,10 @@ lets_expect! { #tokio_test
         let attempts=0;
         let run_at_offset_secs=-10;
         let setup=StatusSetup{status,attempts,max_attempts:3,run_at_offset_secs};
-        to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+        to records_the_queued_claim { fetched_row_count(1), claimed_row_is_queued() }
         when exactly_one_attempt_remains {
             let attempts=2;
-            to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_is_queued() }
         }
         when the_attempt_budget_is_exhausted {
             let attempts=3;
@@ -899,10 +900,10 @@ lets_expect! { #tokio_test
         }
         when the_task_failed_previously {
             let status="Failed";
-            to records_the_running_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+            to records_the_queued_claim { fetched_row_count(1), claimed_row_is_queued() }
             when exactly_one_attempt_remains {
                 let attempts=2;
-                to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_transitioned_to_running() }
+                to records_the_last_permitted_claim { fetched_row_count(1), claimed_row_is_queued() }
             }
             when the_attempt_budget_is_exhausted {
                 let attempts=3;

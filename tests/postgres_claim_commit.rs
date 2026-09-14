@@ -266,7 +266,7 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
         None
     };
     if matches!(fault, Fault::RejectedQuery) {
-        sql_query(format!("CREATE FUNCTION apalis.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_type='{queue}' AND NEW.status='Running' THEN RAISE EXCEPTION 'controlled claim rollback'; END IF; RETURN NEW; END $$")).execute(&mut conn).unwrap();
+        sql_query(format!("CREATE FUNCTION apalis.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_type='{queue}' AND NEW.status IN ('Queued','Running') THEN RAISE EXCEPTION 'controlled claim rollback'; END IF; RETURN NEW; END $$")).execute(&mut conn).unwrap();
         sql_query(format!("CREATE TRIGGER {trigger} BEFORE UPDATE ON apalis.jobs FOR EACH ROW EXECUTE FUNCTION apalis.{trigger}()" )).execute(&mut conn).unwrap();
     }
     let effects = Arc::new(AtomicUsize::new(0));
@@ -348,7 +348,14 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
             .bind::<Text, _>(id.to_string())
             .get_result(&mut conn)
             .unwrap();
-        observation.durable = row.status == "Running" && row.attempts == 0;
+        // A fetcher claims `Queued`; the middleware's `lock_task` claims and
+        // starts in one statement.
+        let claimed_status = if matches!(path, Path::Fallback) {
+            "Running"
+        } else {
+            "Queued"
+        };
+        observation.durable = row.status == claimed_status && row.attempts == 0;
         observation.heartbeat_stopped = matches!(
             heartbeat.next().await,
             Some(Err(Error::WorkerRetired { .. }))
@@ -373,6 +380,7 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
             .unwrap()
             .unwrap()
             .unwrap();
+        // A takeover charges every claim of the incumbent, started or not.
         observation.recovered =
             recovered.parts.task_id == Some(id) && recovered.parts.attempt.current() == 1;
         recovered.parts.attempt = Attempt::new_with_value(2);

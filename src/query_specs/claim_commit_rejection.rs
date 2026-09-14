@@ -39,7 +39,7 @@ async fn commit_rejection(rejection: Rejection) -> Result<Outcome<Value>, String
         with_conn(pool.clone(),move |conn| {
             let code=match rejection {Rejection::Serialization=>"40001",Rejection::Constraint=>"23514"};
             conn.batch_execute(&format!("CREATE FUNCTION public.reject_claim_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled server commit rejection' USING ERRCODE='{code}'; END $$;
-                CREATE CONSTRAINT TRIGGER reject_claim_commit AFTER UPDATE ON apalis.jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.status='Running') EXECUTE FUNCTION public.reject_claim_commit();")).map_err(|e|e.to_string())
+                CREATE CONSTRAINT TRIGGER reject_claim_commit AFTER UPDATE ON apalis.jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.status='Queued') EXECUTE FUNCTION public.reject_claim_commit();")).map_err(|e|e.to_string())
         }).await?;
         let worker=WorkerContext::new::<()>("rejection-worker");let mut tasks=storage.poll_compact(&worker);
         let registered=tasks.next().await.ok_or("registration stream ended")?.map_err(|e|e.to_string())?;
@@ -63,7 +63,7 @@ fn preserves_known_outcome() -> impl Fn(&Result<Outcome<Value>, String>) -> Asse
     observe("known rejected claim commit", |actual: &Value| {
         let expected = json!({"known_rejection":true,"same_task":true,
             "rejected":{"status":"Pending","attempts":0,"owner":null,"locked":false,"done":false},
-            "claimed":{"status":"Running","attempts":0,"owner":"rejection-worker","locked":true,"done":false}});
+            "claimed":{"status":"Queued","attempts":0,"owner":"rejection-worker","locked":true,"done":false}});
         if actual == &expected {
             Ok(())
         } else {

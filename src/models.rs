@@ -162,6 +162,30 @@ impl From<QueueInfoRow> for QueueInfo {
     }
 }
 
+/// One row a completion wait tracks: present in `apalis.jobs`, with the
+/// server's own verdict on whether it will ever run again.
+#[derive(Debug, QueryableByName)]
+pub(crate) struct TrackedTaskRow {
+    #[diesel(sql_type = Text)]
+    pub(crate) id: String,
+    #[diesel(sql_type = Text)]
+    pub(crate) status: String,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    pub(crate) result: Option<Value>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pub(crate) terminal: bool,
+}
+
+impl From<TrackedTaskRow> for TaskResultRow {
+    fn from(row: TrackedTaskRow) -> Self {
+        Self {
+            id: Some(row.id),
+            status: Some(row.status),
+            result: row.result,
+        }
+    }
+}
+
 #[derive(Debug, QueryableByName)]
 pub(crate) struct TaskResultRow {
     #[diesel(sql_type = Nullable<Text>)]
@@ -346,7 +370,7 @@ mod tests {
     /// (`from_row.rs`), so any non-object JSONB — which a third-party writer can
     /// insert straight into `apalis.jobs`, bypassing this crate's push API —
     /// used to panic during row conversion. In the polling path that panic
-    /// fires mid-batch, stranding every co-claimed row as `Running`. Coercing
+    /// fires mid-batch, stranding every co-claimed row as `Queued`. Coercing
     /// non-object metadata to an empty object in `From<JobRow>` keeps the
     /// conversion total, matching apalis-sql's own defensive `try_into_task`.
     fn compact_metadata_json(metadata: Value) -> Result<String, String> {

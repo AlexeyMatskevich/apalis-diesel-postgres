@@ -1257,6 +1257,95 @@ async fn run_metrics_terminal_mix() -> Result<Outcome<MetricsRun>, String> {
     Ok(Outcome::Completed(run))
 }
 
+// --------------------------------------------------------------------------
+// metrics_for_queue and list_queues: stuck work counts claims that never started
+// --------------------------------------------------------------------------
+
+/// Which admin query reports the queue's statistics.
+#[derive(Clone, Copy, Debug)]
+enum StatsSource {
+    Metrics,
+    ListQueues,
+}
+
+#[derive(Debug)]
+struct StuckWorkRun {
+    stale: Option<String>,
+    longest_mins: Option<String>,
+}
+
+/// A `Queued` claim two hours old, a `Running` claim ninety minutes old, a
+/// recent `Running` claim and an old `Pending` task. Claimed work that has
+/// stood for over an hour is stuck whether or not its handler started.
+async fn run_stuck_work_stats(source: StatsSource) -> Result<Outcome<StuckWorkRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-admin-stuck-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Queued", 7_200, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Running", 5_400, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Running", 1, None, 0, 3).await?;
+    let _ = insert_job(pool.clone(), queue.clone(), "Pending", 7_200, None, 0, 3).await?;
+
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let stats: Vec<(String, String)> = match source {
+        StatsSource::Metrics => storage
+            .fetch_by_queue()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|stat| (stat.title, stat.value))
+            .collect(),
+        StatsSource::ListQueues => storage
+            .list_queues()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|info| info.name == queue)
+            .ok_or_else(|| format!("seeded queue {queue} missing from list_queues"))?
+            .stats
+            .into_iter()
+            .map(|stat| (stat.title, stat.value))
+            .collect(),
+    };
+    let value = |title: &str| {
+        stats
+            .iter()
+            .find(|(stat, _)| stat == title)
+            .map(|(_, value)| value.clone())
+    };
+    let run = StuckWorkRun {
+        stale: value("STALE_RUNNING_JOBS"),
+        longest_mins: value("LONGEST_RUNNING_JOB_MINS"),
+    };
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(run))
+}
+
+fn counts_both_old_claims_as_stuck()
+-> impl Fn(&Result<Outcome<StuckWorkRun>, String>) -> AssertionResult {
+    observe::<StuckWorkRun, _>("stuck work statistics", |run| {
+        let stale = run
+            .stale
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok());
+        let longest = run
+            .longest_mins
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok());
+        if stale.is_some_and(|stale| (stale - 2.0).abs() < 0.5)
+            && longest.is_some_and(|minutes| minutes >= 119.0)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected STALE_RUNNING_JOBS = 2 and LONGEST_RUNNING_JOB_MINS of about 120, counting the Queued claim; got {run:?}"
+            ))
+        }
+    })
+}
+
 /// Metric values come back as `REAL` rendered to text, e.g. "1" or "1.0";
 /// the SQL builds `value AS REAL` from a COUNT(*) so the integer rendering
 /// is what Postgres chooses. Accept any representation parseable to the
@@ -1905,6 +1994,16 @@ lets_expect! { #tokio_test
                 metric_value_is("KILLED_JOBS", 1.0),
                 metric_value_is("TOTAL_JOBS", 7.0)
             }
+        }
+    }
+
+    // ----- stuck work counts claims that never started --------------------
+    expect(run_stuck_work_stats(source).await) as stuck_work_statistics {
+        let source = StatsSource::Metrics;
+        to counts_claims_that_never_started_as_stuck_work { counts_both_old_claims_as_stuck() }
+        when the_statistics_come_from_list_queues {
+            let source = StatsSource::ListQueues;
+            to counts_claims_that_never_started_as_stuck_work { counts_both_old_claims_as_stuck() }
         }
     }
 

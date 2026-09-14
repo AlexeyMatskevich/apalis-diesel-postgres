@@ -106,8 +106,31 @@ async fn insert_completed_task(
     max_attempts: i32,
     result: Value,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
-    let task_id = TaskId::from_str(&id.to_string()).map_err(|error| error.to_string())?;
+    insert_completed_task_with_id(
+        pool,
+        queue,
+        task_id(),
+        payload,
+        status,
+        attempts,
+        max_attempts,
+        result,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_completed_task_with_id(
+    pool: PgPool,
+    queue: String,
+    task_id: PgTaskId,
+    payload: &'static str,
+    status: &'static str,
+    attempts: i32,
+    max_attempts: i32,
+    result: Value,
+) -> Result<PgTaskId, String> {
+    let id = task_id.to_string();
     let job = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
     with_conn(pool, move |conn| {
         sql_query(
@@ -115,7 +138,7 @@ async fn insert_completed_task(
                 id, job_type, job, status, attempts, max_attempts, run_at, last_result
             ) VALUES ($1, $2, $3, $4, $5, $6, now(), $7)",
         )
-        .bind::<Text, _>(id.to_string())
+        .bind::<Text, _>(&id)
         .bind::<Text, _>(queue)
         .bind::<diesel::sql_types::Binary, _>(job)
         .bind::<Text, _>(status)
@@ -1821,6 +1844,262 @@ fn wait_pending_does_not_complete_early()
 }
 
 #[derive(Debug)]
+struct WaitAbsentRun {
+    first_item: &'static str,
+    ended_after_first: bool,
+}
+
+/// An id no row carries ends the wait with `TaskNotFound` once it has been
+/// absent on two consecutive polls, and the stream then ends.
+async fn run_wait_absent() -> Result<Outcome<WaitAbsentRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let storage = PostgresStorage::<String>::new_with_config(
+        &pool,
+        &Config::new(&format!("apalis-query-wait-absent-{}", Ulid::new())),
+    );
+    let mut stream =
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [task_id()]);
+    let first_item = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+        Err(_) => "pending",
+        Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => "not_found",
+        Ok(Some(Err(_))) => "other_error",
+        Ok(Some(Ok(_))) => "result",
+        Ok(None) => "ended",
+    };
+    let ended_after_first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .map(|item| item.is_none())
+        .unwrap_or(false);
+    Ok(Outcome::Completed(WaitAbsentRun {
+        first_item,
+        ended_after_first,
+    }))
+}
+
+fn wait_absent_reports_not_found()
+-> impl Fn(&Result<Outcome<WaitAbsentRun>, String>) -> AssertionResult {
+    observe::<WaitAbsentRun, _>("wait_for absent", |run| {
+        if run.first_item == "not_found" && run.ended_after_first {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected wait_for to report the absent id as TaskNotFound and end, got {run:?}"
+            ))
+        }
+    })
+}
+
+#[derive(Debug)]
+struct WaitLateRun {
+    first_item: &'static str,
+}
+
+/// An id whose row appears between the first poll and the second is not
+/// reported missing: the enqueue merely committed after the wait began.
+async fn run_wait_late_enqueue() -> Result<Outcome<WaitLateRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-query-wait-late-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let id = task_id();
+    let mut stream =
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id]);
+    // Let the first poll observe the absence, then insert the completed row
+    // before the second poll (the first backoff is 100 ms).
+    let first_poll = tokio::time::timeout(Duration::from_millis(30), stream.next()).await;
+    let first_item = match first_poll {
+        Err(_) => {
+            insert_completed_task_with_id(
+                pool.clone(),
+                queue.clone(),
+                id,
+                "late",
+                "Done",
+                1,
+                2,
+                serde_json::json!({"Ok": "late"}),
+            )
+            .await?;
+            match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                Err(_) => "pending",
+                Ok(Some(Ok(result))) if result.task_id == id => "result",
+                Ok(Some(Ok(_))) => "other_result",
+                Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => "not_found",
+                Ok(Some(Err(_))) => "other_error",
+                Ok(None) => "ended",
+            }
+        }
+        Ok(_) => "resolved_before_the_row_existed",
+    };
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(WaitLateRun { first_item }))
+}
+
+fn wait_late_enqueue_still_resolves()
+-> impl Fn(&Result<Outcome<WaitLateRun>, String>) -> AssertionResult {
+    observe::<WaitLateRun, _>("wait_for late enqueue", |run| {
+        if run.first_item == "result" {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the wait to survive one absent poll and yield the late result, got {run:?}"
+            ))
+        }
+    })
+}
+
+#[derive(Debug)]
+struct WaitDuplicateRun {
+    results: usize,
+    other_items: usize,
+    ended: bool,
+}
+
+/// The same completed id passed twice is one waited task: one result, then
+/// the wait ends.
+async fn run_wait_duplicate_ids() -> Result<Outcome<WaitDuplicateRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-query-wait-twice-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let id = task_id();
+    insert_completed_task_with_id(
+        pool.clone(),
+        queue.clone(),
+        id,
+        "twice",
+        "Done",
+        1,
+        2,
+        serde_json::json!({"Ok": "twice"}),
+    )
+    .await?;
+    let mut stream =
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id, id]);
+    let (mut results, mut other_items, mut ended) = (0, 0, false);
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+            Err(_) => break,
+            Ok(None) => {
+                ended = true;
+                break;
+            }
+            Ok(Some(Ok(result))) if result.task_id == id => results += 1,
+            Ok(Some(_)) => other_items += 1,
+        }
+    }
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(WaitDuplicateRun {
+        results,
+        other_items,
+        ended,
+    }))
+}
+
+fn wait_duplicate_yields_once()
+-> impl Fn(&Result<Outcome<WaitDuplicateRun>, String>) -> AssertionResult {
+    observe::<WaitDuplicateRun, _>("wait_for duplicate ids", |run| {
+        if run.results == 1 && run.other_items == 0 && run.ended {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one result for an id passed twice, then the end of the wait; got {run:?}"
+            ))
+        }
+    })
+}
+
+#[derive(Debug)]
+struct WaitBesideRun {
+    first: &'static str,
+    second: &'static str,
+}
+
+/// An id still absent when a sibling's result arrives is not reported missing
+/// by the poll that follows at once: its enqueue gets a whole backoff
+/// interval to commit. Polls run only while the stream is awaited, so the row
+/// is always inserted before the next poll.
+async fn run_wait_late_beside_a_completed_task() -> Result<Outcome<WaitBesideRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-query-wait-beside-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let done = task_id();
+    let late = task_id();
+    insert_completed_task_with_id(
+        pool.clone(),
+        queue.clone(),
+        done,
+        "done",
+        "Done",
+        1,
+        2,
+        serde_json::json!({"Ok": "done"}),
+    )
+    .await?;
+    let mut stream =
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [done, late]);
+    let first = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+        Ok(Some(Ok(result))) if result.task_id == done => "done_result",
+        Ok(Some(Ok(_))) => "other_result",
+        Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => "not_found",
+        Ok(Some(Err(_))) => "other_error",
+        Ok(None) => "ended",
+        Err(_) => "pending",
+    };
+    let second = match tokio::time::timeout(Duration::from_millis(30), stream.next()).await {
+        Err(_) => {
+            insert_completed_task_with_id(
+                pool.clone(),
+                queue.clone(),
+                late,
+                "late",
+                "Done",
+                1,
+                2,
+                serde_json::json!({"Ok": "late"}),
+            )
+            .await?;
+            match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                Ok(Some(Ok(result))) if result.task_id == late => "late_result",
+                Ok(Some(Ok(_))) => "other_result",
+                Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => "not_found",
+                Ok(Some(Err(_))) => "other_error",
+                Ok(None) => "ended",
+                Err(_) => "pending",
+            }
+        }
+        Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => {
+            "not_found_before_the_row_existed"
+        }
+        Ok(_) => "resolved_before_the_row_existed",
+    };
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(WaitBesideRun { first, second }))
+}
+
+fn wait_beside_still_resolves()
+-> impl Fn(&Result<Outcome<WaitBesideRun>, String>) -> AssertionResult {
+    observe::<WaitBesideRun, _>("wait_for late id beside a result", |run| {
+        if run.first == "done_result" && run.second == "late_result" {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the completed sibling's result, then the late id's result; got {run:?}"
+            ))
+        }
+    })
+}
+
+#[derive(Debug)]
 struct WaitMalformedRun {
     first_item_was_decode_error: bool,
     stream_ended_after_one_item: bool,
@@ -1947,7 +2226,9 @@ async fn run_orphan_reenqueue(queued: bool, terminal: bool) -> Result<Outcome<Or
     let queue = format!("apalis-query-orphan-{}", Ulid::new());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    let config = Config::new(&queue).set_reenqueue_orphaned_after(Duration::from_secs(1));
+    let config = Config::new(&queue)
+        .set_keep_alive(Duration::from_millis(100))
+        .set_reenqueue_orphaned_after(Duration::from_secs(1));
     let stale_worker = format!("query-orphan-stale-worker-{queue}");
     let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
     storage
@@ -3300,6 +3581,38 @@ lets_expect! { #tokio_test
         }
     }
 
+    expect(run_wait_absent().await) as wait_absent {
+        when wait_for_targets_an_id_no_row_carries {
+            to reports_the_id_as_not_found_and_ends {
+                wait_absent_reports_not_found()
+            }
+        }
+    }
+
+    expect(run_wait_late_enqueue().await) as wait_late_enqueue {
+        when the_row_appears_between_the_first_two_polls {
+            to still_yields_its_result {
+                wait_late_enqueue_still_resolves()
+            }
+        }
+    }
+
+    expect(run_wait_duplicate_ids().await) as wait_duplicate_ids {
+        when the_same_completed_id_is_waited_for_twice {
+            to yields_one_result_and_ends {
+                wait_duplicate_yields_once()
+            }
+        }
+    }
+
+    expect(run_wait_late_beside_a_completed_task().await) as wait_late_beside_a_result {
+        when the_row_appears_after_a_poll_that_yielded_another_result {
+            to still_yields_its_result {
+                wait_beside_still_resolves()
+            }
+        }
+    }
+
     expect(run_wait_malformed_terminal().await) as wait_malformed_terminal {
         when wait_for_observes_a_terminal_row_with_an_unparseable_result {
             to yields_a_decode_error_first {
@@ -3327,6 +3640,11 @@ lets_expect! { #tokio_test
         }
     }
 
+    // The sweep charges a stale worker's `Queued` claim like a `Running` one:
+    // the worker failed, possibly on that claim. Both statuses are pinned at
+    // both budgets, so a regression that spares a claim of a failed worker,
+    // or branches on the status instead of the budget, is caught.
+
     expect(run_orphan_reenqueue(true, true).await) as orphaned_queued_task_at_limit {
         when a_stale_worker_left_a_queued_task_with_no_retries_remaining {
             to kills_the_task {
@@ -3336,11 +3654,6 @@ lets_expect! { #tokio_test
             }
         }
     }
-
-    // Off-diagonal of (queued, terminal): the reenqueue path branches on the
-    // retry budget, not on the snapshot status. Pin both crossings explicitly
-    // so a future regression that conflates "Queued" with "no retries" or
-    // "Running" with "has retries" is caught.
 
     expect(run_orphan_reenqueue(true, false).await) as orphaned_queued_task_with_retries {
         when a_stale_worker_left_a_queued_task_with_retries_available {

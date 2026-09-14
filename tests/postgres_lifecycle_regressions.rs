@@ -1,5 +1,7 @@
 //! Lifecycle ownership, retry budgets, and recovery after interrupted work.
 #![cfg(feature = "tokio")]
+#[path = "support/one_at_a_time.rs"]
+mod one_at_a_time;
 mod support;
 #[path = "support/unreachable.rs"]
 mod unreachable;
@@ -388,7 +390,9 @@ mod races {
     async fn immediate_takeover() -> bool {
         let p = pool().await;
         let q = format!("lifecycle_fractional_timeout_{}", ulid::Ulid::new());
-        let c = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_millis(500));
+        let c = Config::new(&q)
+            .set_keep_alive(Duration::from_millis(100))
+            .set_reenqueue_orphaned_after(Duration::from_millis(500));
         let w = WorkerContext::new::<()>("fraction-worker");
         let mut a = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
         assert!(a.next().await.unwrap().is_ok());
@@ -425,7 +429,7 @@ mod races {
         .await
         .unwrap();
         sql(&p,format!("UPDATE apalis.workers SET last_seen=now()-interval '2 minutes' WHERE worker_type='{q}'")).await;
-        sql(&p,"CREATE OR REPLACE FUNCTION apalis.test_block_recovery() RETURNS trigger AS $$ BEGIN IF NEW.status='Pending' AND OLD.status='Running' THEN PERFORM pg_advisory_xact_lock(8765412); END IF; RETURN NEW; END $$ LANGUAGE plpgsql".to_owned()).await;
+        sql(&p,"CREATE OR REPLACE FUNCTION apalis.test_block_recovery() RETURNS trigger AS $$ BEGIN IF NEW.status='Pending' AND OLD.status IN ('Queued','Running') THEN PERFORM pg_advisory_xact_lock(8765412); END IF; RETURN NEW; END $$ LANGUAGE plpgsql".to_owned()).await;
         sql(&p,format!("CREATE TRIGGER test_block_recovery BEFORE UPDATE ON apalis.jobs FOR EACH ROW WHEN (OLD.job_type='{q}') EXECUTE FUNCTION apalis.test_block_recovery()")).await;
         let mut holder = p.get().unwrap();
         sql_query("BEGIN").execute(&mut holder).unwrap();
@@ -1225,15 +1229,17 @@ mod dropped_stream {
 // The persisted retry budget schedules attempts; an in-process re-dispatch of
 // an acknowledged claim is refused instead of running and reporting stale.
 mod redispatched_claim {
+    use crate::one_at_a_time::OneAtATimeLayer;
     use apalis::layers::{WorkerBuilderExt, retry::RetryPolicy};
     use apalis_core::{
         backend::{FetchById, TaskSink, poll_strategy::IntervalStrategy},
         error::{BoxDynError, WorkerError},
+        layers::{Layer, Service},
         task::builder::TaskBuilder,
         worker::builder::WorkerBuilder,
     };
     use apalis_diesel_postgres::{
-        Config, Error, PgContext, PgTaskId, PostgresStorage, build_pool, setup,
+        Config, Error, PgContext, PgTask, PgTaskId, PostgresStorage, build_pool, setup,
     };
     use diesel::{RunQueryDsl, sql_query, sql_types::Text};
     use futures::{FutureExt, future::BoxFuture};
@@ -1370,6 +1376,186 @@ mod redispatched_claim {
     async fn run(retries: Retries) -> Result<crate::support::Outcome<Observation>, String> {
         crate::database_case(|| failing_handler_under(retries)).await
     }
+
+    /// Records the id of every task dispatched through it.
+    #[derive(Clone)]
+    struct RecordDispatches(Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S> Layer<S> for RecordDispatches {
+        type Service = Recorded<S>;
+        fn layer(&self, inner: S) -> Self::Service {
+            Recorded {
+                inner,
+                dispatched: self.0.clone(),
+            }
+        }
+    }
+    #[derive(Clone)]
+    struct Recorded<S> {
+        inner: S,
+        dispatched: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl<S, Args> Service<PgTask<Args>> for Recorded<S>
+    where
+        S: Service<PgTask<Args>>,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = S::Future;
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+        fn call(&mut self, task: PgTask<Args>) -> Self::Future {
+            self.dispatched.lock().unwrap().push(
+                task.parts
+                    .task_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+            );
+            self.inner.call(task)
+        }
+    }
+    #[derive(diesel::QueryableByName)]
+    struct LostRow {
+        #[diesel(sql_type = Text)]
+        status: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempts: i32,
+    }
+    #[derive(Debug)]
+    struct LostClaimObservation {
+        run: &'static str,
+        handler_runs: usize,
+        lost_dispatches: usize,
+        lost_row: (String, i32),
+    }
+    /// Two tasks are claimed in one batch and dispatched one at a time. While
+    /// the first runs, its sibling's claim is recovered (and kept unclaimable),
+    /// so the middleware refuses the sibling before its handler; a retry layer
+    /// outside the middleware then re-dispatches that refusal.
+    async fn lost_claim_under_a_retry_layer() -> LostClaimObservation {
+        let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
+        setup(&pool).await.unwrap();
+        let queue = format!("lifecycle_lost_claim_{}", ulid::Ulid::new());
+        let config = Config::new(&queue)
+            .set_keep_alive(Duration::from_millis(10))
+            .set_reenqueue_orphaned_after(Duration::from_secs(60))
+            .set_buffer_size(2);
+        let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config)
+            .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
+        let mut ids = Vec::new();
+        for label in ["first", "second"] {
+            let id = PgTaskId::new(ulid::Ulid::new());
+            storage
+                .push_task(TaskBuilder::new(label.to_owned()).with_task_id(id).build())
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let (first, lost) = (ids[0], ids[1]);
+        let handler_runs = Arc::new(AtomicUsize::new(0));
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (handler_pool, counter) = (pool.clone(), handler_runs.clone());
+        let handler = move |job: String| {
+            let (pool, counter) = (handler_pool.clone(), counter.clone());
+            async move {
+                if job == "first" {
+                    tokio::task::spawn_blocking(move || {
+                        sql_query(
+                            "UPDATE apalis.jobs SET status='Pending', lock_by=NULL, lock_at=NULL,
+                             run_at=now() + INTERVAL '1 hour' WHERE id=$1",
+                        )
+                        .bind::<Text, _>(lost.to_string())
+                        .execute(&mut pool.get().unwrap())
+                        .unwrap();
+                    })
+                    .await
+                    .unwrap();
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), BoxDynError>(())
+            }
+        };
+        let mut observer = storage.clone();
+        let seen = dispatched.clone();
+        let signal = async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let first_done = observer
+                    .fetch_by_id(&first)
+                    .await
+                    .map_err(|error| WorkerError::StreamError(Box::new(error)))?
+                    .is_some_and(|task| task.parts.status.load().to_string() == "Done");
+                let lost_dispatched = seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|id| *id == lost.to_string());
+                if first_done && lost_dispatched {
+                    // Leave room for every re-dispatch the retry layer attempts.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(WorkerError::PanicError(
+                        "the lost claim was never dispatched".into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let run = WorkerBuilder::new("lost-claim-worker")
+            .backend(storage.clone())
+            .layer(OneAtATimeLayer::default())
+            .retry(RetryPolicy::retries(2))
+            .layer(RecordDispatches(dispatched.clone()))
+            .build(handler)
+            .run_until(signal)
+            .await;
+        let lost_dispatches = dispatched
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| **id == lost.to_string())
+            .count();
+        let lost_row = tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().unwrap();
+            let row = sql_query("SELECT status, attempts FROM apalis.jobs WHERE id=$1")
+                .bind::<Text, _>(lost.to_string())
+                .get_result::<LostRow>(&mut conn)
+                .unwrap();
+            sql_query("DELETE FROM apalis.jobs WHERE job_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+            sql_query("DELETE FROM apalis.workers WHERE worker_type=$1")
+                .bind::<Text, _>(&queue)
+                .execute(&mut conn)
+                .unwrap();
+            (row.status, row.attempts)
+        })
+        .await
+        .unwrap();
+        LostClaimObservation {
+            run: run_kind(&run),
+            handler_runs: handler_runs.load(Ordering::SeqCst),
+            lost_dispatches,
+            lost_row,
+        }
+    }
+    fn re_dispatched_within_the_budget()
+    -> impl Fn(&Result<crate::support::Outcome<LostClaimObservation>, String>) -> AssertionResult
+    {
+        // `RetryPolicy::retries(2)` allows the first dispatch and two retries.
+        crate::satisfies(|o: &LostClaimObservation| {
+            o.run == "completed"
+                && o.handler_runs == 1
+                && o.lost_dispatches == 3
+                && o.lost_row == ("Pending".to_owned(), 0)
+        })
+    }
     lets_expect! {#tokio_test
       expect(run(retries).await) as a_failing_handler_under_the_backend_middleware {
         let retries=Retries::DatabaseBudget;
@@ -1377,6 +1563,9 @@ mod redispatched_claim {
         when an_in_process_retry_layer_wraps_the_middleware {let retries=Retries::InProcessLayer;
           to refuses_the_re_dispatch_and_completes_the_run {observes("completed",1,"Killed",1)}
         }
+      }
+      expect(crate::database_case(lost_claim_under_a_retry_layer).await) as a_claim_lost_before_its_handler_under_a_retry_layer {
+        to is_re_dispatched_only_within_the_retry_budget {re_dispatched_within_the_budget()}
       }
     }
 }

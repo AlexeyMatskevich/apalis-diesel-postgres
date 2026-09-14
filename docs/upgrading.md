@@ -1,5 +1,58 @@
 # Installation and upgrades
 
+## Upgrading from 0.5.0
+
+One schema change and several behaviours of the running system change; see
+the [lifecycle reference](lifecycle.md) for the protocol they belong to and
+the [changelog](../CHANGELOG.md) for the full list.
+
+- Migration `20260914000000_task_state_shape` adds the constraint
+  `jobs_state_shape_check`: a `Pending` row carries no owner columns, and a
+  `Queued` or `Running` row carries both `lock_by` and `lock_at`. Before
+  validating it, the migration clears stale owner columns from `Pending`
+  rows and recovers active rows whose claim has no timestamp as lost
+  executions, consuming one attempt within the budget (`Pending` or
+  `Killed`). Complete claims and terminal history are untouched. It also
+  builds `jobs_job_type_lock_by_idx` over every owned row, the index the
+  registration foreign key needs when a registration is deleted. Run
+  `setup`; constraint validation and the index build scan `jobs` under the
+  DDL lock until the series commits, so plan a maintenance window and
+  disk/WAL headroom for large tables. To take the index build out of that
+  window, build the index beforehand without blocking writes, outside a
+  transaction:
+  `CREATE INDEX CONCURRENTLY jobs_job_type_lock_by_idx ON apalis.jobs (job_type, lock_by) WHERE lock_by IS NOT NULL;`
+  The migration keeps an index of that name, and `setup` refuses one that a
+  failed concurrent build left invalid, so drop such an index and build it
+  again before running `setup`. The down migration removes the
+  constraint and the index and keeps the repaired rows. The current series
+  has fourteen versions; a journal-less thirteen-version catalog is adopted
+  like the eleven-version generation and completed.
+- A `Config` whose `keep_alive` is zero or not shorter than
+  `reenqueue_orphaned_after` is refused at registration with
+  `InvalidArgument`. Such a worker was stale between its own heartbeats and
+  recovered its own running tasks. Set `keep_alive` to at most a third of
+  `reenqueue_orphaned_after` (the defaults are 30 and 300 seconds).
+- A claimed task stays `Queued` until the backend middleware starts it,
+  right before its handler; only then is it `Running`. Code and dashboards
+  that read `status` or `RUNNING_JOBS` see buffered claims as `Queued`, while
+  `STALE_RUNNING_JOBS` and `LONGEST_RUNNING_JOB_MINS` count every claim. A
+  release hands buffered claims back without charging an attempt; recovery
+  after a failure still charges every claim of the failed worker. A dispatch
+  whose claim was recovered, released or taken over before it started is
+  refused with `Error::ClaimLost` before its handler runs.
+- An application that takes tasks from a storage's stream and runs them
+  without `Backend::middleware()` calls `PgAck::start` before running each
+  task. Without it its claims stay `Queued`, and a release hands a task it was
+  running back without charging an attempt.
+- `WaitForCompletion::wait_for` ends with `TaskNotFound` for an id that no row
+  carries for a whole backoff interval, instead of waiting forever. Wait for
+  an enqueue transaction to commit before waiting on its ids.
+- Call `PostgresStorage::release_worker` after a worker's run returns, so a
+  redeploy under the same name registers immediately. Without it the
+  behaviour is unchanged: the name is refused until the previous registration
+  is stale. Schedule `purge_terminal_tasks` and `prune_workers` if the
+  application has no retention of its own; nothing is deleted automatically.
+
 ## Upgrading from 0.4.1 to 0.5.0
 
 Use this path when moving from `0.4.1` to `0.5.0`. It covers both the Rust
@@ -112,8 +165,8 @@ async fn migrate(pool: &PgPool) -> Result<(), Error> {
 ```
 
 For the complete 0.4.1 schema, setup adopts eight known versions into its private
-journal and executes the five additional embedded migrations. The resulting
-current series has thirteen versions. Schema recognition determines this path;
+journal and executes the six additional embedded migrations. The resulting
+current series has fourteen versions. Schema recognition determines this path;
 changing the application's crate version alone does not migrate the database.
 
 Do not copy or move `public.__diesel_schema_migrations`, manually insert version
@@ -244,6 +297,30 @@ restores the pre-upgrade state. The down migration removes the new constraint
 and function guard, but cannot reconstruct ownership or history repaired by a
 previously committed upgrade.
 
+### Claim shape update
+
+Migration `20260914000000_task_state_shape` adds the invariant that a
+`Pending` row has no owner columns and that every `Queued` or `Running` row
+has both `lock_by` and `lock_at`. Before validating the constraint it clears
+stale owner columns from `Pending` rows, and treats an active row whose claim
+has no timestamp as a lost execution, like the ownership repairs above: one
+attempt is consumed within the retry budget and the row becomes `Pending` or
+`Killed`. Claims with a complete timestamp and all terminal history, including
+the last owner a completed row names, are preserved.
+
+The migration also creates `jobs_job_type_lock_by_idx` on `(job_type,
+lock_by)` over owned rows. Deleting a registration makes PostgreSQL probe
+`jobs` for rows that still name it, and the only earlier owner index covered
+active rows alone, so every deletion scanned the queue's history; the new
+index serves that probe and `prune_workers`. Each claim now maintains one
+more index entry.
+
+Run `setup` to apply the migration. Constraint validation and the index
+build scan `jobs` under the DDL lock until the complete setup transaction
+commits; plan a maintenance window and disk/WAL headroom for large tables.
+The down migration removes the constraint and the index and keeps the
+repaired rows; it cannot restore a claim timestamp that never existed.
+
 ## Direct middleware acknowledgement
 
 `PgMiddleware` now uses the attempt history returned by each SQL claim for
@@ -276,13 +353,14 @@ This acknowledgement change requires no schema migration.
   its required structure and adopt the fixed eleven known versions privately.
   Preserve application data and any public journal, then execute later migrations.
   This also works without a public journal. Even if a raw harness already applied
-  `20260912000000_worker_key_share` or
-  `20260912000001_require_active_owner`, setup adopts only the eleven-version
-  generation and safely reapplies both later, idempotent migrations. A missing
-  active-owner constraint without a journal is structurally indistinguishable
-  from the supported previous generation; adoption does not prove provenance.
-  An existing incorrect or unvalidated constraint is rejected. With a current
-  private journal, a missing constraint is also rejected.
+  `20260912000000_worker_key_share`, `20260912000001_require_active_owner` or
+  `20260914000000_task_state_shape`, setup adopts only the eleven-version
+  generation and safely reapplies the later, idempotent migrations. A missing
+  active-owner or state-shape constraint without a journal is structurally
+  indistinguishable from the supported previous generation; adoption does not
+  prove provenance. An existing incorrect or unvalidated constraint is
+  rejected. With a current private journal, a missing constraint is also
+  rejected.
 - That crate's initial schema, or the bytea/JSONB schema of
   `apalis-postgres 1.0.0-rc.8` after all 19 upstream migrations: run the guarded
   legacy transition. Older upstream JSONB job/`last_error` generations must first

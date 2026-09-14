@@ -26,6 +26,35 @@ enum Release {
     ClaimSwept,
 }
 
+/// How the configured codec reports a payload it cannot decode.
+#[derive(Debug, Clone, Copy)]
+enum DecodeFailure {
+    /// It returns an error.
+    Reported,
+    /// It panics, as a codec trusting a corrupt length prefix does.
+    Panicked,
+}
+
+/// Decodes JSON like the default codec, but panics on a payload it cannot
+/// parse instead of returning the error.
+struct PanickingCodec;
+
+impl apalis_core::backend::codec::Codec<String> for PanickingCodec {
+    type Error = serde_json::Error;
+    type Compact = CompactType;
+
+    fn encode(value: &String) -> Result<CompactType, Self::Error> {
+        serde_json::to_vec(value)
+    }
+
+    fn decode(compact: &CompactType) -> Result<String, Self::Error> {
+        match serde_json::from_slice(compact) {
+            Ok(value) => Ok(value),
+            Err(error) => panic!("corrupt payload: {error}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DecodeOutcome {
     errors: Vec<&'static str>,
@@ -40,6 +69,7 @@ struct DecodeOutcome {
 async fn decode_cleanup(
     release: Release,
     max_attempts: i32,
+    failure: DecodeFailure,
 ) -> Result<Option<DecodeOutcome>, String> {
     let Some(url) = support::database_url_or_skip()? else {
         return Ok(None);
@@ -103,13 +133,24 @@ async fn decode_cleanup(
     let compact: TaskStream<PgTask<CompactType>, Error> =
         stream::iter(claimed.into_iter().map(|task| Ok(Some(task)))).boxed();
     let compact = crate::fetcher::LeaseStream::new(compact, lease.clone(), true).boxed();
-    let mut decoded = crate::fetcher::decode_task_stream::<String, crate::JsonCodec<CompactType>>(
-        compact,
-        pool.clone(),
-        name.clone().into(),
-        Some(token),
-        lease.clone(),
-    );
+    let mut decoded = match failure {
+        DecodeFailure::Reported => {
+            crate::fetcher::decode_task_stream::<String, crate::JsonCodec<CompactType>>(
+                compact,
+                pool.clone(),
+                name.clone().into(),
+                Some(token),
+                lease.clone(),
+            )
+        }
+        DecodeFailure::Panicked => crate::fetcher::decode_task_stream::<String, PanickingCodec>(
+            compact,
+            pool.clone(),
+            name.clone().into(),
+            Some(token),
+            lease.clone(),
+        ),
+    };
     // The single pooled connection is held so the release cannot check one out.
     if matches!(release, Release::ClaimSwept) {
         // Orphan recovery reclaimed the batch while the release was pending.
@@ -211,7 +252,7 @@ fn recovered(
         let sibling_delivered = outcome.sibling.as_ref().is_some_and(|sibling| {
             sibling.args == "healthy-sibling"
                 && sibling.parts.task_id == Some(outcome.expected_sibling_id)
-                && sibling.parts.status.load() == Status::Running
+                && sibling.parts.status.load() == Status::Queued
                 && sibling.parts.ctx.lock_by().as_deref() == Some(outcome.expected_worker.as_str())
                 && sibling.parts.ctx.lock_at().is_some()
                 && sibling.parts.attempt.current() == 0
@@ -226,7 +267,7 @@ fn recovered(
             Ok(())
         } else {
             Err(AssertionError::new(vec![format!(
-                "expected the codec error then the sibling, {expected_status} after exactly one failed attempt, the original healthy sibling with Running owner/lock and attempt zero, an active worker until the whole stream is dropped; got {result:?}"
+                "expected the codec error then the sibling, {expected_status} after exactly one failed attempt, the original healthy sibling claimed (Queued) with owner/lock and attempt zero, an active worker until the whole stream is dropped; got {result:?}"
             )]))
         }
     }
@@ -242,7 +283,7 @@ fn retired_with_the_claim_intact()
             return Ok(());
         };
         if outcome.errors == ["pool", "retired"]
-            && outcome.corrupt_state.status == "Running"
+            && outcome.corrupt_state.status == "Queued"
             && outcome.corrupt_state.attempts == 0
             && outcome.sibling.is_none()
             && outcome.retired_after_next
@@ -251,7 +292,7 @@ fn retired_with_the_claim_intact()
             Ok(())
         } else {
             Err(AssertionError::new(vec![format!(
-                "expected the database error then WorkerRetired, the corrupt row still Running with no attempt consumed, no sibling delivered and the worker retired by the failed release; got {result:?}"
+                "expected the database error then WorkerRetired, the corrupt row still claimed (Queued) with no attempt consumed, no sibling delivered and the worker retired by the failed release; got {result:?}"
             )]))
         }
     }
@@ -283,10 +324,19 @@ fn retired_after_losing_the_claim()
 }
 
 lets_expect! { #tokio_test
-    expect(decode_cleanup(release, max_attempts).await) as corrupt_claim_cleanup {
+    expect(decode_cleanup(release, max_attempts, failure).await) as corrupt_claim_cleanup {
         let release = Release::Immediate;
         let max_attempts = 3_i32;
+        let failure = DecodeFailure::Reported;
         to releases_the_corrupt_claim_before_delivering_the_valid_sibling { recovered(max_attempts) }
+        when the_codec_panics_instead_of_reporting_the_error {
+            let failure = DecodeFailure::Panicked;
+            to releases_the_corrupt_claim_before_delivering_the_valid_sibling { recovered(max_attempts) }
+            when the_corrupt_task_has_exhausted_its_attempt_budget {
+                let max_attempts = 1_i32;
+                to kills_the_corrupt_task_and_preserves_the_valid_sibling { recovered(max_attempts) }
+            }
+        }
         when the_corrupt_task_has_exhausted_its_attempt_budget {
             let max_attempts = 1_i32;
             to kills_the_corrupt_task_and_preserves_the_valid_sibling { recovered(max_attempts) }

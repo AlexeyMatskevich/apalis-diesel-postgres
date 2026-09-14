@@ -10,6 +10,7 @@ pub(crate) mod fetch;
 mod metrics;
 mod notify;
 mod push;
+pub(crate) mod retention;
 pub(crate) mod worker;
 
 pub(crate) use metrics::refresh_queue_stats_snapshot;
@@ -19,14 +20,28 @@ pub(crate) use admin::{
     fetch_by_id, list_all_tasks, list_queues, list_tasks, list_workers, metrics_for_queue,
     metrics_global, register_worker,
 };
-pub(crate) use fetch::{fail_undecodable_task, fetch_next, lock_task};
+pub(crate) use fetch::{StartClaim, fail_undecodable_task, fetch_next, lock_task, start_task};
 pub(crate) use notify::{NOTIFY_LISTENER_POLL_INTERVAL, clamp_notify_capacity, notify_task_ids};
 pub(crate) use push::{FlushFailure, flush_tasks, push_tasks_on_conn, validate_task};
 #[cfg(test)]
 pub(crate) use push::{
     MAX_IDEMPOTENCY_KEY_LEN, MAX_JOB_PAYLOAD_LEN, MAX_METADATA_PAYLOAD_LEN, MAX_QUEUE_NAME_LEN,
 };
-pub(crate) use worker::{initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream};
+pub(crate) use retention::{prune_workers, purge_terminal_tasks};
+pub(crate) use worker::{
+    initial_heartbeat, keep_alive_stream, reenqueue_orphaned_stream, release_worker,
+    validate_liveness,
+};
+
+/// SQL predicate for a terminal row: `Done`, `Killed`, or `Failed` with no
+/// retry budget left (a shape only other writers produce). An exhausted
+/// `Pending` row, another shape only other writers produce, never runs again
+/// either, but it is not terminal: it is neither awaited as complete nor
+/// purged.
+/// Shared by `WaitForCompletion` and retention so the rows a waiter can
+/// observe and the rows a purge removes are the same set.
+pub(crate) const TERMINAL_PREDICATE: &str =
+    "(status IN ('Done', 'Killed') OR (status = 'Failed' AND attempts >= max_attempts))";
 
 pub(super) fn with_conn<F, T>(
     pool: PgPool,

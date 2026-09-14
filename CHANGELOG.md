@@ -9,6 +9,37 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Added
 
+- `PgAck::start` starts a claimed task for a consumer that takes tasks from a
+  storage's stream and runs them without the backend middleware. A claim
+  stays `Queued` until it is started, and a release hands a `Queued` claim
+  back uncharged, so such a consumer starts each claim before running it; a
+  claim lost in the meantime is refused with `ClaimLost`.
+- `PostgresStorage::release_worker` hands a stopped worker's registration
+  back: every `Running` or `Queued` task it still owns returns to the queue,
+  charged one attempt only when its handler had started, the lease token is
+  cleared, and the row is
+  marked released, so a restart registers the same name immediately instead
+  of waiting for `reenqueue_orphaned_after`. A registration the storage does
+  not own is reported as `WorkerNotRegistered` and left untouched.
+  `PostgresStorage::run_released` awaits a worker future and then releases
+  whether the run returned, failed or panicked, returning both results as
+  `ReleasedRun`; only cancelling it skips the release.
+  `PostgresStorage::releaser` returns a clonable `PgReleaser` with both
+  operations, so a storage that moved into a `WorkerBuilder` (or whose
+  fetcher cannot be cloned, as with `SharedPostgresStorage`) can still be
+  released.
+- Retention for the queue's data: `PostgresStorage::purge_terminal_tasks`
+  deletes `Done`, `Killed` and budget-exhausted `Failed` tasks completed
+  longer ago than a window, in bounded batches that each borrow a pooled
+  connection; the apalis `Vacuum` trait is implemented as that purge with a
+  zero window; and `PostgresStorage::prune_workers` deletes, in bounded
+  batches, registrations that have been stale for a window and that no task
+  references. A prune window shorter than `reenqueue_orphaned_after` is
+  refused with `InvalidArgument`, because a registration is stale only after
+  that deadline.
+- `docs/lifecycle.md` documents every task state and transition, the worker
+  registration protocol, recovery latency after each kind of failure, and
+  retention.
 - `PostgresStorage::acknowledger()` returns a `PgAck` bound to the storage's
   registration token and local liveness, so a manual acknowledgement that
   fails retires the worker's registration like the automatic middleware
@@ -20,8 +51,59 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   `AbortError` before the handler runs again, and `PgAck` returns it for a
   repeated manual acknowledgement of the same claim snapshot.
 
+### Changed (breaking)
+
+- A claimed task stays `Queued` until the backend middleware starts it,
+  right before its handler runs; only then does it become `Running`.
+  `release_worker` hands a `Queued` task back to `Pending` without consuming
+  an attempt or recording a result, so the tasks a poll fetcher had buffered
+  when its worker stopped keep their budget; before, each lost an attempt,
+  and a task allowed one attempt was killed without running. The stale sweep
+  and a takeover still charge every claim of a worker that failed, started
+  or not, so a task that crashes the process still reaches `Killed`. A dispatch whose claim was recovered, released,
+  or taken over in the meantime is refused before the handler runs with the
+  new `Error::ClaimLost`, and the worker continues. An acknowledger attached
+  outside the middleware records nothing for a claim whose start was refused. Every refusal before the
+  handler counts as a dispatch on the task's attempt counter, so a retry
+  layer outside the middleware stops after its budget. Starting a task costs one
+  more transaction per task, and a start that fails on the database retires
+  the worker like a failed acknowledgement. Code that reads `status` sees
+  buffered claims as `Queued`, and `running_jobs` counts only started tasks, while
+  `stale_running_jobs` and `longest_running_job_mins` count every claim.
+  A stream consumer that acknowledges without the middleware acknowledges
+  `Queued` rows as before; one that runs tasks starts each claim with
+  `PgAck::start`, so a release charges the claims it was running.
+- Registration and the heartbeat stream refuse a schedule that cannot keep
+  a registration fresh: `keep_alive` must be greater than zero and shorter
+  than `reenqueue_orphaned_after`, or the first stream item is
+  `InvalidArgument` and no row is written. Such a worker was stale between
+  its own heartbeats and recovered its own running tasks as orphans. A
+  `Config` that shortened `reenqueue_orphaned_after` to the default
+  30-second `keep_alive` or below now needs a shorter `keep_alive` as well.
+- Migration `20260914000000_task_state_shape` adds the constraint
+  `jobs_state_shape_check`: a `Pending` row carries no owner columns and a
+  `Queued` or `Running` row carries both `lock_by` and `lock_at`. Existing
+  `Pending` rows lose stale owner columns, and active rows whose claim has no
+  timestamp are recovered as lost executions with one attempt consumed. The
+  same migration builds `jobs_job_type_lock_by_idx` over every owned row, so
+  deleting a registration (`prune_workers`) no longer scans the queue's
+  history for the foreign-key probe; each claim maintains one more index
+  entry. Run `setup` and follow the maintenance guidance in
+  [the upgrade guide](docs/upgrading.md). The series now has fourteen
+  versions; a journal-less thirteen-version catalog is adopted and completed.
+
 ### Changed
 
+- `WaitForCompletion::wait_for` reports an id that no row carries for a
+  whole backoff interval as `TaskNotFound` and stops waiting for it, instead
+  of polling forever. This covers ids that were never enqueued and tasks that
+  `purge_terminal_tasks` or `Vacuum` removed; an enqueue that commits within
+  that interval is still awaited. An id passed more than once is waited for
+  once and yields one result.
+- A task that `release_worker` charges records
+  `Re-enqueued because the worker released its registration.` as its result
+  when it had none; a claim it hands back uncharged keeps its result, and the
+  sweep and takeover keep the heartbeat timeout message.
 - A registration without a lease token (the admin `RegisterWorker` trait,
   legacy clients of `apalis.get_jobs`) now renews `last_seen` on every
   `register_worker` call, and a worker stream registering the same name
@@ -33,6 +115,19 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- A codec that panicked while decoding a claimed payload took the worker
+  down, and the claim waited for recovery. The panic is now treated as an
+  undecodable payload: the row is released through its retry budget and the
+  rest of the batch is delivered.
+- The heartbeat stream could renew before the task stream had registered the
+  name: Apalis polls both streams from the start, so a registration that took
+  longer than one `keep_alive` (a slow database, a large startup sweep, a
+  short interval under load) ended the worker with `WorkerNotRegistered`
+  before it claimed anything. The first renewal now waits for the
+  registration outcome: a heartbeat stream polled on its own never yields
+  until the task stream has yielded its first item, then renews (or reports
+  `WorkerNotRegistered` when the registration was refused), and yields
+  `WorkerRetired` once the name is retired.
 - A token-bound claim by a worker with no registration for the task's queue
   reported `WorkerNotRegistered` with the hint that its registration had
   been replaced and that a fresh storage was needed. The hint now names the

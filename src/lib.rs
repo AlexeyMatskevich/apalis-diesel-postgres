@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
-use std::{fmt::Debug, marker::PhantomData};
+use std::{fmt::Debug, future::Future, marker::PhantomData, time::Duration};
 
 pub use apalis_codec::json::JsonCodec;
 use apalis_core::{
@@ -101,6 +101,76 @@ const _: fn() = || {
     assert_send_sync::<PostgresStorage<(), JsonCodec<CompactType>, SharedFetcher>>();
     assert_send_sync::<SharedPostgresStorage<()>>();
 };
+
+/// What [`PostgresStorage::run_released`] observed: the worker's own result
+/// and the release that followed it.
+#[must_use = "both the run outcome and the release result need handling"]
+#[derive(Debug)]
+pub struct ReleasedRun<T> {
+    /// The value the worker future resolved to.
+    pub outcome: T,
+    /// The release: the number of tasks handed back, or why nothing was
+    /// released (see [`PostgresStorage::release_worker`]).
+    pub released: Result<usize, Error>,
+}
+
+/// Releases registrations of one storage without holding its fetcher.
+///
+/// Obtained from [`PostgresStorage::releaser`] before the storage moves into
+/// a worker (`WorkerBuilder::backend` consumes it, and a storage whose
+/// fetcher is not `Clone`, such as one made by [`SharedPostgresStorage`],
+/// cannot be cloned). It carries the pool, the queue configuration, the
+/// registration token and the local liveness registry, which is everything a
+/// release needs.
+#[derive(Clone)]
+pub struct PgReleaser {
+    pool: PgPool,
+    config: Config,
+    lease_token: std::sync::Arc<str>,
+    leases: crate::lease::LeaseRegistry,
+}
+
+impl Debug for PgReleaser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgReleaser")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PgReleaser {
+    /// Release the registration of `worker_id`; see
+    /// [`PostgresStorage::release_worker`] for what is released and reported.
+    ///
+    /// # Errors
+    /// The same as [`PostgresStorage::release_worker`].
+    pub async fn release_worker(&self, worker_id: &str) -> Result<usize, Error> {
+        self.leases.for_worker(worker_id).retire();
+        queries::release_worker(
+            self.pool.clone(),
+            self.config.clone(),
+            worker_id.to_owned(),
+            std::sync::Arc::clone(&self.lease_token),
+        )
+        .await
+    }
+
+    /// Run a worker to completion, then release its registration; see
+    /// [`PostgresStorage::run_released`].
+    pub async fn run_released<F>(&self, worker_id: &str, run: F) -> ReleasedRun<F::Output>
+    where
+        F: Future,
+    {
+        use futures::FutureExt as _;
+        // A panic in the run still releases, then resumes unwinding.
+        let outcome = std::panic::AssertUnwindSafe(run).catch_unwind().await;
+        let released = self.release_worker(worker_id).await;
+        match outcome {
+            Ok(outcome) => ReleasedRun { outcome, released },
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
 
 /// PostgreSQL storage backend implemented with Diesel.
 pub struct PostgresStorage<
@@ -246,6 +316,9 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// same way the automatic middleware does, so orphan recovery can reclaim
     /// the task. [`PgAck::new`] and [`PgAck::with_lease_token`] bind no
     /// liveness and leave the heartbeat running after a failure.
+    ///
+    /// A consumer that runs tasks without the backend middleware starts each
+    /// claim with [`PgAck::start`] before running it.
     #[must_use]
     pub fn acknowledger(&self) -> PgAck {
         PgAck::with_lease_registry(
@@ -253,6 +326,162 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
             std::sync::Arc::clone(&self.lease_token),
             self.leases.clone(),
         )
+    }
+
+    /// A clonable handle that releases this storage's registrations; take it
+    /// before the storage moves into a `WorkerBuilder`. Storages whose
+    /// fetcher is not `Clone` (those made by [`SharedPostgresStorage`]) have
+    /// no other way to release after the build.
+    #[must_use]
+    pub fn releaser(&self) -> PgReleaser {
+        PgReleaser {
+            pool: self.pool.clone(),
+            config: self.config.clone(),
+            lease_token: std::sync::Arc::clone(&self.lease_token),
+            leases: self.leases.clone(),
+        }
+    }
+
+    /// Release this storage's registration of `worker_id` for its queue: hand
+    /// every `Running` or `Queued` task the worker still owns back to the
+    /// queue, and mark the registration released so a successor can register
+    /// the same name immediately instead of waiting for
+    /// `reenqueue_orphaned_after`.
+    ///
+    /// Call this once the worker has stopped, after `Worker::run` (or
+    /// `run_until`) returns, whether it returned an error or not, or let
+    /// [`Self::run_released`] do it. The local registration is retired first,
+    /// so clones of this storage stop claiming and heartbeating under the
+    /// name before the database is updated; a restart needs fresh storage, as
+    /// after any retirement.
+    ///
+    /// `worker_id` must be the stopped worker's own name. Clones of one
+    /// storage share the registration token, so a wrong name that another
+    /// live worker of the same storage uses releases that worker instead;
+    /// the call cannot tell the two apart.
+    ///
+    /// A `Running` task consumes one attempt, like orphan recovery: its
+    /// handler started, so the worker may have executed it partially. A
+    /// `Queued` task was claimed but never started, such as the tasks the
+    /// poll fetcher buffered and the stopped worker never handed to a
+    /// handler; it returns to `Pending` with its attempt count and result
+    /// unchanged. Orphan recovery after a failure charges `Queued` tasks as
+    /// well, because the failed worker may have failed on them. A task the
+    /// worker acknowledged before stopping is not touched.
+    /// The registration row itself is kept because completed tasks reference
+    /// it as their last owner; [`Self::prune_workers`] removes it once
+    /// nothing references it any more.
+    ///
+    /// Returns the number of tasks handed back.
+    ///
+    /// # Errors
+    /// - [`Error::WorkerNotRegistered`] if the registration is absent, has
+    ///   no lease token, or is owned by another storage. Nothing is released:
+    ///   a successor that took the name over owns those claims now, and no
+    ///   deadline applies.
+    /// - [`Error::Pool`], [`Error::Database`], [`Error::Blocking`] for
+    ///   connection, SQL and executor failures. The database registration is
+    ///   then still live; the periodic sweep recovers it once it is stale.
+    pub async fn release_worker(&self, worker_id: &str) -> Result<usize, Error> {
+        self.releaser().release_worker(worker_id).await
+    }
+
+    /// Run a worker to completion, then release its registration.
+    ///
+    /// `run` is typically `Worker::run_until(signal)`. The release follows
+    /// whether the run returned `Ok`, returned an error, or panicked (the
+    /// panic resumes after the release); only cancelling the returned future
+    /// skips it. See [`Self::release_worker`] for what the release does and
+    /// reports. Both results are returned: a run that failed still needs its
+    /// error handled, and a release that failed leaves the registration to
+    /// the periodic sweep, or, for `WorkerNotRegistered`, to the successor
+    /// that already owns it.
+    ///
+    /// ```no_run
+    /// # use apalis::prelude::*;
+    /// # use apalis_diesel_postgres::{Error, PgPool, PostgresStorage, ReleasedRun};
+    /// # async fn handle(job: String) -> Result<(), BoxDynError> { Ok(()) }
+    /// # async fn example(
+    /// #     storage: PostgresStorage<String>,
+    /// #     shutdown: impl std::future::Future<Output = Result<(), WorkerError>> + Send + 'static,
+    /// # ) -> Result<(), BoxDynError> {
+    /// let releaser = storage.releaser();
+    /// let worker = WorkerBuilder::new("emails-worker")
+    ///     .backend(storage)
+    ///     .build(handle);
+    /// let ReleasedRun { outcome, released } = releaser
+    ///     .run_released("emails-worker", worker.run_until(shutdown))
+    ///     .await;
+    /// match released {
+    ///     Ok(_) | Err(Error::WorkerNotRegistered { .. }) => {}
+    ///     Err(error) => eprintln!("registration stays until the stale deadline: {error}"),
+    /// }
+    /// outcome?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_released<F>(&self, worker_id: &str, run: F) -> ReleasedRun<F::Output>
+    where
+        F: Future,
+    {
+        self.releaser().run_released(worker_id, run).await
+    }
+
+    /// Delete the terminal tasks of this storage's queue (`Done`, `Killed`,
+    /// and `Failed` with no retry budget left) that completed at least
+    /// `completed_before` ago, and return how many rows were deleted.
+    ///
+    /// Completed rows are never removed by the worker protocol; this is the
+    /// retention step of the task lifecycle. Deletion runs in bounded batches,
+    /// each its own transaction. A deleted task is no longer observable
+    /// through `FetchById`, `WaitForCompletion` or the listings, and its
+    /// `idempotency_key` becomes free for a new task, so keep
+    /// `completed_before` longer than any consumer still waiting on results
+    /// and than the deduplication horizon the application relies on.
+    /// [`apalis_core::backend::Vacuum::vacuum`] is this method with a zero
+    /// window.
+    ///
+    /// # Errors
+    /// - [`Error::Pool`], [`Error::Database`], [`Error::Blocking`] for
+    ///   connection, SQL and executor failures. Batches already deleted stay
+    ///   deleted.
+    pub async fn purge_terminal_tasks(&self, completed_before: Duration) -> Result<usize, Error> {
+        queries::purge_terminal_tasks(
+            self.pool.clone(),
+            self.config.queue().to_string(),
+            completed_before,
+        )
+        .await
+    }
+
+    /// Delete the registrations of this storage's queue that have been stale
+    /// for at least `stale_for` and that no task references any more, in
+    /// bounded batches, and return how many rows were deleted.
+    ///
+    /// Registration rows are kept by the worker protocol so completed tasks
+    /// can name their last owner; workers with unique names (one per process
+    /// or pod) otherwise accumulate forever. A registration still referenced
+    /// by a task, even a completed one, is kept until
+    /// [`Self::purge_terminal_tasks`] removes that task, and a registration in
+    /// use by another transaction is skipped. `stale_for` must be at least
+    /// this storage's `reenqueue_orphaned_after`: a registration is stale
+    /// only after that deadline, and pruning it earlier would remove a live
+    /// worker whose heartbeat merely lags, so that its next renewal reports
+    /// `WorkerNotRegistered`. Use the longest deadline any worker of the queue
+    /// runs with when they differ. A released registration passes any window.
+    ///
+    /// Every deleted row runs the foreign-key probe over the queue's history;
+    /// the `jobs_job_type_lock_by_idx` index serves both that probe and the
+    /// search for unreferenced registrations.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidArgument`] if `stale_for` is shorter than
+    ///   `reenqueue_orphaned_after`; nothing is deleted.
+    /// - [`Error::Pool`], [`Error::Database`], [`Error::Blocking`] for
+    ///   connection, SQL and executor failures. Batches already deleted stay
+    ///   deleted.
+    pub async fn prune_workers(&self, stale_for: Duration) -> Result<usize, Error> {
+        queries::prune_workers(self.pool.clone(), self.config.clone(), stale_for).await
     }
 
     /// Change the task codec while retaining pool, config, fetcher, and the
@@ -306,20 +535,36 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
         &self,
         worker: &WorkerContext,
     ) -> futures::stream::BoxStream<'static, Result<(), Error>> {
-        let keep_alive = queries::keep_alive_stream(
-            self.pool.clone(),
-            self.config.clone(),
-            worker.clone(),
-            std::sync::Arc::clone(&self.lease_token),
-        );
-        let reenqueue = queries::reenqueue_orphaned_stream(self.pool.clone(), self.config.clone())
-            .map_ok(|_| ());
-        crate::fetcher::LeaseStream::new(
-            futures::stream::select(keep_alive, reenqueue),
-            self.leases.for_worker(worker.name()),
-            false,
-        )
-        .boxed()
+        // The poll stream refuses the same configuration at registration;
+        // refusing it here as well keeps the first heartbeat tick from
+        // reporting a misleading `WorkerNotRegistered` before that happens.
+        if let Err(error) = queries::validate_liveness(&self.config) {
+            return futures::stream::once(futures::future::ready(Err(error))).boxed();
+        }
+        // The registration is the task stream's first item, and only that
+        // item creates the row a heartbeat renews. Apalis polls both streams
+        // from the start, so the first renewal must wait for it: a renewal
+        // that found no row would end the worker with `WorkerNotRegistered`
+        // whenever registration takes longer than one `keep_alive`. A refused
+        // registration settles the wait as well, and the renewal then reports
+        // the refusal; a retired name reports `WorkerRetired` instead.
+        let lease = self.leases.for_worker(worker.name());
+        let pool = self.pool.clone();
+        let config = self.config.clone();
+        let worker = worker.clone();
+        let lease_token = std::sync::Arc::clone(&self.lease_token);
+        let beats = futures::stream::once(lease.registration()).flat_map(move |()| {
+            let keep_alive = queries::keep_alive_stream(
+                pool.clone(),
+                config.clone(),
+                worker.clone(),
+                std::sync::Arc::clone(&lease_token),
+            );
+            let reenqueue =
+                queries::reenqueue_orphaned_stream(pool.clone(), config.clone()).map_ok(|_| ());
+            futures::stream::select(keep_alive, reenqueue)
+        });
+        crate::fetcher::LeaseStream::new(beats, lease, false).boxed()
     }
 }
 
@@ -503,6 +748,12 @@ where
     type Beat = futures::stream::BoxStream<'static, Result<(), Error>>;
     type Layer = PgMiddleware;
 
+    /// The keep-alive and orphan-sweep stream for `worker`. It yields nothing
+    /// until the task stream returned by [`Backend::poll`] has yielded its
+    /// first item, the registration outcome; then it renews every
+    /// `keep_alive`, reporting `WorkerNotRegistered` when the registration
+    /// was refused, and yields [`Error::WorkerRetired`] once the name is
+    /// retired.
     fn heartbeat(&self, worker: &WorkerContext) -> Self::Beat {
         self.heartbeat_stream(worker)
     }
@@ -847,6 +1098,87 @@ mod tests {
             Err(AssertionError::new(vec![format!(
                 "unexpected backend trait surfaces: {result:?}"
             )]))
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    mod tokio_tests {
+        use super::*;
+
+        /// Run a worker future that resolves to `outcome` through
+        /// `run_released` against an unreachable pool: the outcome must come
+        /// back untouched, the release must report the pool failure, and the
+        /// name must be retired locally either way.
+        async fn released_run(
+            outcome: Result<(), &'static str>,
+        ) -> (Result<(), &'static str>, &'static str, bool) {
+            let storage = storage_for_config("run-released", 1);
+            let ReleasedRun { outcome, released } = storage
+                .run_released("released-worker", async move { outcome })
+                .await;
+            let released = match released {
+                Ok(_) => "released",
+                Err(Error::Pool(_)) => "pool",
+                Err(_) => "other",
+            };
+            let retired = storage.leases.for_worker("released-worker").is_retired();
+            (outcome, released, retired)
+        }
+
+        /// A run that panics still releases (observable as the local
+        /// retirement, which precedes the database write) and then resumes
+        /// the panic.
+        async fn panicking_run_released() -> (bool, bool) {
+            use futures::FutureExt as _;
+            let storage = storage_for_config("run-released-panic", 1);
+            let releaser = storage.releaser();
+            let panicked = std::panic::AssertUnwindSafe(
+                releaser.run_released("panicking-worker", async { panic!("handler exploded") }),
+            )
+            .catch_unwind()
+            .await
+            .is_err();
+            (
+                panicked,
+                storage.leases.for_worker("panicking-worker").is_retired(),
+            )
+        }
+
+        /// A prune window shorter than the stale deadline is refused before
+        /// any connection is used.
+        async fn prune_with_short_window() -> &'static str {
+            let storage = storage_for_config("prune-window", 1);
+            match storage.prune_workers(Duration::from_secs(1)).await {
+                Err(Error::InvalidArgument(_)) => "invalid_argument",
+                Err(Error::Pool(_)) => "pool",
+                Err(_) => "other_error",
+                Ok(_) => "pruned",
+            }
+        }
+
+        lets_expect! { #tokio_test
+            expect(panicking_run_released().await) as a_panicking_run_followed_by_a_release {
+                to releases_and_resumes_the_panic { equal((true, true)) }
+            }
+
+            expect(prune_with_short_window().await) as a_prune_window_shorter_than_the_deadline {
+                to is_refused_before_touching_the_pool { equal("invalid_argument") }
+            }
+
+            expect(released_run(outcome).await) as a_run_followed_by_a_release {
+                let outcome: Result<(), &'static str> = Ok(());
+                when the_database_cannot_be_reached {
+                    to keeps_the_outcome_reports_the_release_failure_and_retires_the_name {
+                        equal((Ok(()), "pool", true))
+                    }
+                    when the_run_itself_failed {
+                        let outcome: Result<(), &'static str> = Err("worker stopped");
+                        to keeps_the_failed_outcome_reports_the_release_failure_and_retires_the_name {
+                            equal((Err("worker stopped"), "pool", true))
+                        }
+                    }
+                }
+            }
         }
     }
 
