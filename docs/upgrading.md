@@ -17,7 +17,13 @@ the [changelog](../CHANGELOG.md) for the full list.
   registration foreign key needs when a registration is deleted. Run
   `setup`; constraint validation and the index build scan `jobs` under the
   DDL lock until the series commits, so plan a maintenance window and
-  disk/WAL headroom for large tables. The down migration removes the
+  disk/WAL headroom for large tables. To take the index build out of that
+  window, build the index beforehand without blocking writes, outside a
+  transaction:
+  `CREATE INDEX CONCURRENTLY jobs_job_type_lock_by_idx ON apalis.jobs (job_type, lock_by) WHERE lock_by IS NOT NULL;`
+  The migration keeps an index of that name, and `setup` refuses one that a
+  failed concurrent build left invalid, so drop such an index and build it
+  again before running `setup`. The down migration removes the
   constraint and the index and keeps the repaired rows. The current series
   has fourteen versions; a journal-less thirteen-version catalog is adopted
   like the eleven-version generation and completed.
