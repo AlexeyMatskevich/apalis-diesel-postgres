@@ -247,39 +247,40 @@ pub(crate) fn start_task(
     claim: StartClaim,
 ) -> impl Future<Output = Result<bool, Error>> + Send {
     with_conn(pool, move |conn| {
-        conn.transaction(|conn| {
-            // The worker row is taken before the job row, like every other
-            // ownership operation, and stays locked until the start commits.
-            if claim.lease_token.is_some()
-                && !super::worker::lock_current_worker(
-                    conn,
-                    &claim.worker_id,
-                    &claim.queue,
-                    claim.lease_token.as_deref(),
-                )?
-            {
-                return Ok(false);
-            }
-            let count = sql_query(
-                "UPDATE apalis.jobs
-                 SET status = 'Running'
-                 WHERE id = $1
-                     AND job_type = $2
-                     AND lock_by = $3
-                     AND lock_at = to_timestamp($4::double precision)
-                     AND ($5::integer IS NULL OR attempts = $5)
-                     AND (status = 'Queued' OR ($6 AND status = 'Running'))",
-            )
-            .bind::<Text, _>(claim.task_id.to_string())
-            .bind::<Text, _>(&claim.queue)
-            .bind::<Text, _>(&claim.worker_id)
-            .bind::<BigInt, _>(claim.lock_at)
-            .bind::<Nullable<Integer>, _>(claim.attempts)
-            .bind::<Bool, _>(claim.restart)
-            .execute(conn)
-            .map_err(Error::database("starting task"))?;
-            Ok(count == 1)
-        })
+        // One statement. The owner CTE takes the registration's share lock
+        // before the job row is updated, the order of every other ownership
+        // operation, and holds it until the start commits; with a token it
+        // also requires that token to own the registration. A CTE that locks
+        // rows is never inlined, so it runs once.
+        let count = sql_query(
+            "WITH owner AS MATERIALIZED (
+                 SELECT 1 FROM apalis.workers
+                 WHERE id = $3
+                     AND worker_type = $2
+                     AND ($7::text IS NULL OR lease_token IS NOT DISTINCT FROM $7)
+                 FOR KEY SHARE
+             )
+             UPDATE apalis.jobs
+             SET status = 'Running'
+             FROM owner
+             WHERE apalis.jobs.id = $1
+                 AND apalis.jobs.job_type = $2
+                 AND apalis.jobs.lock_by = $3
+                 AND apalis.jobs.lock_at = to_timestamp($4::double precision)
+                 AND ($5::integer IS NULL OR apalis.jobs.attempts = $5)
+                 AND (apalis.jobs.status = 'Queued'
+                     OR ($6 AND apalis.jobs.status = 'Running'))",
+        )
+        .bind::<Text, _>(claim.task_id.to_string())
+        .bind::<Text, _>(&claim.queue)
+        .bind::<Text, _>(&claim.worker_id)
+        .bind::<BigInt, _>(claim.lock_at)
+        .bind::<Nullable<Integer>, _>(claim.attempts)
+        .bind::<Bool, _>(claim.restart)
+        .bind::<Nullable<Text>, _>(claim.lease_token.as_deref())
+        .execute(conn)
+        .map_err(Error::database("starting task"))?;
+        Ok(count == 1)
     })
 }
 
