@@ -233,7 +233,8 @@ these states; the columns in parentheses are what other actors read.
    `releaser()` handle carries both operations for a storage that has moved
    into the builder. The name must be the stopped worker's own: clones of one
    storage share the token, and a wrong name releases whichever live worker
-   uses it. Apalis drains running handlers before a graceful stop, but the
+   uses it. Apalis drains running handlers, and the starts of tasks already
+   dispatched, before a graceful stop, but the
    poll fetcher's buffer of claimed, undispatched tasks (up to `buffer_size`)
    is dropped with the stream; those rows are still `Queued`, and the
    release hands them back without charging an attempt. After a fail-stop

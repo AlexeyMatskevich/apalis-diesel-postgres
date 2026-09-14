@@ -1836,6 +1836,36 @@ mod tests {
             }
         }
 
+        /// A dispatch of a claim, created and then dropped before it was
+        /// polled. Returns the worker's task count while the dispatch exists
+        /// and after it is dropped.
+        fn dispatch_tracking() -> (usize, usize) {
+            let worker = WorkerContext::new::<()>("tracked-worker");
+            let mut task = TaskBuilder::new(())
+                .with_task_id(task_id())
+                .with_ctx(
+                    PgContext::new()
+                        .with_queue("tracked-queue".to_owned())
+                        .with_lock_by(Some("tracked-worker".to_owned()))
+                        .with_lock_at(Some(1_700_000_000)),
+                )
+                .build();
+            task.parts.data.insert(worker.clone());
+            record_claim(&mut task.parts);
+            let mut service = LockTaskService {
+                inner: RecordingHandler(Arc::new(AtomicUsize::new(0))),
+                pool: unreachable_pool(),
+                leases: None,
+                lease_token: None,
+            };
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(matches!(service.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+            let dispatch = service.call(task);
+            let while_dispatched = worker.task_count();
+            drop(dispatch);
+            (while_dispatched, worker.task_count())
+        }
+
         /// How the handler behind the middleware ends when it runs.
         #[derive(Clone, Copy, Debug)]
         enum HandlerOutcome {
@@ -2385,6 +2415,13 @@ mod tests {
                         have(owner_retired) be_false
                     }
                 }
+            }
+
+            expect(dispatch_tracking()) as a_dispatch_of_a_claim {
+                // A graceful stop waits for the worker's tasks. Counting the
+                // dispatch from its creation keeps a stop from dropping a
+                // start whose transaction may still commit `Running`.
+                to counts_as_a_task_of_its_worker_until_it_ends_or_is_dropped { equal((1, 0)) }
             }
 
             expect(acknowledge_outside_the_middleware(row, handler).await) as an_acknowledger_outside_the_middleware {
@@ -3130,11 +3167,8 @@ where
     fn call(&mut self, mut req: PgTask<Args>) -> Self::Future {
         let pool = self.pool.clone();
         let lease_token = self.lease_token.as_ref().map(|token| token.0.clone());
-        let worker_id = req
-            .parts
-            .data
-            .get::<WorkerContext>()
-            .map(|worker| worker.name().to_owned());
+        let worker = req.parts.data.get::<WorkerContext>().cloned();
+        let worker_id = worker.as_ref().map(|worker| worker.name().to_owned());
         let local_lease = self
             .leases
             .as_ref()
@@ -3174,7 +3208,7 @@ where
         let clone = self.inner.clone();
         let mut ready_inner = std::mem::replace(&mut self.inner, clone);
 
-        async move {
+        let dispatch = async move {
             // Every refusal below happens before the handler, where the
             // worker's Tracker would have counted the dispatch. Count it here,
             // in one place, so a counter-based retry layer outside this
@@ -3271,7 +3305,14 @@ where
             // retires on acknowledgement failure; this guard covers cancellation.
             completion_guard.disarm();
             result
+        };
+        // A graceful stop waits for its worker's tasks. Counting the dispatch
+        // from its creation, not from the handler, keeps a stop from dropping
+        // a start whose transaction may still commit `Running`, which a release
+        // would then charge although no handler ran.
+        match worker {
+            Some(worker) => worker.track(dispatch).boxed(),
+            None => dispatch.boxed(),
         }
-        .boxed()
     }
 }
