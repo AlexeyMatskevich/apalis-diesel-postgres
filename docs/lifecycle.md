@@ -288,7 +288,7 @@ waiting.
 | Claim fails before any row was claimed | The task stream yields the error; nothing is owned. |
 | Claim transaction produced rows but the commit was not confirmed | `ClaimOutcomeUnknown`; the name is retired locally so recovery can proceed. |
 | Acknowledgement fails or is lost | The storage's acknowledger retires the name; the row stays `Running`, or `Queued` for a claim that was never started, until recovery. `PgAck::new` and `with_lease_token` bind no liveness and leave the heartbeat running. |
-| Start fails (pool timeout, connection lost) | The dispatch aborts before the handler and the name is retired locally. Recovery hands the claim back after the stale deadline and charges it. |
+| Start fails (pool timeout, connection lost) | The dispatch aborts before the handler and the name is retired locally. Recovery hands the claim back after the stale deadline and charges it. An acknowledger attached outside the middleware records nothing for the refused start. |
 | Start matches nothing | `ClaimLost`: the claim was recovered, released, taken over, or started by another claim of its epoch. The handler does not run and the worker continues. An acknowledger attached outside the middleware records nothing for the refusal. |
 | Process crashes on a claim, started or not | Recovery after the stale deadline, by the sweep or a takeover, charges every claim the worker held, so a task that crashes the process reaches `Killed`. |
 | Payload does not decode, or the codec panics on it | The row is released through its budget (`Failed`, then `Killed`) with bounded retries; persistent failure retires the name. |

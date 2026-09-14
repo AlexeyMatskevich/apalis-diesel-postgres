@@ -145,10 +145,6 @@ pub enum Error {
     #[error(
         "claim of task {task_id} in queue {queue} by worker {worker_id} was lost before the task started; it was recovered or taken over and runs elsewhere"
     )]
-    ///
-    /// Only this crate constructs it, so an acknowledger can tell the refusal
-    /// from a handler's own error.
-    #[non_exhaustive]
     ClaimLost {
         /// Task id whose claim was lost.
         task_id: String,

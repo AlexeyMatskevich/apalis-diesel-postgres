@@ -63,7 +63,7 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   or not, so a task that crashes the process still reaches `Killed`. A dispatch whose claim was recovered, released,
   or taken over in the meantime is refused before the handler runs with the
   new `Error::ClaimLost`, and the worker continues. An acknowledger attached
-  outside the middleware records nothing for that refusal. Every refusal before the
+  outside the middleware records nothing for a claim whose start was refused. Every refusal before the
   handler counts as a dispatch on the task's attempt counter, so a retry
   layer outside the middleware stops after its budget. Starting a task costs one
   more transaction per task, and a start that fails on the database retires

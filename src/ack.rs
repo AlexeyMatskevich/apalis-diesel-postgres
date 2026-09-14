@@ -38,11 +38,11 @@ use crate::{Error, PgContext, PgPool, PgTask, PgTaskId, queries};
 /// the caller supplies an `Attempt` including the completed execution, as in
 /// the low-level acknowledgement contract.
 ///
-/// Acknowledging the backend middleware's refusal of a lost claim
-/// ([`Error::ClaimLost`]) writes nothing and succeeds: no handler ran, and the
-/// row belongs to another execution. This keeps an acknowledger attached
-/// outside the middleware, for example with apalis `ack_with`, from recording
-/// that refusal as the task's result.
+/// Acknowledging a claim whose start was refused, by the backend middleware or
+/// by [`PgAck::start`], writes nothing and succeeds: no handler ran for it.
+/// This keeps an acknowledger attached outside the middleware, for example
+/// with apalis `ack_with`, from recording a refusal as the task's result. A
+/// handler's own error is recorded, whatever it contains.
 #[derive(Clone)]
 pub struct PgAck {
     pool: PgPool,
@@ -75,6 +75,10 @@ struct ClaimAcknowledgement {
     /// re-dispatch of the same claim may start it again; a different claim
     /// that happens to share the epoch may not.
     started: AtomicBool,
+    /// Set when a start of this claim was attempted, by the middleware or by
+    /// `PgAck::start`. Attempted but not started means every start was
+    /// refused, so no handler ran for the claim in this process.
+    start_attempted: AtomicBool,
 }
 
 impl ClaimAttempt {
@@ -92,6 +96,17 @@ impl ClaimAttempt {
 
     fn mark_started(&self) {
         self.acknowledgement.started.store(true, Ordering::Release);
+    }
+
+    fn mark_start_attempted(&self) {
+        self.acknowledgement
+            .start_attempted
+            .store(true, Ordering::Release);
+    }
+
+    /// A start of this claim was attempted and none succeeded.
+    fn start_refused(&self) -> bool {
+        self.acknowledgement.start_attempted.load(Ordering::Acquire) && !self.has_started()
     }
 
     async fn serialize(&self) -> futures::lock::MutexGuard<'_, ()> {
@@ -136,6 +151,7 @@ pub(crate) fn record_claim(parts: &mut Parts<PgContext, Ulid>) {
             serial: futures::lock::Mutex::new(()),
             done: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            start_attempted: AtomicBool::new(false),
         }),
     });
 }
@@ -1871,6 +1887,19 @@ mod tests {
         enum HandlerOutcome {
             Succeeds,
             Fails,
+            /// Fails with the refusal of another task's claim, as a handler
+            /// that starts another task itself and propagates the error does.
+            FailsWithAnotherClaimsRefusal,
+        }
+
+        /// What the middleware meets when it starts the claim.
+        #[derive(Clone, Copy, Debug)]
+        enum StartConditions {
+            Healthy,
+            /// The start cannot reach the database.
+            DatabaseUnreachable,
+            /// The storage retired the worker name locally.
+            RetiredLocally,
         }
 
         #[derive(Clone)]
@@ -1881,7 +1910,7 @@ mod tests {
 
         impl Service<PgTask<()>> for OutcomeHandler {
             type Response = ();
-            type Error = std::io::Error;
+            type Error = BoxDynError;
             type Future = Ready<Result<(), Self::Error>>;
 
             fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -1892,7 +1921,11 @@ mod tests {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 ready(match self.outcome {
                     HandlerOutcome::Succeeds => Ok(()),
-                    HandlerOutcome::Fails => Err(std::io::Error::other("handler failed")),
+                    HandlerOutcome::Fails => Err(std::io::Error::other("handler failed").into()),
+                    HandlerOutcome::FailsWithAnotherClaimsRefusal => Err(AbortError::new(
+                        crate::Error::claim_lost("another-task", "another-queue", "another-worker"),
+                    )
+                    .into()),
                 })
             }
         }
@@ -1936,6 +1969,7 @@ mod tests {
         async fn acknowledge_outside_the_middleware(
             row: RowAtDispatch,
             handler: HandlerOutcome,
+            conditions: StartConditions,
         ) -> Result<crate::test_support::Outcome<OuterAcknowledgementObservation>, String> {
             let Some(pool) = crate::test_support::shared_pool().await? else {
                 return Ok(crate::test_support::Outcome::Skipped);
@@ -1953,6 +1987,9 @@ mod tests {
                 .await?;
                 let registry = crate::lease::LeaseRegistry::default();
                 let owner = registry.for_worker(&worker);
+                if matches!(conditions, StartConditions::RetiredLocally) {
+                    owner.retire();
+                }
                 let runs = Arc::new(AtomicUsize::new(0));
                 let acknowledger = PgAck {
                     pool: pool.clone(),
@@ -1964,7 +2001,10 @@ mod tests {
                         outcome: handler,
                         runs: runs.clone(),
                     },
-                    pool: pool.clone(),
+                    pool: match conditions {
+                        StartConditions::DatabaseUnreachable => unreachable_pool(),
+                        _ => pool.clone(),
+                    },
                     leases: Some(registry.clone()),
                     lease_token: Some(ClaimToken(Arc::from(START_TOKEN))),
                 });
@@ -1989,6 +2029,8 @@ mod tests {
                             .and_then(|source| source.downcast_ref::<crate::Error>());
                         match (refusal, error.downcast_ref::<crate::Error>()) {
                             (Some(crate::Error::ClaimLost { .. }), _) => "claim_lost".to_owned(),
+                            (Some(crate::Error::Pool(_)), _) => "pool".to_owned(),
+                            (Some(crate::Error::WorkerRetired { .. }), _) => "retired".to_owned(),
                             (_, Some(crate::Error::StaleAcknowledgement { .. })) => {
                                 "stale_acknowledgement".to_owned()
                             }
@@ -2015,6 +2057,7 @@ mod tests {
             outcome: &'static str,
             handler_runs: usize,
             row: (&'static str, i32),
+            owner_retired: bool,
         ) -> impl Fn(
             &Result<crate::test_support::Outcome<OuterAcknowledgementObservation>, String>,
         ) -> AssertionResult {
@@ -2025,12 +2068,12 @@ mod tests {
                         && run.handler_runs == handler_runs
                         && run.row.0 == row.0
                         && run.row.1 == row.1
-                        && !run.owner_retired
+                        && run.owner_retired == owner_retired
                     {
                         Ok(())
                     } else {
                         Err(format!(
-                            "expected {outcome} after {handler_runs} handler run(s), a {row:?} row and the owner still active; got {run:?}"
+                            "expected {outcome} after {handler_runs} handler run(s), a {row:?} row and owner_retired={owner_retired}; got {run:?}"
                         ))
                     }
                 },
@@ -2424,28 +2467,47 @@ mod tests {
                 to counts_as_a_task_of_its_worker_until_it_ends_or_is_dropped { equal((1, 0)) }
             }
 
-            expect(acknowledge_outside_the_middleware(row, handler).await) as an_acknowledger_outside_the_middleware {
+            expect(acknowledge_outside_the_middleware(row, handler, conditions).await) as an_acknowledger_outside_the_middleware {
                 let row = RowAtDispatch::Claimed;
                 let handler = HandlerOutcome::Succeeds;
+                let conditions = StartConditions::Healthy;
                 to records_the_handler_result {
-                    acknowledged_outside("ran", 1, ("Done", 2))
+                    acknowledged_outside("ran", 1, ("Done", 2), false)
                 }
                 when the_handler_fails {
                     let handler = HandlerOutcome::Fails;
                     to records_the_failure {
-                        acknowledged_outside("handler_failed", 1, ("Failed", 2))
+                        acknowledged_outside("handler_failed", 1, ("Failed", 2), false)
+                    }
+                }
+                when the_handler_fails_with_the_refusal_of_another_tasks_claim {
+                    let handler = HandlerOutcome::FailsWithAnotherClaimsRefusal;
+                    to records_the_failure_of_its_own_claim {
+                        acknowledged_outside("claim_lost", 1, ("Failed", 2), false)
                     }
                 }
                 when the_claim_was_recovered_before_the_dispatch {
                     let row = RowAtDispatch::Recovered;
                     to records_nothing_for_the_refusal_and_keeps_the_worker_active {
-                        acknowledged_outside("claim_lost", 0, ("Pending", 1))
+                        acknowledged_outside("claim_lost", 0, ("Pending", 1), false)
                     }
                 }
                 when another_claim_of_the_same_epoch_already_started_the_row {
                     let row = RowAtDispatch::Started;
                     to leaves_the_running_execution_untouched {
-                        acknowledged_outside("claim_lost", 0, ("Running", 1))
+                        acknowledged_outside("claim_lost", 0, ("Running", 1), false)
+                    }
+                }
+                when the_start_cannot_reach_the_database {
+                    let conditions = StartConditions::DatabaseUnreachable;
+                    to records_nothing_for_the_claim_that_never_started {
+                        acknowledged_outside("pool", 0, ("Queued", 1), true)
+                    }
+                }
+                when the_worker_is_retired_locally {
+                    let conditions = StartConditions::RetiredLocally;
+                    to records_nothing_for_the_claim_that_never_started {
+                        acknowledged_outside("retired", 0, ("Queued", 1), true)
                     }
                 }
             }
@@ -2652,7 +2714,6 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
             claim: claim.clone(),
         };
         let response = build_ack_response(res);
-        let lost_claim = is_lost_claim(res);
         // SQL stores completed history; Tracker increments a shared Attempt
         // only when it is present. Use the claim snapshot for both the retry
         // decision and the write so direct middleware calls behave identically.
@@ -2671,12 +2732,11 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         let lease_token = self.lease_token.clone();
 
         async move {
-            if lost_claim {
-                // The middleware refused this dispatch before its handler: the
-                // claim was recovered, released, taken over, or started by
-                // another claim of its epoch. Nothing ran and the row is not
-                // this claim's to write, so there is no result to record and
-                // no obligation was lost.
+            if claim.as_ref().is_some_and(ClaimAttempt::start_refused) {
+                // Every start of this claim was refused, by the middleware or
+                // by `PgAck::start`: no handler ran for it in this process, so
+                // there is no result to record and no obligation was lost. The
+                // row may belong to another execution or wait for recovery.
                 completion_guard.disarm();
                 return Ok(());
             }
@@ -2732,23 +2792,6 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         }
         .boxed()
     }
-}
-
-/// Whether a dispatch result is the lock middleware's refusal of a lost
-/// claim, anywhere in its error chain. Only this crate constructs
-/// [`Error::ClaimLost`], so a handler's own error never matches.
-fn is_lost_claim<Res>(res: &Result<Res, BoxDynError>) -> bool {
-    let Err(error) = res else {
-        return false;
-    };
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
-    while let Some(error) = current {
-        if matches!(error.downcast_ref::<Error>(), Some(Error::ClaimLost { .. })) {
-            return true;
-        }
-        current = error.source();
-    }
-    false
 }
 
 /// Calculate the persisted task status from a task execution result.
@@ -3095,6 +3138,9 @@ fn start_claim(
         None => (*parts.ctx.lock_at(), parts.attempt.current(), true),
     };
     async move {
+        if let Some(claim) = &claim {
+            claim.mark_start_attempted();
+        }
         let owed = |error: Error| StartRefusal {
             error,
             still_owed: true,
