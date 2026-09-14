@@ -31,6 +31,7 @@ impl LeaseRegistry {
                     retired: AtomicBool::new(false),
                     registered: AtomicBool::new(false),
                     settled_registrations: AtomicU64::new(0),
+                    pending_registrations: AtomicU64::new(0),
                     waiters: Mutex::new(Vec::new()),
                 })
             })
@@ -48,6 +49,11 @@ pub(crate) struct WorkerLease {
     /// or not. A heartbeat created before an attempt waits for that attempt
     /// to settle; a refused attempt lets it report the refusal.
     settled_registrations: AtomicU64,
+    /// Registration attempts that began and have not settled. A refusal
+    /// releases a waiting heartbeat only once none is pending, so the refused
+    /// attempt of one worker does not release the heartbeat of another worker
+    /// of the name whose registration is still being committed.
+    pending_registrations: AtomicU64,
     /// Every waiter, so two heartbeat streams of one name (clones of one
     /// storage register with the same token) are both woken.
     waiters: Mutex<Vec<Waker>>,
@@ -63,12 +69,23 @@ impl WorkerLease {
     pub(crate) fn is_registered(&self) -> bool {
         self.registered.load(Ordering::Acquire)
     }
-    /// Record that a registration attempt yielded its first item.
-    pub(crate) fn settle_registration(&self, succeeded: bool) {
+    /// Begin a registration attempt, as a task stream does on its first poll.
+    /// The attempt settles when it is settled or dropped.
+    pub(crate) fn begin_registration(self: &Arc<Self>) -> RegistrationAttempt {
+        self.pending_registrations.fetch_add(1, Ordering::AcqRel);
+        RegistrationAttempt {
+            lease: self.clone(),
+            settled: false,
+        }
+    }
+    fn finish_registration(&self, succeeded: bool) {
         if succeeded {
             self.registered.store(true, Ordering::Release);
         }
+        // Counted as settled before it stops being pending, so a waiter that
+        // reads between the two sees it as still in flight and is woken below.
         self.settled_registrations.fetch_add(1, Ordering::AcqRel);
+        self.pending_registrations.fetch_sub(1, Ordering::AcqRel);
         self.wake_waiters();
     }
     fn wake_waiters(&self) {
@@ -83,10 +100,11 @@ impl WorkerLease {
         }
     }
     /// Resolves once the name is registered, once it is retired, or once a
-    /// registration attempt that had not settled when this future was
-    /// created has settled, refused or not. A heartbeat stream then either
-    /// renews a row that exists, reports the retirement, or reports the
-    /// refusal as `WorkerNotRegistered`.
+    /// registration attempt that had not settled when this future was created
+    /// has settled, refused or not, and no attempt of the name is still
+    /// pending. A heartbeat stream then either renews a row that exists,
+    /// reports the retirement, or reports the refusal as
+    /// `WorkerNotRegistered`.
     pub(crate) fn registration(self: &Arc<Self>) -> Registration {
         Registration {
             lease: self.clone(),
@@ -109,6 +127,27 @@ impl WorkerLease {
         }
     }
 }
+/// One registration attempt of a worker name, from a task stream's first poll
+/// until its first item. Dropping it unsettled settles it as refused, so a
+/// heartbeat never waits for a stream that is gone.
+pub(crate) struct RegistrationAttempt {
+    lease: Arc<WorkerLease>,
+    settled: bool,
+}
+impl RegistrationAttempt {
+    /// Settle the attempt with its outcome.
+    pub(crate) fn settle(mut self, succeeded: bool) {
+        self.settled = true;
+        self.lease.finish_registration(succeeded);
+    }
+}
+impl Drop for RegistrationAttempt {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.lease.finish_registration(false);
+        }
+    }
+}
 /// See [`WorkerLease::registration`].
 pub(crate) struct Registration {
     lease: Arc<WorkerLease>,
@@ -118,7 +157,8 @@ impl Registration {
     fn is_settled(&self) -> bool {
         self.lease.is_registered()
             || self.lease.is_retired()
-            || self.lease.settled_registrations.load(Ordering::Acquire) > self.settled_before
+            || (self.lease.settled_registrations.load(Ordering::Acquire) > self.settled_before
+                && self.lease.pending_registrations.load(Ordering::Acquire) == 0)
     }
 }
 impl Future for Registration {
@@ -210,11 +250,11 @@ mod tests {
         assert!(!first_before && !second_before);
         match milestone {
             Milestone::None => {}
-            Milestone::Registered => lease.settle_registration(true),
-            Milestone::Refused => lease.settle_registration(false),
+            Milestone::Registered => lease.begin_registration().settle(true),
+            Milestone::Refused => lease.begin_registration().settle(false),
             Milestone::Retired => lease.retire(),
             Milestone::RegisteredThenRetired => {
-                lease.settle_registration(true);
+                lease.begin_registration().settle(true);
                 lease.retire();
             }
         }
@@ -233,19 +273,59 @@ mod tests {
     /// that earlier refusal: it waits for the next attempt.
     fn waiter_after_a_refusal() -> (bool, bool) {
         let lease = LeaseRegistry::default().for_worker("one");
-        lease.settle_registration(false);
+        lease.begin_registration().settle(false);
         let mut later = lease.registration();
         let noop = Context::from_waker(futures::task::noop_waker_ref());
         let before = later
             .poll_unpin(&mut Context::from_waker(noop.waker()))
             .is_ready();
-        lease.settle_registration(false);
+        lease.begin_registration().settle(false);
         let after = later
             .poll_unpin(&mut Context::from_waker(noop.waker()))
             .is_ready();
         (before, after)
     }
+    /// Two registration attempts of one name are in flight when a heartbeat
+    /// starts waiting, as with two workers of that name on clones of one
+    /// storage. The second is refused, then the first settles. Reports whether
+    /// the waiter resolved after the refusal and after the first attempt.
+    fn waiter_beside_another_attempt(first_succeeds: bool) -> (bool, bool) {
+        let lease = LeaseRegistry::default().for_worker("one");
+        let first = lease.begin_registration();
+        let second = lease.begin_registration();
+        let mut waiter = lease.registration();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(waiter.poll_unpin(&mut cx).is_pending());
+        second.settle(false);
+        let after_refusal = waiter.poll_unpin(&mut cx).is_ready();
+        first.settle(first_succeeds);
+        (after_refusal, waiter.poll_unpin(&mut cx).is_ready())
+    }
+
+    /// A heartbeat waiting on an attempt whose task stream is dropped before
+    /// its first item. Reports whether the waiter then resolves.
+    fn waiter_after_an_abandoned_attempt() -> bool {
+        let lease = LeaseRegistry::default().for_worker("one");
+        let attempt = lease.begin_registration();
+        let mut waiter = lease.registration();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(waiter.poll_unpin(&mut cx).is_pending());
+        drop(attempt);
+        waiter.poll_unpin(&mut cx).is_ready()
+    }
+
     lets_expect! {
+        expect(waiter_beside_another_attempt(first_succeeds)) as a_heartbeat_waiting_while_two_attempts_of_its_name_are_in_flight {
+            let first_succeeds = true;
+            to ignores_one_refusal_and_resolves_when_the_other_attempt_registers { equal((false, true)) }
+            when the_other_attempt_is_refused_too {
+                let first_succeeds = false;
+                to resolves_to_report_the_refusal_once_no_attempt_is_pending { equal((false, true)) }
+            }
+        }
+        expect(waiter_after_an_abandoned_attempt()) as a_heartbeat_waiting_on_an_attempt_whose_stream_was_dropped {
+            to resolves_instead_of_waiting_forever { equal(true) }
+        }
         expect(registration_waits(milestone)) as heartbeats_waiting_for_a_registration {
             let milestone = Milestone::None;
             to stay_pending_and_unwoken_while_nothing_happened { equal(((false, false), (false, false))) }

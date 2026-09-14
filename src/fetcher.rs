@@ -390,9 +390,17 @@ pub(crate) struct LeaseStream<S> {
     lease: Arc<crate::lease::WorkerLease>,
     _guard: Option<crate::lease::LeaseGuard>,
     retire_on_drop: bool,
-    /// Whether the first item, the registration outcome, has been seen.
-    registration_settled: bool,
+    /// Where the registration attempt, settled by the first item, stands.
+    registration: RegistrationProgress,
     ended: bool,
+}
+
+/// A task stream's registration attempt: begun on the first poll, settled by
+/// the first item, the registration outcome.
+enum RegistrationProgress {
+    NotBegun,
+    Pending(crate::lease::RegistrationAttempt),
+    Settled,
 }
 
 impl<S> LeaseStream<S> {
@@ -406,7 +414,7 @@ impl<S> LeaseStream<S> {
             lease,
             _guard: None,
             retire_on_drop,
-            registration_settled: false,
+            registration: RegistrationProgress::NotBegun,
             ended: false,
         }
     }
@@ -426,6 +434,12 @@ where
             this.ended = true;
             return Poll::Ready(Some(Err(error)));
         }
+        if this.retire_on_drop && matches!(this.registration, RegistrationProgress::NotBegun) {
+            // The registration statement runs on this first poll. Heartbeats
+            // of the name wait for the attempt to settle, and a refusal
+            // releases them only once no other attempt of the name is pending.
+            this.registration = RegistrationProgress::Pending(this.lease.begin_registration());
+        }
         let result = this.stream.as_mut().poll_next(cx);
         // Registration is the first item and assigns no task; claim SQL can
         // only be dispatched by later polls. Arm the guard as that item
@@ -433,24 +447,26 @@ where
         // is cancelled while its claim is queued and may still commit. A
         // stream whose registration fails or that is never registered owns no
         // claim and leaves the name free for its siblings.
-        if this.retire_on_drop && !this.registration_settled {
-            match &result {
+        if matches!(this.registration, RegistrationProgress::Pending(_)) {
+            let succeeded = match &result {
                 Poll::Ready(Some(Ok(_))) => {
-                    this.registration_settled = true;
                     this._guard = Some(this.lease.guard());
                     // The heartbeat stream of this name waits for this
                     // moment: a renewal before the registration would update
                     // no row and end the worker with `WorkerNotRegistered`.
-                    this.lease.settle_registration(true);
+                    Some(true)
                 }
-                Poll::Ready(Some(Err(_))) => {
-                    // A refused or failed registration settles the attempt
-                    // too, so a heartbeat waiting on it reports the refusal
-                    // instead of waiting for a registration that never comes.
-                    this.registration_settled = true;
-                    this.lease.settle_registration(false);
-                }
-                Poll::Ready(None) | Poll::Pending => {}
+                // A refused or failed registration settles the attempt too,
+                // so a heartbeat waiting on it reports the refusal instead of
+                // waiting for a registration that never comes.
+                Poll::Ready(Some(Err(_))) => Some(false),
+                Poll::Ready(None) | Poll::Pending => None,
+            };
+            if let Some(succeeded) = succeeded
+                && let RegistrationProgress::Pending(attempt) =
+                    std::mem::replace(&mut this.registration, RegistrationProgress::Settled)
+            {
+                attempt.settle(succeeded);
             }
         }
         if matches!(
