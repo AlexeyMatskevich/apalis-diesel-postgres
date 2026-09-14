@@ -37,6 +37,12 @@ use crate::{Error, PgContext, PgPool, PgTask, PgTaskId, queries};
 /// but is not serialized. For manually assembled Parts without that snapshot,
 /// the caller supplies an `Attempt` including the completed execution, as in
 /// the low-level acknowledgement contract.
+///
+/// Acknowledging the backend middleware's refusal of a lost claim
+/// ([`Error::ClaimLost`]) writes nothing and succeeds: no handler ran, and the
+/// row belongs to another execution. This keeps an acknowledger attached
+/// outside the middleware, for example with apalis `ack_with`, from recording
+/// that refusal as the task's result.
 #[derive(Clone)]
 pub struct PgAck {
     pool: PgPool,
@@ -1693,6 +1699,177 @@ mod tests {
             })
         }
 
+        /// How the handler behind the middleware ends when it runs.
+        #[derive(Clone, Copy, Debug)]
+        enum HandlerOutcome {
+            Succeeds,
+            Fails,
+        }
+
+        #[derive(Clone)]
+        struct OutcomeHandler {
+            outcome: HandlerOutcome,
+            runs: Arc<AtomicUsize>,
+        }
+
+        impl Service<PgTask<()>> for OutcomeHandler {
+            type Response = ();
+            type Error = std::io::Error;
+            type Future = Ready<Result<(), Self::Error>>;
+
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _: PgTask<()>) -> Self::Future {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                ready(match self.outcome {
+                    HandlerOutcome::Succeeds => Ok(()),
+                    HandlerOutcome::Fails => Err(std::io::Error::other("handler failed")),
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        struct OuterAcknowledgementObservation {
+            outcome: String,
+            handler_runs: usize,
+            /// `(status, attempts)` of the row afterwards; the claim was
+            /// seeded with one attempt.
+            row: (String, i32),
+            owner_retired: bool,
+        }
+
+        async fn row_state(pool: PgPool, id: Ulid) -> Result<(String, i32), String> {
+            use diesel::{
+                QueryableByName, RunQueryDsl, sql_query,
+                sql_types::{Integer, Text},
+            };
+            #[derive(QueryableByName)]
+            struct Row {
+                #[diesel(sql_type = Text)]
+                status: String,
+                #[diesel(sql_type = Integer)]
+                attempts: i32,
+            }
+            crate::test_support::with_conn(pool, move |conn| {
+                sql_query("SELECT status, attempts FROM apalis.jobs WHERE id = $1")
+                    .bind::<Text, _>(id.to_string())
+                    .get_result::<Row>(conn)
+                    .map(|row| (row.status, row.attempts))
+                    .map_err(|e| e.to_string())
+            })
+            .await
+        }
+
+        /// The storage's acknowledger attached outside the middleware, as
+        /// apalis `ack_with` composes it when automatic acknowledgement is
+        /// off: it receives whatever the middleware returned, including a
+        /// refusal before the handler.
+        async fn acknowledge_outside_the_middleware(
+            row: RowAtDispatch,
+            handler: HandlerOutcome,
+        ) -> Result<crate::test_support::Outcome<OuterAcknowledgementObservation>, String> {
+            let Some(pool) = crate::test_support::shared_pool().await? else {
+                return Ok(crate::test_support::Outcome::Skipped);
+            };
+            let queue = format!("outer-ack-{}", Ulid::new());
+            let worker = format!("outer-ack-worker-{}", Ulid::new());
+            let observation = async {
+                let (id, lock_at) = seed_claim(
+                    pool.clone(),
+                    queue.clone(),
+                    worker.clone(),
+                    START_TOKEN,
+                    row,
+                )
+                .await?;
+                let registry = crate::lease::LeaseRegistry::default();
+                let owner = registry.for_worker(&worker);
+                let runs = Arc::new(AtomicUsize::new(0));
+                let acknowledger = PgAck {
+                    pool: pool.clone(),
+                    lease_token: Some(Arc::from(START_TOKEN)),
+                    leases: Some(registry.clone()),
+                };
+                let mut service = AcknowledgeLayer::new(acknowledger).layer(LockTaskService {
+                    inner: OutcomeHandler {
+                        outcome: handler,
+                        runs: runs.clone(),
+                    },
+                    pool: pool.clone(),
+                    leases: Some(registry.clone()),
+                    lease_token: Some(ClaimToken(Arc::from(START_TOKEN))),
+                });
+                futures::future::poll_fn(|cx| service.poll_ready(cx))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let result: Result<(), BoxDynError> = service
+                    .call(claimed_task(
+                        id,
+                        &queue,
+                        &worker,
+                        lock_at,
+                        ClaimHistory::Fresh,
+                    ))
+                    .await;
+                let outcome = match &result {
+                    Ok(()) => "ran".to_owned(),
+                    Err(error) => {
+                        let refusal = error
+                            .downcast_ref::<AbortError>()
+                            .and_then(std::error::Error::source)
+                            .and_then(|source| source.downcast_ref::<crate::Error>());
+                        match (refusal, error.downcast_ref::<crate::Error>()) {
+                            (Some(crate::Error::ClaimLost { .. }), _) => "claim_lost".to_owned(),
+                            (_, Some(crate::Error::StaleAcknowledgement { .. })) => {
+                                "stale_acknowledgement".to_owned()
+                            }
+                            _ if error.downcast_ref::<std::io::Error>().is_some() => {
+                                "handler_failed".to_owned()
+                            }
+                            _ => format!("unexpected: {error:?}"),
+                        }
+                    }
+                };
+                Ok::<_, String>(OuterAcknowledgementObservation {
+                    outcome,
+                    handler_runs: runs.load(Ordering::SeqCst),
+                    row: row_state(pool.clone(), id).await?,
+                    owner_retired: owner.is_retired(),
+                })
+            }
+            .await;
+            remove_queue(pool, queue).await?;
+            observation.map(crate::test_support::Outcome::Completed)
+        }
+
+        fn acknowledged_outside(
+            outcome: &'static str,
+            handler_runs: usize,
+            row: (&'static str, i32),
+        ) -> impl Fn(
+            &Result<crate::test_support::Outcome<OuterAcknowledgementObservation>, String>,
+        ) -> AssertionResult {
+            crate::test_support::observe::<OuterAcknowledgementObservation, _>(
+                "acknowledgement outside the middleware",
+                move |run| {
+                    if run.outcome == outcome
+                        && run.handler_runs == handler_runs
+                        && run.row.0 == row.0
+                        && run.row.1 == row.1
+                        && !run.owner_retired
+                    {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "expected {outcome} after {handler_runs} handler run(s), a {row:?} row and the owner still active; got {run:?}"
+                        ))
+                    }
+                },
+            )
+        }
+
         /// The Tower cycle against a real claim: `poll_ready` reserves the
         /// inner instance, and only that instance may serve `call`.
         async fn reserved_inner_serves_the_claim()
@@ -1995,6 +2172,32 @@ mod tests {
                 }
             }
 
+            expect(acknowledge_outside_the_middleware(row, handler).await) as an_acknowledger_outside_the_middleware {
+                let row = RowAtDispatch::Claimed;
+                let handler = HandlerOutcome::Succeeds;
+                to records_the_handler_result {
+                    acknowledged_outside("ran", 1, ("Done", 2))
+                }
+                when the_handler_fails {
+                    let handler = HandlerOutcome::Fails;
+                    to records_the_failure {
+                        acknowledged_outside("handler_failed", 1, ("Failed", 2))
+                    }
+                }
+                when the_claim_was_recovered_before_the_dispatch {
+                    let row = RowAtDispatch::Recovered;
+                    to records_nothing_for_the_refusal_and_keeps_the_worker_active {
+                        acknowledged_outside("claim_lost", 0, ("Pending", 1))
+                    }
+                }
+                when another_claim_of_the_same_epoch_already_started_the_row {
+                    let row = RowAtDispatch::Started;
+                    to leaves_the_running_execution_untouched {
+                        acknowledged_outside("claim_lost", 0, ("Running", 1))
+                    }
+                }
+            }
+
             expect(lock_service_call_preclaimed().await) as an_existing_claim {
                 when the_task_already_carries_a_matching_lock_by_and_lock_at {
                     to starts_the_claim_in_the_database_before_the_handler {
@@ -2132,6 +2335,7 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
             claim: claim.clone(),
         };
         let response = build_ack_response(res);
+        let lost_claim = is_lost_claim(res);
         // SQL stores completed history; Tracker increments a shared Attempt
         // only when it is present. Use the claim snapshot for both the retry
         // decision and the write so direct middleware calls behave identically.
@@ -2150,6 +2354,15 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         let lease_token = self.lease_token.clone();
 
         async move {
+            if lost_claim {
+                // The middleware refused this dispatch before its handler: the
+                // claim was recovered, released, taken over, or started by
+                // another claim of its epoch. Nothing ran and the row is not
+                // this claim's to write, so there is no result to record and
+                // no obligation was lost.
+                completion_guard.disarm();
+                return Ok(());
+            }
             // Acknowledgements of one claim run one at a time, so a concurrent
             // repeat waits for the first and then observes its marker.
             let _serial = match &claim {
@@ -2202,6 +2415,23 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         }
         .boxed()
     }
+}
+
+/// Whether a dispatch result is the lock middleware's refusal of a lost
+/// claim, anywhere in its error chain. Only this crate constructs
+/// [`Error::ClaimLost`], so a handler's own error never matches.
+fn is_lost_claim<Res>(res: &Result<Res, BoxDynError>) -> bool {
+    let Err(error) = res else {
+        return false;
+    };
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+    while let Some(error) = current {
+        if matches!(error.downcast_ref::<Error>(), Some(Error::ClaimLost { .. })) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 /// Calculate the persisted task status from a task execution result.

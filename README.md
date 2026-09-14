@@ -654,7 +654,9 @@ worker logs point at the failed lifecycle step:
 - Lost claims: `claim of task … was lost before the task started`
   (`Error::ClaimLost`) when a claimed task was recovered, released or taken
   over before the middleware started it. The handler does not run, the
-  worker continues, and the task runs elsewhere.
+  worker continues, and the task runs elsewhere. An acknowledger attached
+  outside the middleware, for example with apalis `ack_with`, records
+  nothing for it.
 - Waiting on an id no row carries: `task not found while waiting for
   completion` once the id is absent on two consecutive polls, for ids that
   were never enqueued or tasks that retention removed.
