@@ -56,15 +56,21 @@ pub(crate) fn purge_terminal_batch(
     cutoff: f64,
     limit: i64,
 ) -> Result<usize, Error> {
+    // Select the batch once. A locking LIMIT subquery inside `IN (...)` can be
+    // planned on the inner side of a nested-loop semi-join and run again for
+    // every outer row; each run skips the rows this statement already deleted,
+    // so one batch could delete the whole backlog.
     sql_query(format!(
-        "DELETE FROM apalis.jobs WHERE id IN (
+        "WITH candidates AS MATERIALIZED (
             SELECT id FROM apalis.jobs
             WHERE job_type = $1
                 AND {TERMINAL_PREDICATE}
                 AND EXTRACT(EPOCH FROM COALESCE(done_at, run_at)) <= $2
             LIMIT $3
             FOR UPDATE SKIP LOCKED
-        )"
+        )
+        DELETE FROM apalis.jobs USING candidates
+        WHERE apalis.jobs.id = candidates.id"
     ))
     .bind::<Text, _>(queue)
     .bind::<Double, _>(cutoff)
@@ -139,8 +145,9 @@ pub(crate) fn prune_workers_batch(
     stale_for: Duration,
     limit: i64,
 ) -> Result<usize, Error> {
+    // Select the batch once, for the reason given in `purge_terminal_batch`.
     sql_query(
-        "DELETE FROM apalis.workers WHERE (id, worker_type) IN (
+        "WITH candidates AS MATERIALIZED (
             SELECT w.id, w.worker_type FROM apalis.workers w
             WHERE w.worker_type = $1
                 AND EXTRACT(EPOCH FROM (clock_timestamp() - w.last_seen)) >= $2
@@ -151,7 +158,10 @@ pub(crate) fn prune_workers_batch(
             ORDER BY w.id
             LIMIT $3
             FOR UPDATE SKIP LOCKED
-        )",
+        )
+        DELETE FROM apalis.workers USING candidates
+        WHERE apalis.workers.id = candidates.id
+            AND apalis.workers.worker_type = candidates.worker_type",
     )
     .bind::<Text, _>(queue)
     .bind::<Double, _>(timeout_seconds(stale_for))

@@ -9,7 +9,9 @@ use crate::{
 };
 use apalis_core::worker::context::WorkerContext;
 use diesel::{
-    PgConnection, QueryableByName, RunQueryDsl, sql_query,
+    PgConnection, QueryableByName, RunQueryDsl,
+    connection::SimpleConnection,
+    sql_query,
     sql_types::{BigInt, Bool, Integer, Jsonb, Nullable, Text},
 };
 use lets_expect::{AssertionResult, *};
@@ -653,6 +655,94 @@ async fn run_batched_purge() -> Result<Outcome<BatchedPurgeRun>, String> {
     run.map(Outcome::Completed)
 }
 
+/// A batch statement run under a plan that re-runs its candidate selection.
+#[derive(Clone, Copy, Debug)]
+enum RescannedBatch {
+    Purge,
+    Prune,
+}
+
+/// Leaves the planner only a nested-loop semi-join over sequential scans: the
+/// plan in which a limited candidate subquery sits on the inner side and runs
+/// again for every outer row.
+const RESCANNING_PLAN: &str = "SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
+    SET LOCAL enable_hashagg = off; SET LOCAL enable_sort = off; SET LOCAL enable_material = off;
+    SET LOCAL enable_memoize = off; SET LOCAL enable_bitmapscan = off;
+    SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;";
+
+/// Five deletable rows stored in their candidate order, and one batch of two
+/// under [`RESCANNING_PLAN`], rolled back so the planner settings never reach
+/// another scenario. Returns how many rows the batch deleted.
+async fn run_batch_under_a_rescanning_plan(
+    batch: RescannedBatch,
+) -> Result<Outcome<usize>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-rescan-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let run = {
+        let queue = queue.clone();
+        with_conn(pool.clone(), move |conn| {
+            for index in 0..5 {
+                match batch {
+                    RescannedBatch::Purge => {
+                        seed_job(
+                            conn,
+                            &queue,
+                            &JobSeed {
+                                status: "Done",
+                                attempts: 1,
+                                max_attempts: 3,
+                                owner: None,
+                                done_at_age_secs: Some(60),
+                                run_at_age_secs: 120,
+                                last_result: None,
+                            },
+                        )?;
+                    }
+                    RescannedBatch::Prune => {
+                        seed_worker(conn, &queue, &format!("rescan-worker-{index}"), None, 3_600)?;
+                    }
+                }
+            }
+            let cutoff =
+                retention::server_cutoff(conn, Duration::ZERO).map_err(|e| e.to_string())?;
+            let deleted = conn
+                .batch_execute(&format!("BEGIN; {RESCANNING_PLAN}"))
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    match batch {
+                        RescannedBatch::Purge => {
+                            retention::purge_terminal_batch(conn, &queue, cutoff, 2)
+                        }
+                        RescannedBatch::Prune => {
+                            retention::prune_workers_batch(conn, &queue, Duration::from_secs(60), 2)
+                        }
+                    }
+                    .map_err(|e| e.to_string())
+                });
+            conn.batch_execute("ROLLBACK").map_err(|e| e.to_string())?;
+            deleted
+        })
+        .await
+    };
+    cleanup_queue(pool, queue).await?;
+    run.map(Outcome::Completed)
+}
+
+fn deletes_exactly(expected: usize) -> impl Fn(&Result<Outcome<usize>, String>) -> AssertionResult {
+    observe::<usize, _>("batch under a rescanning plan", move |deleted| {
+        if *deleted == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one batch to delete {expected} rows, it deleted {deleted}"
+            ))
+        }
+    })
+}
+
 fn drains_in_batches() -> impl Fn(&Result<Outcome<BatchedPurgeRun>, String>) -> AssertionResult {
     observe::<BatchedPurgeRun, _>("batched purge", |run| {
         if run.first_batch == 2 && run.total == 3 && run.remaining == 0 {
@@ -967,6 +1057,15 @@ lets_expect! { #tokio_test
 
     expect(run_batched_purge().await) as a_purge_larger_than_one_batch {
         to drains_the_backlog_across_batches { drains_in_batches() }
+    }
+
+    expect(run_batch_under_a_rescanning_plan(batch).await) as a_batch_under_a_plan_that_rescans_its_candidates {
+        let batch = RescannedBatch::Purge;
+        to deletes_no_more_than_its_limit { deletes_exactly(2) }
+        when the_batch_prunes_registrations {
+            let batch = RescannedBatch::Prune;
+            to deletes_no_more_than_its_limit { deletes_exactly(2) }
+        }
     }
 
     expect(run_prune(freshness, reference, scope, hold).await) as pruning_stale_registrations {
