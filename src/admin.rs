@@ -211,14 +211,15 @@ where
 
     /// Wait for the given tasks to complete, yielding each result as it lands.
     ///
-    /// The tasks must exist: an id no row carries on two consecutive polls,
-    /// at least one backoff interval apart, yields
+    /// The tasks must exist: an id that no row carries on a poll, and still on
+    /// a poll at least one backoff interval later, yields
     /// [`Error::TaskNotFound`] for that id and is no longer waited for,
     /// whether it was never enqueued or was removed by
-    /// [`PostgresStorage::purge_terminal_tasks`]. One absent poll is
+    /// [`PostgresStorage::purge_terminal_tasks`]. That interval of absence is
     /// tolerated so an enqueue committing right after the wait began is not
     /// mistaken for a missing task; wait for the enqueue transaction to
-    /// commit before waiting on its ids.
+    /// commit before waiting on its ids. An id passed more than once is
+    /// waited for once and yields one result.
     ///
     /// # Error handling
     ///

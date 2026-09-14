@@ -1953,6 +1953,153 @@ fn wait_late_enqueue_still_resolves()
 }
 
 #[derive(Debug)]
+struct WaitDuplicateRun {
+    results: usize,
+    other_items: usize,
+    ended: bool,
+}
+
+/// The same completed id passed twice is one waited task: one result, then
+/// the wait ends.
+async fn run_wait_duplicate_ids() -> Result<Outcome<WaitDuplicateRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-query-wait-twice-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let id = task_id();
+    insert_completed_task_with_id(
+        pool.clone(),
+        queue.clone(),
+        id,
+        "twice",
+        "Done",
+        1,
+        2,
+        serde_json::json!({"Ok": "twice"}),
+    )
+    .await?;
+    let mut stream =
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id, id]);
+    let (mut results, mut other_items, mut ended) = (0, 0, false);
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+            Err(_) => break,
+            Ok(None) => {
+                ended = true;
+                break;
+            }
+            Ok(Some(Ok(result))) if result.task_id == id => results += 1,
+            Ok(Some(_)) => other_items += 1,
+        }
+    }
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(WaitDuplicateRun {
+        results,
+        other_items,
+        ended,
+    }))
+}
+
+fn wait_duplicate_yields_once()
+-> impl Fn(&Result<Outcome<WaitDuplicateRun>, String>) -> AssertionResult {
+    observe::<WaitDuplicateRun, _>("wait_for duplicate ids", |run| {
+        if run.results == 1 && run.other_items == 0 && run.ended {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected one result for an id passed twice, then the end of the wait; got {run:?}"
+            ))
+        }
+    })
+}
+
+#[derive(Debug)]
+struct WaitBesideRun {
+    first: &'static str,
+    second: &'static str,
+}
+
+/// An id still absent when a sibling's result arrives is not reported missing
+/// by the poll that follows at once: its enqueue gets a whole backoff
+/// interval to commit. Polls run only while the stream is awaited, so the row
+/// is always inserted before the next poll.
+async fn run_wait_late_beside_a_completed_task() -> Result<Outcome<WaitBesideRun>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-query-wait-beside-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let done = task_id();
+    let late = task_id();
+    insert_completed_task_with_id(
+        pool.clone(),
+        queue.clone(),
+        done,
+        "done",
+        "Done",
+        1,
+        2,
+        serde_json::json!({"Ok": "done"}),
+    )
+    .await?;
+    let mut stream =
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [done, late]);
+    let first = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+        Ok(Some(Ok(result))) if result.task_id == done => "done_result",
+        Ok(Some(Ok(_))) => "other_result",
+        Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => "not_found",
+        Ok(Some(Err(_))) => "other_error",
+        Ok(None) => "ended",
+        Err(_) => "pending",
+    };
+    let second = match tokio::time::timeout(Duration::from_millis(30), stream.next()).await {
+        Err(_) => {
+            insert_completed_task_with_id(
+                pool.clone(),
+                queue.clone(),
+                late,
+                "late",
+                "Done",
+                1,
+                2,
+                serde_json::json!({"Ok": "late"}),
+            )
+            .await?;
+            match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                Ok(Some(Ok(result))) if result.task_id == late => "late_result",
+                Ok(Some(Ok(_))) => "other_result",
+                Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => "not_found",
+                Ok(Some(Err(_))) => "other_error",
+                Ok(None) => "ended",
+                Err(_) => "pending",
+            }
+        }
+        Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => {
+            "not_found_before_the_row_existed"
+        }
+        Ok(_) => "resolved_before_the_row_existed",
+    };
+    cleanup_queue(pool, queue).await?;
+    Ok(Outcome::Completed(WaitBesideRun { first, second }))
+}
+
+fn wait_beside_still_resolves()
+-> impl Fn(&Result<Outcome<WaitBesideRun>, String>) -> AssertionResult {
+    observe::<WaitBesideRun, _>("wait_for late id beside a result", |run| {
+        if run.first == "done_result" && run.second == "late_result" {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the completed sibling's result, then the late id's result; got {run:?}"
+            ))
+        }
+    })
+}
+
+#[derive(Debug)]
 struct WaitMalformedRun {
     first_item_was_decode_error: bool,
     stream_ended_after_one_item: bool,
@@ -3446,6 +3593,22 @@ lets_expect! { #tokio_test
         when the_row_appears_between_the_first_two_polls {
             to still_yields_its_result {
                 wait_late_enqueue_still_resolves()
+            }
+        }
+    }
+
+    expect(run_wait_duplicate_ids().await) as wait_duplicate_ids {
+        when the_same_completed_id_is_waited_for_twice {
+            to yields_one_result_and_ends {
+                wait_duplicate_yields_once()
+            }
+        }
+    }
+
+    expect(run_wait_late_beside_a_completed_task().await) as wait_late_beside_a_result {
+        when the_row_appears_after_a_poll_that_yielded_another_result {
+            to still_yields_its_result {
+                wait_beside_still_resolves()
             }
         }
     }

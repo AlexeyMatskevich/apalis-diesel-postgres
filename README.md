@@ -663,7 +663,7 @@ worker logs point at the failed lifecycle step:
   outside the middleware, for example with apalis `ack_with`, records
   nothing for it.
 - Waiting on an id no row carries: `task not found while waiting for
-  completion` once the id is absent on two consecutive polls, for ids that
+  completion` once the id has been absent for a whole backoff interval, for ids that
   were never enqueued or tasks that retention removed.
 - Heartbeat failures for missing worker rows: `worker not registered`,
   instead of a generic update-count mismatch. `release_worker` reports the

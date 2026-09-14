@@ -169,7 +169,9 @@ struct PollTriage<O> {
 fn triage_poll<O>(
     remaining: Vec<String>,
     rows: Vec<TrackedTaskRow>,
-    absent_once: &mut std::collections::HashSet<String>,
+    absent_since: &mut std::collections::HashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+    grace: Duration,
 ) -> PollTriage<O>
 where
     Result<O, String>: DeserializeOwned,
@@ -181,29 +183,46 @@ where
     for id in remaining {
         match present.remove(&id) {
             Some(row) if row.terminal => {
-                absent_once.remove(&id);
+                absent_since.remove(&id);
                 items.push(task_result_from_row(row.into()));
             }
             Some(_) => {
-                absent_once.remove(&id);
+                absent_since.remove(&id);
                 next_remaining.push(id);
             }
-            None if absent_once.remove(&id) => items.push(Err(Error::task_not_found(
-                "waiting for completion",
-                id,
-                None,
-                "the task does not exist: it was never enqueued, its enqueue has not committed, or it was purged",
-            ))),
-            None => {
-                absent_once.insert(id.clone());
-                next_remaining.push(id);
-            }
+            None => match absent_since.get(&id).copied() {
+                // Absent for a whole grace interval, however many polls ran
+                // in between: the task does not exist.
+                Some(first_absent) if now.saturating_duration_since(first_absent) >= grace => {
+                    absent_since.remove(&id);
+                    items.push(Err(Error::task_not_found(
+                        "waiting for completion",
+                        id,
+                        None,
+                        "the task does not exist: it was never enqueued, its enqueue has not committed, or it was purged",
+                    )));
+                }
+                Some(_) => next_remaining.push(id),
+                None => {
+                    absent_since.insert(id.clone(), now);
+                    next_remaining.push(id);
+                }
+            },
         }
     }
     PollTriage {
         items,
         remaining: next_remaining,
     }
+}
+
+/// The waited ids in their first order, each once: a task is waited for
+/// once, however often its id was passed.
+fn distinct_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
 }
 
 pub(crate) fn wait_for_completion<O>(
@@ -216,7 +235,7 @@ where
 {
     // `Vec<String>` keeps the per-tick clone for `tracked_task_rows` (the
     // SQL bind takes ownership); `triage_poll` prunes it in one pass.
-    let remaining: Vec<String> = task_ids.into_iter().map(|id| id.to_string()).collect();
+    let remaining: Vec<String> = distinct_ids(task_ids.into_iter().map(|id| id.to_string()));
     // Exponential backoff (100ms → 2s) replaces the previous fixed 500ms
     // poll. Many concurrent `wait_for` callers no longer pin the database
     // at a steady 2 Hz; long-running waits also avoid wasteful re-polls.
@@ -229,10 +248,14 @@ where
     // the streak, so a database that merely flaps keeps making progress (jobs
     // stay durable in `apalis.jobs`, so a surfaced error is always retryable).
     const MAX_CONSECUTIVE_DB_ERRORS: u32 = 3;
-    let absent_once = std::collections::HashSet::new();
+    // An id absent from a poll is reported missing only once it has been
+    // absent for at least one initial backoff interval. A poll that yields
+    // results is followed at once by the next, so counting polls instead of
+    // time would give an enqueue committing just after the wait no grace.
+    let absent_since = std::collections::HashMap::new();
     stream::unfold(
-        (remaining, INITIAL_BACKOFF, 0u32, absent_once),
-        move |(remaining_ids, backoff, error_streak, mut absent_once)| {
+        (remaining, INITIAL_BACKOFF, 0u32, absent_since),
+        move |(remaining_ids, backoff, error_streak, mut absent_since)| {
             let pool = pool.clone();
             async move {
                 if remaining_ids.is_empty() {
@@ -247,32 +270,37 @@ where
                         if db_errors_exhausted(error_streak, MAX_CONSECUTIVE_DB_ERRORS) {
                             return Some((
                                 stream::iter(vec![Err(error)]),
-                                (Vec::new(), INITIAL_BACKOFF, 0, absent_once),
+                                (Vec::new(), INITIAL_BACKOFF, 0, absent_since),
                             ));
                         }
                         apalis_core::timer::sleep(backoff).await;
                         let new_backoff = next_backoff(backoff, MAX_BACKOFF);
                         return Some((
                             stream::iter(Vec::new()),
-                            (remaining_ids, new_backoff, error_streak + 1, absent_once),
+                            (remaining_ids, new_backoff, error_streak + 1, absent_since),
                         ));
                     }
                 };
-                let PollTriage { items, remaining } =
-                    triage_poll::<O>(remaining_ids, rows, &mut absent_once);
+                let PollTriage { items, remaining } = triage_poll::<O>(
+                    remaining_ids,
+                    rows,
+                    &mut absent_since,
+                    std::time::Instant::now(),
+                    INITIAL_BACKOFF,
+                );
                 if items.is_empty() {
                     apalis_core::timer::sleep(backoff).await;
                     let new_backoff = next_backoff(backoff, MAX_BACKOFF);
                     // A successful (if empty) poll clears the error streak.
                     return Some((
                         stream::iter(Vec::new()),
-                        (remaining, new_backoff, 0, absent_once),
+                        (remaining, new_backoff, 0, absent_since),
                     ));
                 }
                 // Reset backoff and the error streak after observing progress.
                 Some((
                     stream::iter(items),
-                    (remaining, INITIAL_BACKOFF, 0, absent_once),
+                    (remaining, INITIAL_BACKOFF, 0, absent_since),
                 ))
             }
         },
@@ -785,19 +813,36 @@ mod tests {
         }
     }
 
-    /// One waited id through one poll, optionally already absent on the
-    /// previous poll. Reports what the poll yielded for it and whether it is
-    /// still waited for.
-    fn triaged(presence: Presence, absent_before: bool) -> (&'static str, bool, bool) {
+    /// How long before this poll the id was first found absent.
+    #[derive(Clone, Copy)]
+    enum Absence {
+        Never,
+        LessThanTheGrace,
+        TheWholeGrace,
+    }
+
+    /// One waited id through one poll, with its earlier absence. Reports what
+    /// the poll yielded for it, whether it is still waited for, and whether an
+    /// absence is still remembered.
+    fn triaged(presence: Presence, absence: Absence) -> (&'static str, bool, bool) {
         let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let mut absent_once = std::collections::HashSet::new();
-        if absent_before {
-            absent_once.insert(id.to_owned());
+        let grace = Duration::from_millis(100);
+        let first_absent = std::time::Instant::now();
+        let mut absent_since = std::collections::HashMap::new();
+        let now = match absence {
+            Absence::Never => first_absent,
+            Absence::LessThanTheGrace => first_absent + grace / 2,
+            Absence::TheWholeGrace => first_absent + grace,
+        };
+        if !matches!(absence, Absence::Never) {
+            absent_since.insert(id.to_owned(), first_absent);
         }
         let PollTriage { items, remaining } = triage_poll::<String>(
             vec![id.to_owned()],
             tracked(id, presence).into_iter().collect(),
-            &mut absent_once,
+            &mut absent_since,
+            now,
+            grace,
         );
         let item = match items.as_slice() {
             [] => "nothing",
@@ -805,13 +850,17 @@ mod tests {
             [Err(Error::TaskNotFound { task_id, .. })] if task_id == id => "not_found",
             _ => "unexpected",
         };
-        (item, remaining == [id.to_owned()], absent_once.contains(id))
+        (
+            item,
+            remaining == [id.to_owned()],
+            absent_since.contains_key(id),
+        )
     }
 
     lets_expect! {
-        expect(triaged(presence, absent_before)) as a_waited_task_after_one_poll {
+        expect(triaged(presence, absence)) as a_waited_task_after_one_poll {
             let presence = Presence::Active;
-            let absent_before = false;
+            let absence = Absence::Never;
             to keeps_waiting_for_an_active_task { equal(("nothing", true, false)) }
             when the_task_is_terminal {
                 let presence = Presence::Terminal;
@@ -820,17 +869,32 @@ mod tests {
             when the_task_is_absent {
                 let presence = Presence::Absent;
                 to keeps_waiting_once_and_remembers_the_absence { equal(("nothing", true, true)) }
-                when it_was_already_absent_on_the_previous_poll {
-                    let absent_before = true;
+                when it_was_first_absent_less_than_the_grace_ago {
+                    let absence = Absence::LessThanTheGrace;
+                    to keeps_waiting_whatever_number_of_polls_ran { equal(("nothing", true, true)) }
+                }
+                when it_was_first_absent_the_whole_grace_ago {
+                    let absence = Absence::TheWholeGrace;
                     to reports_it_missing_and_stops_waiting { equal(("not_found", false, false)) }
                 }
             }
             when the_task_reappears_after_an_absence {
-                let absent_before = true;
+                let absence = Absence::TheWholeGrace;
                 to keeps_waiting_and_forgets_the_absence { equal(("nothing", true, false)) }
                 when it_reappears_terminal {
                     let presence = Presence::Terminal;
                     to yields_its_result_and_stops_waiting { equal(("result", false, false)) }
+                }
+            }
+        }
+
+        expect(distinct_ids(ids.into_iter().map(str::to_owned))) as waited_ids {
+            let ids = vec!["a", "b"];
+            to keeps_distinct_ids_in_their_order { equal(vec!["a".to_owned(), "b".to_owned()]) }
+            when an_id_repeats {
+                let ids = vec!["a", "b", "a", "b", "c"];
+                to keeps_each_id_once_in_its_first_order {
+                    equal(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()])
                 }
             }
         }
