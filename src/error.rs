@@ -129,7 +129,7 @@ pub enum Error {
 
     /// A task acknowledgement no longer matches the stored lock state.
     #[error(
-        "stale acknowledgement for task {task_id} in queue {queue} by worker {worker_id}; the task is no longer Running with the same lock owner, attempt, and lock timestamp"
+        "stale acknowledgement for task {task_id} in queue {queue} by worker {worker_id}; the task no longer holds that claim: the same lock owner, attempt, and lock timestamp"
     )]
     StaleAcknowledgement {
         /// Task id involved in the acknowledgement.
@@ -634,7 +634,7 @@ mod tests {
         }
 
         expect(Error::stale_acknowledgement("task-1", "queue-1", "worker-1")) as stale_acknowledgement_details {
-            to displays_the_ack_conflict { displays_as("stale acknowledgement for task task-1 in queue queue-1 by worker worker-1; the task is no longer Running with the same lock owner, attempt, and lock timestamp") }
+            to displays_the_ack_conflict { displays_as("stale acknowledgement for task task-1 in queue queue-1 by worker worker-1; the task no longer holds that claim: the same lock owner, attempt, and lock timestamp") }
             to has_no_error_source { has_no_source }
         }
 

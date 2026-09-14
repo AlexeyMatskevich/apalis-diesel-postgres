@@ -127,7 +127,7 @@ pub(crate) fn validate_prune_window(config: &Config, stale_for: Duration) -> Res
     let stale_after = config.reenqueue_orphaned_after();
     if stale_for < stale_after {
         return Err(Error::InvalidArgument(format!(
-            "stale_for ({stale_for:?}) must not be shorter than reenqueue_orphaned_after ({stale_after:?}): a registration is stale only after that deadline, and pruning it earlier would remove a live worker"
+            "stale_for ({stale_for:?}) must not be shorter than reenqueue_orphaned_after ({stale_after:?}): a registration is stale only after that deadline, and pruning it earlier would remove a live worker; when workers of the queue run with different deadlines, use the longest"
         )));
     }
     Ok(())

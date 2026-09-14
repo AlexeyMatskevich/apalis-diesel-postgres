@@ -2,8 +2,9 @@
 
 ## Upgrading from 0.5.0
 
-One schema change and two behaviours of the running system change; see the
-[lifecycle reference](lifecycle.md) for the protocol they belong to.
+One schema change and several behaviours of the running system change; see
+the [lifecycle reference](lifecycle.md) for the protocol they belong to and
+the [changelog](../CHANGELOG.md) for the full list.
 
 - Migration `20260914000000_task_state_shape` adds the constraint
   `jobs_state_shape_check`: a `Pending` row carries no owner columns, and a
@@ -25,6 +26,21 @@ One schema change and two behaviours of the running system change; see the
   `InvalidArgument`. Such a worker was stale between its own heartbeats and
   recovered its own running tasks. Set `keep_alive` to at most a third of
   `reenqueue_orphaned_after` (the defaults are 30 and 300 seconds).
+- A claimed task stays `Queued` until the backend middleware starts it,
+  right before its handler; only then is it `Running`. Code and dashboards
+  that read `status` or `RUNNING_JOBS` see buffered claims as `Queued`, while
+  `STALE_RUNNING_JOBS` and `LONGEST_RUNNING_JOB_MINS` count every claim. A
+  release hands buffered claims back without charging an attempt; recovery
+  after a failure still charges every claim of the failed worker. A dispatch
+  whose claim was recovered, released or taken over before it started is
+  refused with `Error::ClaimLost` before its handler runs.
+- An application that takes tasks from a storage's stream and runs them
+  without `Backend::middleware()` calls `PgAck::start` before running each
+  task. Without it its claims stay `Queued`, and a release hands a task it was
+  running back without charging an attempt.
+- `WaitForCompletion::wait_for` ends with `TaskNotFound` for an id that no row
+  carries for a whole backoff interval, instead of waiting forever. Wait for
+  an enqueue transaction to commit before waiting on its ids.
 - Call `PostgresStorage::release_worker` after a worker's run returns, so a
   redeploy under the same name registers immediately. Without it the
   behaviour is unchanged: the name is refused until the previous registration

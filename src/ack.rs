@@ -3018,9 +3018,9 @@ impl PgMiddleware {
         }
     }
 
-    /// Bind new fallback claims and automatic acknowledgements to a worker
-    /// registration token. Existing preclaimed work may still finish; its
-    /// acknowledgement must match the registration that owns the claim.
+    /// Bind starts, fallback claims and automatic acknowledgements to a worker
+    /// registration token: a claim whose registration another token now owns
+    /// is refused with [`Error::ClaimLost`] before its handler runs.
     ///
     /// This is for callers that registered the worker outside this crate's
     /// storage and hold its token. It binds the token only and does not

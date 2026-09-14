@@ -220,7 +220,9 @@ these states; the columns in parentheses are what other actors read.
 5. **Local retirement.** The instance retires the name locally when it can
    no longer prove its claims were handled: an acknowledgement through the
    storage's middleware or acknowledger fails, a claim commit cannot be
-   confirmed (`ClaimOutcomeUnknown`), the release of an undecodable payload
+   confirmed (`ClaimOutcomeUnknown`), a start fails in a way that may leave
+   the claim owned but not started, a dispatch is dropped before its handler
+   finishes, the release of an undecodable payload
    keeps failing or matches no row, the registered task stream is dropped,
    or `release_worker` is called. From then on the instance and its clones
    answer `WorkerRetired` for that name; restarting needs fresh storage.
@@ -244,7 +246,9 @@ these states; the columns in parentheses are what other actors read.
    that have been stale for the given window and that no task references.
    The window must be at least `reenqueue_orphaned_after`, the deadline
    after which the protocol itself treats a registration as stale; a shorter
-   window is refused. A registration named by a completed task stays until
+   window is refused. When workers of the queue run with different deadlines,
+   use the longest: a shorter window can remove the registration of an idle
+   worker whose heartbeat is merely slower. A registration named by a completed task stays until
    `purge_terminal_tasks` removes that task.
 
 ### Recovery latency

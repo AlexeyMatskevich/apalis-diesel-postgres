@@ -33,8 +33,11 @@ pub(crate) use worker::{
     validate_liveness,
 };
 
-/// SQL predicate for a row that will never run again: `Done`, `Killed`, or
-/// `Failed` with no retry budget left (a shape only other writers produce).
+/// SQL predicate for a terminal row: `Done`, `Killed`, or `Failed` with no
+/// retry budget left (a shape only other writers produce). An exhausted
+/// `Pending` row, another shape only other writers produce, never runs again
+/// either, but it is not terminal: it is neither awaited as complete nor
+/// purged.
 /// Shared by `WaitForCompletion` and retention so the rows a waiter can
 /// observe and the rows a purge removes are the same set.
 pub(crate) const TERMINAL_PREDICATE: &str =

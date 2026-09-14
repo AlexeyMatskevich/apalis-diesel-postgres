@@ -100,10 +100,10 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   `purge_terminal_tasks` or `Vacuum` removed; an enqueue that commits within
   that interval is still awaited. An id passed more than once is waited for
   once and yields one result.
-- Tasks recovered by `release_worker` record
-  `Re-enqueued because the worker released its registration.` as their
-  result when they had none; the sweep and takeover keep the heartbeat
-  timeout message.
+- A task that `release_worker` charges records
+  `Re-enqueued because the worker released its registration.` as its result
+  when it had none; a claim it hands back uncharged keeps its result, and the
+  sweep and takeover keep the heartbeat timeout message.
 - A registration without a lease token (the admin `RegisterWorker` trait,
   legacy clients of `apalis.get_jobs`) now renews `last_seen` on every
   `register_worker` call, and a worker stream registering the same name
