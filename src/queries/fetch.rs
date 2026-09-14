@@ -221,7 +221,10 @@ pub(crate) struct StartClaim {
     pub(crate) queue: String,
     pub(crate) worker_id: String,
     pub(crate) lock_at: i64,
-    pub(crate) attempts: i32,
+    /// The attempts the claim recorded, or `None` for a task without its claim
+    /// record, whose counter has no fixed meaning: then only the owner and the
+    /// claim timestamp are compared.
+    pub(crate) attempts: Option<i32>,
     /// This claim already started once in this process, so the dispatch is a
     /// re-dispatch of it and a `Running` row of the epoch is accepted. A claim
     /// that has not started requires `Queued`: a recovered `Queued` row keeps
@@ -264,14 +267,14 @@ pub(crate) fn start_task(
                      AND job_type = $2
                      AND lock_by = $3
                      AND lock_at = to_timestamp($4::double precision)
-                     AND attempts = $5
+                     AND ($5::integer IS NULL OR attempts = $5)
                      AND (status = 'Queued' OR ($6 AND status = 'Running'))",
             )
             .bind::<Text, _>(claim.task_id.to_string())
             .bind::<Text, _>(&claim.queue)
             .bind::<Text, _>(&claim.worker_id)
             .bind::<BigInt, _>(claim.lock_at)
-            .bind::<Integer, _>(claim.attempts)
+            .bind::<Nullable<Integer>, _>(claim.attempts)
             .bind::<Bool, _>(claim.restart)
             .execute(conn)
             .map_err(Error::database("starting task"))?;

@@ -1444,6 +1444,10 @@ mod tests {
             Unrecorded,
             /// A claim whose acknowledgement already committed in this process.
             Acknowledged,
+            /// A task assembled by hand, without the claim record, whose
+            /// attempt counter already includes the run it is about to start,
+            /// as the manual acknowledgement contract counts it.
+            UnrecordedCounterAhead,
         }
 
         /// Who holds the registration when the dispatch starts the claim.
@@ -1608,7 +1612,13 @@ mod tests {
                 .build();
             task.parts.data.insert(WorkerContext::new::<()>(worker));
             task.parts.status.store(Status::Queued);
-            if !matches!(history, ClaimHistory::Unrecorded) {
+            if matches!(history, ClaimHistory::UnrecordedCounterAhead) {
+                task.parts.attempt = Attempt::new_with_value(2);
+            }
+            if !matches!(
+                history,
+                ClaimHistory::Unrecorded | ClaimHistory::UnrecordedCounterAhead
+            ) {
                 record_claim(&mut task.parts);
             }
             if matches!(history, ClaimHistory::AlreadyStarted) {
@@ -2367,6 +2377,12 @@ mod tests {
                     to moves_the_row_to_running_before_the_handler_runs_once {
                         started("ran", &[Status::Running], 1, "Running", false)
                     }
+                    when its_attempt_counter_differs_from_the_row {
+                        let history = ClaimHistory::UnrecordedCounterAhead;
+                        to starts_it_by_owner_and_claim_timestamp {
+                            started("ran", &[Status::Running], 2, "Running", false)
+                        }
+                    }
                 }
                 when another_token_owns_the_registration {
                     let holder = Holder::Replaced;
@@ -2441,6 +2457,12 @@ mod tests {
                     let history = ClaimHistory::Unrecorded;
                     to moves_the_row_and_the_task_to_running {
                         started_by_the_acknowledger("started", Status::Running, "Running", false)
+                    }
+                    when its_attempt_counter_differs_from_the_row {
+                        let history = ClaimHistory::UnrecordedCounterAhead;
+                        to starts_it_by_owner_and_claim_timestamp {
+                            started_by_the_acknowledger("started", Status::Running, "Running", false)
+                        }
                     }
                 }
                 when another_token_owns_the_registration {
@@ -2578,7 +2600,9 @@ impl PgAck {
     ///
     /// Keep the task's `Parts` from the claim, including `data`, as for an
     /// acknowledgement. Starting a claim this process already started is
-    /// accepted, unless its acknowledgement already committed.
+    /// accepted, unless its acknowledgement already committed. `Parts` without
+    /// the claim record are matched by owner and claim timestamp only,
+    /// whatever their attempt counter says.
     ///
     /// # Errors
     /// - [`Error::ClaimLost`] if the claim was recovered, released or taken
@@ -3153,10 +3177,13 @@ fn start_claim(
     let status = parts.status.clone();
     let claim = parts.data.get::<ClaimAttempt>().cloned();
     // A manually assembled task has no claim identity to tell a repeated start
-    // from a second claim; it starts either way.
+    // from a second claim, and its attempt counter has no fixed meaning: the
+    // worker's Tracker and the manual acknowledgement contract count it
+    // differently. It is matched by owner and claim timestamp, and starts
+    // either way.
     let (lock_at, attempts, restart) = match claim.as_ref() {
-        Some(claim) => (claim.lock_at, claim.completed, claim.has_started()),
-        None => (*parts.ctx.lock_at(), parts.attempt.current(), true),
+        Some(claim) => (claim.lock_at, Some(claim.completed), claim.has_started()),
+        None => (*parts.ctx.lock_at(), None, true),
     };
     async move {
         if let Some(claim) = &claim {
@@ -3192,7 +3219,7 @@ fn start_claim(
         let lock_at = lock_at
             .ok_or(Error::MissingField("lock_at"))
             .map_err(owed)?;
-        let attempts = i32::try_from(attempts).map_err(|_| {
+        let attempts = attempts.map(i32::try_from).transpose().map_err(|_| {
             owed(Error::InvalidArgument(
                 "task attempt counter does not fit the attempts column".to_owned(),
             ))
