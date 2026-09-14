@@ -493,6 +493,8 @@ enum Age {
 enum Window {
     Zero,
     OneMinute,
+    /// Longer than PostgreSQL's timestamp range reaches back.
+    BeyondTheTimestampRange,
 }
 
 #[derive(Clone, Copy)]
@@ -561,6 +563,7 @@ async fn run_purge(
             let completed_before = match window {
                 Window::Zero => Duration::ZERO,
                 Window::OneMinute => Duration::from_secs(60),
+                Window::BeyondTheTimestampRange => Duration::MAX,
             };
             let cutoff =
                 retention::server_cutoff(conn, completed_before).map_err(|e| e.to_string())?;
@@ -1281,6 +1284,10 @@ lets_expect! { #tokio_test
         let window = Window::OneMinute;
         let scope = Scope::SameQueue;
         to deletes_a_completed_task_older_than_the_window { purged() }
+        when the_window_is_longer_than_the_timestamp_range {
+            let window = Window::BeyondTheTimestampRange;
+            to keeps_it_without_failing { kept() }
+        }
         when the_task_completed_inside_the_window {
             let age = Age::Fresh;
             to keeps_it { kept() }

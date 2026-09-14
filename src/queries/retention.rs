@@ -26,6 +26,10 @@ pub(crate) const PURGE_BATCH_LIMIT: i64 = 10_000;
 /// history, so the batch stays as small as the orphan sweep's.
 pub(crate) const PRUNE_BATCH_LIMIT: i64 = 1_000;
 
+/// Epoch seconds of the earliest timestamp PostgreSQL represents, 24 November
+/// 4714 BC; `to_timestamp` refuses anything earlier.
+const TIMESTAMP_FLOOR_EPOCH: &str = "-210866803200";
+
 #[derive(QueryableByName)]
 struct Epoch {
     #[diesel(sql_type = Double)]
@@ -59,18 +63,24 @@ pub(crate) fn purge_terminal_batch(
     // Select the batch once. A locking LIMIT subquery inside `IN (...)` can be
     // planned on the inner side of a nested-loop semi-join and run again for
     // every outer row; each run skips the rows this statement already deleted,
-    // so one batch could delete the whole backlog.
+    // so one batch could delete the whole backlog. The age filter compares the
+    // columns themselves, so the `(job_type, done_at)` and `run_at` indexes
+    // serve it and a queue with nothing to purge is not scanned; the cutoff is
+    // clamped to the earliest timestamp PostgreSQL represents, so a window
+    // longer than that range selects nothing instead of failing. The batch is
+    // deleted by primary key.
     sql_query(format!(
         "WITH candidates AS MATERIALIZED (
             SELECT id FROM apalis.jobs
             WHERE job_type = $1
                 AND {TERMINAL_PREDICATE}
-                AND EXTRACT(EPOCH FROM COALESCE(done_at, run_at)) <= $2
+                AND (done_at <= to_timestamp(GREATEST($2, {TIMESTAMP_FLOOR_EPOCH}))
+                    OR (done_at IS NULL
+                        AND run_at <= to_timestamp(GREATEST($2, {TIMESTAMP_FLOOR_EPOCH}))))
             LIMIT $3
             FOR UPDATE SKIP LOCKED
         )
-        DELETE FROM apalis.jobs USING candidates
-        WHERE apalis.jobs.id = candidates.id"
+        DELETE FROM apalis.jobs WHERE id = ANY(ARRAY(SELECT id FROM candidates))"
     ))
     .bind::<Text, _>(queue)
     .bind::<Double, _>(cutoff)
@@ -173,15 +183,18 @@ fn prune_workers_batch_counted(
         // again under a later snapshot, taken after the locks, which no new
         // claim can pass because a claim needs a share lock on the
         // registration. A plain locking SELECT runs once, so the batch keeps
-        // its limit.
+        // its limit. The reference checks here and in the delete are
+        // correlated scalar subqueries, so each candidate probes
+        // `jobs_job_type_lock_by_idx`; `NOT EXISTS` is planned as an
+        // anti-join over the queue's whole history.
         let candidates = sql_query(
             "SELECT w.id FROM apalis.workers w
              WHERE w.worker_type = $1
                  AND EXTRACT(EPOCH FROM (clock_timestamp() - w.last_seen)) >= $2
-                 AND NOT EXISTS (
+                 AND NOT (SELECT EXISTS (
                      SELECT 1 FROM apalis.jobs j
                      WHERE j.job_type = w.worker_type AND j.lock_by = w.id
-                 )
+                 ))
              ORDER BY w.id
              LIMIT $3
              FOR UPDATE SKIP LOCKED",
@@ -220,10 +233,10 @@ pub(crate) fn delete_unreferenced_registrations(
         "DELETE FROM apalis.workers w
          WHERE w.worker_type = $1
              AND w.id = ANY($2)
-             AND NOT EXISTS (
+             AND NOT (SELECT EXISTS (
                  SELECT 1 FROM apalis.jobs j
                  WHERE j.job_type = w.worker_type AND j.lock_by = w.id
-             )",
+             ))",
     )
     .bind::<Text, _>(queue)
     .bind::<Array<Text>, _>(ids)
