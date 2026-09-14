@@ -75,12 +75,12 @@ impl diesel::r2d2::CustomizeConnection<PgConnection, diesel::r2d2::Error> for Ob
     fn on_acquire(&self, conn: &mut PgConnection) -> Result<(), diesel::r2d2::Error> {
         let observed = self.0.clone();
         conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
-            // Only schedule faults around the public completion SELECT. The
-            // query itself and its state transitions remain production code.
+            // Only schedule faults around the public completion SELECT, the
+            // only statement that reports a terminal verdict. The query itself
+            // and its state transitions remain production code.
             match event {
                 InstrumentationEvent::StartQuery { query, .. }
-                    if format!("{query}")
-                        .starts_with("SELECT id, status, last_result AS result") =>
+                    if format!("{query}").contains(" AS terminal") =>
                 {
                     let mut state = observed.lock().unwrap();
                     if let Err(error) = state.before_query() {
@@ -88,8 +88,7 @@ impl diesel::r2d2::CustomizeConnection<PgConnection, diesel::r2d2::Error> for Ob
                     }
                 }
                 InstrumentationEvent::FinishQuery { query, error, .. }
-                    if format!("{query}")
-                        .starts_with("SELECT id, status, last_result AS result") =>
+                    if format!("{query}").contains(" AS terminal") =>
                 {
                     observed
                         .lock()

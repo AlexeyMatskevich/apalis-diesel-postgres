@@ -310,17 +310,21 @@ where
 }
 
 /// Every waited row that exists, with the server's terminal verdict, so a
-/// wait can tell an active task from one that does not exist.
+/// wait can tell an active task from one that does not exist. Only a
+/// terminal row's result is read: an active row's earlier failures can be
+/// large and are polled repeatedly.
 fn tracked_task_rows(
     pool: PgPool,
     ids: Vec<String>,
 ) -> impl Future<Output = Result<Vec<TrackedTaskRow>, Error>> + Send {
     with_conn(pool, move |conn| {
         sql_query(format!(
-            "SELECT id, status, last_result AS result, {} AS terminal
+            "SELECT id, status,
+                    CASE WHEN {terminal} THEN last_result END AS result,
+                    {terminal} AS terminal
              FROM apalis.jobs
              WHERE id = ANY($1)",
-            crate::queries::TERMINAL_PREDICATE
+            terminal = crate::queries::TERMINAL_PREDICATE
         ))
         .bind::<Array<Text>, _>(ids)
         .load::<TrackedTaskRow>(conn)
