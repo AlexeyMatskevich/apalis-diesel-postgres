@@ -1442,6 +1442,8 @@ mod tests {
             AlreadyStarted,
             /// A task assembled by hand, without the claim record.
             Unrecorded,
+            /// A claim whose acknowledgement already committed in this process.
+            Acknowledged,
         }
 
         /// Who holds the registration when the dispatch starts the claim.
@@ -1616,6 +1618,13 @@ mod tests {
                     .expect("claim recorded")
                     .mark_started();
             }
+            if matches!(history, ClaimHistory::Acknowledged) {
+                task.parts
+                    .data
+                    .get::<ClaimAttempt>()
+                    .expect("claim recorded")
+                    .mark_acknowledged();
+            }
             task
         }
 
@@ -1768,6 +1777,9 @@ mod tests {
                     Ok(()) => "started".to_owned(),
                     Err(crate::Error::ClaimLost { .. }) => "claim_lost".to_owned(),
                     Err(crate::Error::WorkerRetired { .. }) => "retired".to_owned(),
+                    Err(crate::Error::AlreadyAcknowledged { .. }) => {
+                        "already_acknowledged".to_owned()
+                    }
                     Err(error) => format!("unexpected: {error:?}"),
                 };
                 Ok::<_, String>(AcknowledgerStartObservation {
@@ -2419,6 +2431,12 @@ mod tests {
                         }
                     }
                 }
+                when the_claim_was_already_acknowledged {
+                    let history = ClaimHistory::Acknowledged;
+                    to refuses_the_start_as_already_acknowledged_without_touching_the_row {
+                        started_by_the_acknowledger("already_acknowledged", Status::Queued, "Queued", false)
+                    }
+                }
                 when the_task_carries_no_claim_record {
                     let history = ClaimHistory::Unrecorded;
                     to moves_the_row_and_the_task_to_running {
@@ -2560,12 +2578,15 @@ impl PgAck {
     ///
     /// Keep the task's `Parts` from the claim, including `data`, as for an
     /// acknowledgement. Starting a claim this process already started is
-    /// accepted.
+    /// accepted, unless its acknowledgement already committed.
     ///
     /// # Errors
     /// - [`Error::ClaimLost`] if the claim was recovered, released or taken
     ///   over, or another claim of the same epoch started the row. Do not run
     ///   the task: it runs elsewhere.
+    /// - [`Error::AlreadyAcknowledged`] if this claim's acknowledgement already
+    ///   committed in this process. Do not run the task again: the persisted
+    ///   retry budget schedules any further attempt.
     /// - [`Error::WorkerRetired`] if the storage this acknowledger comes from
     ///   retired the worker name locally. Do not run the task.
     /// - [`Error::MissingField`] if `task_id`, `queue`, `lock_by` or `lock_at`
@@ -3139,6 +3160,19 @@ fn start_claim(
     };
     async move {
         if let Some(claim) = &claim {
+            if claim.is_acknowledged() {
+                // This claim's acknowledgement already committed: the database
+                // retry budget schedules any further attempt and nothing is
+                // owed, so this is not a refused start either.
+                return Err(StartRefusal {
+                    error: Error::already_acknowledged(
+                        task_id.map(|id| id.to_string()).unwrap_or_default(),
+                        queue.clone().unwrap_or_default(),
+                        worker_id,
+                    ),
+                    still_owed: false,
+                });
+            }
             claim.mark_start_attempted();
         }
         let owed = |error: Error| StartRefusal {
