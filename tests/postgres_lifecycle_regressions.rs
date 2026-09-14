@@ -406,87 +406,91 @@ mod races {
         .await;
         result.is_ok()
     }
-    async fn controlled_deadlock() -> bool {
-        let p = pool().await;
-        let q = format!("lifecycle_deadlock_{}", ulid::Ulid::new());
-        let c = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_secs(60));
-        let w = WorkerContext::new::<()>("deadlock-worker");
-        let mut old = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
-        assert!(old.next().await.unwrap().is_ok());
-        let id = ulid::Ulid::new();
-        sql(&p,format!("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at) VALUES('{id}','{q}',''::bytea,'Pending',0,25,now())")).await;
-        let mut task = old.next().await.unwrap().unwrap().unwrap();
-        task.parts.attempt = Attempt::new_with_value(1);
-        let pp = p.clone();
-        let qq = q.clone();
-        let token = tokio::task::spawn_blocking(move || {
-            sql_query("SELECT lease_token FROM apalis.workers WHERE worker_type=$1")
-                .bind::<Text, _>(qq)
-                .get_result::<Token>(&mut pp.get().unwrap())
+    /// The recovery trigger parks on this advisory key while it holds the job row.
+    const RECOVERY_PARKED: &str = "SELECT count(*)n FROM pg_locks WHERE locktype='advisory' AND NOT granted AND classid=0 AND objid=8765412 AND objsubid=1";
+    /// A session the parked recovery blocks, observed through its blocking pids.
+    const BLOCKED_BY_RECOVERY: &str = "SELECT count(DISTINCT w.pid)n FROM pg_locks w, pg_locks r WHERE NOT w.granted AND r.locktype='advisory' AND NOT r.granted AND r.classid=0 AND r.objid=8765412 AND r.objsubid=1 AND r.pid=ANY(pg_blocking_pids(w.pid))";
+    async fn wait_until_observed(p: &PgPool, what: &str, query: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while n(p, query.to_owned()).await == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} was not observed within 10 seconds"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    /// The scenario owns its database: it installs a trigger on `apalis.jobs`
+    /// and waits for specific lock waits, neither of which may meet another
+    /// scenario running at the same time.
+    async fn controlled_deadlock() -> Result<crate::support::Outcome<bool>, String> {
+        crate::support::with_isolated_database(|url| async move {
+            let p = build_pool(url).unwrap();
+            setup(&p).await.unwrap();
+            let q = format!("lifecycle_deadlock_{}", ulid::Ulid::new());
+            let c = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_secs(60));
+            let w = WorkerContext::new::<()>("deadlock-worker");
+            let mut old = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
+            assert!(old.next().await.unwrap().is_ok());
+            let id = ulid::Ulid::new();
+            sql(&p,format!("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at) VALUES('{id}','{q}',''::bytea,'Pending',0,25,now())")).await;
+            let mut task = old.next().await.unwrap().unwrap().unwrap();
+            task.parts.attempt = Attempt::new_with_value(1);
+            let pp = p.clone();
+            let qq = q.clone();
+            let token = tokio::task::spawn_blocking(move || {
+                sql_query("SELECT lease_token FROM apalis.workers WHERE worker_type=$1")
+                    .bind::<Text, _>(qq)
+                    .get_result::<Token>(&mut pp.get().unwrap())
+                    .unwrap()
+                    .lease_token
+            })
+            .await
+            .unwrap();
+            sql(&p,format!("UPDATE apalis.workers SET last_seen=now()-interval '2 minutes' WHERE worker_type='{q}'")).await;
+            sql(&p,"CREATE OR REPLACE FUNCTION apalis.test_block_recovery() RETURNS trigger AS $$ BEGIN IF NEW.status='Pending' AND OLD.status IN ('Queued','Running') THEN PERFORM pg_advisory_xact_lock(8765412); END IF; RETURN NEW; END $$ LANGUAGE plpgsql".to_owned()).await;
+            sql(&p,format!("CREATE TRIGGER test_block_recovery BEFORE UPDATE ON apalis.jobs FOR EACH ROW WHEN (OLD.job_type='{q}') EXECUTE FUNCTION apalis.test_block_recovery()")).await;
+            let mut holder = p.get().unwrap();
+            sql_query("BEGIN").execute(&mut holder).unwrap();
+            sql_query("SELECT pg_advisory_xact_lock(8765412)")
+                .execute(&mut holder)
+                .unwrap();
+            let mut fresh = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
+            let takeover = tokio::spawn(async move { fresh.next().await });
+            wait_until_observed(&p, "the recovery parked in its trigger", RECOVERY_PARKED).await;
+            let mut ack = PgAck::with_lease_token(&p, Arc::from(token));
+            let acknowledger = tokio::spawn(async move {
+                let result: Result<(), BoxDynError> = Ok(());
+                ack.ack(&result, &task.parts).await
+            });
+            wait_until_observed(
+                &p,
+                "the acknowledgement blocked by the recovery",
+                BLOCKED_BY_RECOVERY,
+            )
+            .await;
+            sql_query("COMMIT").execute(&mut holder).unwrap();
+            drop(holder);
+            let a = tokio::time::timeout(Duration::from_secs(5), takeover)
+                .await
                 .unwrap()
-                .lease_token
+                .unwrap();
+            let b = tokio::time::timeout(Duration::from_secs(5), acknowledger)
+                .await
+                .unwrap()
+                .unwrap();
+            eprintln!("controlled recovery={a:?}; ack={b:?}");
+            Ok(!(matches!(a, Some(Ok(None)))
+                && matches!(
+                    b,
+                    Err(apalis_diesel_postgres::Error::StaleAcknowledgement { .. })
+                )))
         })
         .await
-        .unwrap();
-        sql(&p,format!("UPDATE apalis.workers SET last_seen=now()-interval '2 minutes' WHERE worker_type='{q}'")).await;
-        sql(&p,"CREATE OR REPLACE FUNCTION apalis.test_block_recovery() RETURNS trigger AS $$ BEGIN IF NEW.status='Pending' AND OLD.status IN ('Queued','Running') THEN PERFORM pg_advisory_xact_lock(8765412); END IF; RETURN NEW; END $$ LANGUAGE plpgsql".to_owned()).await;
-        sql(&p,format!("CREATE TRIGGER test_block_recovery BEFORE UPDATE ON apalis.jobs FOR EACH ROW WHEN (OLD.job_type='{q}') EXECUTE FUNCTION apalis.test_block_recovery()")).await;
-        let mut holder = p.get().unwrap();
-        sql_query("BEGIN").execute(&mut holder).unwrap();
-        sql_query("SELECT pg_advisory_xact_lock(8765412)")
-            .execute(&mut holder)
-            .unwrap();
-        let mut fresh = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
-        let takeover = tokio::spawn(async move { fresh.next().await });
-        for _ in 0..200 {
-            if n(&p,"SELECT count(*)n FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory'".to_owned()).await>0{break;}
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(n(&p,"SELECT count(*)n FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory'".to_owned()).await>0);
-        let mut ack = PgAck::with_lease_token(&p, Arc::from(token));
-        let acknowledger = tokio::spawn(async move {
-            let result: Result<(), BoxDynError> = Ok(());
-            ack.ack(&result, &task.parts).await
-        });
-        for _ in 0..200 {
-            if n(&p,"SELECT count(*)n FROM pg_stat_activity WHERE datname=current_database() AND wait_event='transactionid'".to_owned()).await>0{break;}
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let waiting=n(&p,"SELECT count(*)n FROM pg_stat_activity WHERE datname=current_database() AND wait_event='transactionid'".to_owned()).await;
-        assert!(waiting > 0);
-        sql_query("COMMIT").execute(&mut holder).unwrap();
-        drop(holder);
-        let a = tokio::time::timeout(Duration::from_secs(5), takeover)
-            .await
-            .unwrap()
-            .unwrap();
-        let b = tokio::time::timeout(Duration::from_secs(5), acknowledger)
-            .await
-            .unwrap()
-            .unwrap();
-        eprintln!("controlled recovery={a:?}; ack={b:?}");
-        let deadlock = !(matches!(a, Some(Ok(None)))
-            && matches!(
-                b,
-                Err(apalis_diesel_postgres::Error::StaleAcknowledgement { .. })
-            ));
-        sql(
-            &p,
-            "DROP TRIGGER test_block_recovery ON apalis.jobs".to_owned(),
-        )
-        .await;
-        sql(&p, "DROP FUNCTION apalis.test_block_recovery()".to_owned()).await;
-        sql(&p, format!("DELETE FROM apalis.jobs WHERE job_type='{q}'")).await;
-        sql(
-            &p,
-            format!("DELETE FROM apalis.workers WHERE worker_type='{q}'"),
-        )
-        .await;
-        deadlock
     }
     lets_expect! {#tokio_test
      expect(crate::database_case(immediate_takeover).await)as fractional_timeout{when the_incumbent_is_fresh{to rejects_takeover_before_the_timeout{crate::operation_refused()}}}
-     expect(crate::database_case(controlled_deadlock).await)as ownership_operations{when recovery_holds_the_job_before_ack_finishes{to do_not_deadlock{crate::operation_refused()}}}
+     expect(controlled_deadlock().await)as ownership_operations{when recovery_holds_the_job_before_ack_finishes{to do_not_deadlock{crate::operation_refused()}}}
     }
 }
 
