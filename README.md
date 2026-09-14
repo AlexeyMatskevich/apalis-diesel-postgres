@@ -24,12 +24,13 @@ orphan re-enqueue, admin queries, and `MakeShared` for many-queue setups.
 Targets the Apalis 1.0 release candidate: `apalis-core 1.0.0-rc.9`,
 `apalis-sql 1.0.0-rc.9`, `apalis-codec 0.1.0-rc.9`, `diesel >=2.3.13`.
 Uses the Apalis SQL tables (`apalis.jobs`, `apalis.workers`). The
-[0.4.1 to 0.5.0 upgrade guide](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/v0.5.0/docs/upgrading.md#upgrading-from-041-to-050)
-covers Rust API changes, schema migration, deployment order and rollback limits.
+[0.5.0 to 0.6.0 upgrade guide](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/v0.6.0/docs/upgrading.md#upgrading-from-050-to-060)
+covers the schema migration, configuration validation and task state changes; the
+same guide keeps the 0.4.1 to 0.5.0 path.
 
 MSRV: Rust 1.88.
 
-The [lifecycle reference](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/master/docs/lifecycle.md)
+The [lifecycle reference](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/v0.6.0/docs/lifecycle.md)
 describes every task state and transition, the worker registration protocol,
 recovery latency after each kind of failure, and retention.
 
@@ -41,7 +42,7 @@ PostgreSQL 14–17 have not been validated by the current CI matrix.
 
 ```toml
 [dependencies]
-apalis-diesel-postgres = { version = "0.5", features = ["tokio"] }
+apalis-diesel-postgres = { version = "0.6", features = ["tokio"] }
 diesel = { version = "2.3.13", features = ["postgres", "r2d2", "chrono", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 ```

@@ -1,10 +1,13 @@
 # Installation and upgrades
 
-## Upgrading from 0.5.0
+## Upgrading from 0.5.0 to 0.6.0
 
-One schema change and several behaviours of the running system change; see
-the [lifecycle reference](lifecycle.md) for the protocol they belong to and
-the [changelog](../CHANGELOG.md) for the full list.
+Use this path when moving from `0.5.0` to `0.6.0`. Update the application's
+dependency requirement to `apalis-diesel-postgres = "0.6"`: a `"0.5"` requirement
+does not select this release. One schema change and several behaviours of the
+running system change; see the [lifecycle reference](lifecycle.md) for the
+protocol they belong to and the [0.6.0 changelog](../CHANGELOG.md#060) for the
+full list.
 
 - Migration `20260914000000_task_state_shape` adds the constraint
   `jobs_state_shape_check`: a `Pending` row carries no owner columns, and a
