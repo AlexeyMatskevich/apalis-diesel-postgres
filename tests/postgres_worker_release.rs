@@ -123,9 +123,20 @@ async fn job_row(pool: PgPool, id: PgTaskId) -> Result<(String, i32, Option<Stri
 // A registration released with an unfinished claim
 // --------------------------------------------------------------------------
 
+/// What the consumer did with its claim before it stopped.
+#[derive(Clone, Copy)]
+enum Consumer {
+    /// Took the task from the stream and stopped without starting it.
+    ClaimsOnly,
+    /// Started the claim with the storage's acknowledger, as a consumer that
+    /// runs tasks without the backend middleware does, then stopped.
+    StartsBeforeRunning,
+}
+
 #[derive(Debug)]
 struct ReleaseObservation {
     claimed: &'static str,
+    started: Result<(), String>,
     released: Result<usize, &'static str>,
     row_after_release: (String, i32, Option<String>),
     clone_after_release: &'static str,
@@ -141,7 +152,9 @@ fn release_error(error: Error) -> &'static str {
     }
 }
 
-async fn release_with_unfinished_claim() -> Result<Outcome<ReleaseObservation>, String> {
+async fn release_with_unfinished_claim(
+    consumer: Consumer,
+) -> Result<Outcome<ReleaseObservation>, String> {
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
@@ -154,7 +167,18 @@ async fn release_with_unfinished_claim() -> Result<Outcome<ReleaseObservation>, 
         let task_id = push_with_id(&mut producer, "unfinished", None).await?;
         let mut stream = storage.clone().poll_compact(&worker);
         assert_eq!(next_item(&mut stream).await, "registered");
-        let claimed = next_item(&mut stream).await;
+        let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a stream item within five seconds");
+        let started = match (&next, consumer) {
+            (Some(Ok(Some(task))), Consumer::StartsBeforeRunning) => storage
+                .acknowledger()
+                .start(&task.parts)
+                .await
+                .map_err(|error| error.to_string()),
+            _ => Ok(()),
+        };
+        let claimed = item(next);
         // The process stops without acknowledging: the stream goes away with
         // the task still owned by the name.
         drop(stream);
@@ -179,6 +203,7 @@ async fn release_with_unfinished_claim() -> Result<Outcome<ReleaseObservation>, 
             .map_err(release_error);
         Ok::<_, String>(ReleaseObservation {
             claimed,
+            started,
             released,
             row_after_release,
             clone_after_release,
@@ -192,13 +217,15 @@ async fn release_with_unfinished_claim() -> Result<Outcome<ReleaseObservation>, 
     observation.map(Outcome::Completed)
 }
 
-fn hands_the_claim_to_an_immediate_successor()
--> impl Fn(&Result<Outcome<ReleaseObservation>, String>) -> AssertionResult {
-    observe::<ReleaseObservation, _>("release with an unfinished claim", |o| {
-        // The stream claimed the task but nothing started it, so the
-        // release hands it back with its attempt count unchanged.
-        let expected_row = ("Pending".to_owned(), 0, None);
+/// `charged` is the attempts the release consumes: none for a claim that was
+/// never started, one for a started claim that may have run partially.
+fn hands_the_claim_to_an_immediate_successor(
+    charged: i32,
+) -> impl Fn(&Result<Outcome<ReleaseObservation>, String>) -> AssertionResult {
+    observe::<ReleaseObservation, _>("release with an unfinished claim", move |o| {
+        let expected_row = ("Pending".to_owned(), charged, None);
         if o.claimed == "task"
+            && o.started.is_ok()
             && o.released == Ok(1)
             && o.row_after_release == expected_row
             && o.clone_after_release == "retired"
@@ -209,7 +236,7 @@ fn hands_the_claim_to_an_immediate_successor()
             Ok(())
         } else {
             Err(format!(
-                "expected the unstarted claim handed back as Pending with no attempt consumed, the releasing storage retired, an immediate successor that receives the task, and a second release refused; got {o:?}"
+                "expected the claim handed back as Pending with {charged} attempt(s) consumed, the releasing storage retired, an immediate successor that receives the task, and a second release refused; got {o:?}"
             ))
         }
     })
@@ -904,9 +931,14 @@ fn removes_only_completed_history()
 }
 
 lets_expect! { #tokio_test
-    expect(release_with_unfinished_claim().await) as a_released_registration {
+    expect(release_with_unfinished_claim(consumer).await) as a_released_registration {
+        let consumer = Consumer::ClaimsOnly;
         when the_worker_stopped_with_an_unfinished_claim {
-            to hands_the_claim_to_an_immediate_successor { hands_the_claim_to_an_immediate_successor() }
+            to hands_the_claim_to_an_immediate_successor { hands_the_claim_to_an_immediate_successor(0) }
+            when the_consumer_had_started_the_claim {
+                let consumer = Consumer::StartsBeforeRunning;
+                to charges_the_started_claim_and_hands_it_to_an_immediate_successor { hands_the_claim_to_an_immediate_successor(1) }
+            }
         }
     }
 

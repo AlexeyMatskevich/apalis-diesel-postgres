@@ -9,6 +9,11 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Added
 
+- `PgAck::start` starts a claimed task for a consumer that takes tasks from a
+  storage's stream and runs them without the backend middleware. A claim
+  stays `Queued` until it is started, and recovery charges an attempt only
+  for a started claim, so such a consumer starts each claim before running
+  it; a claim lost in the meantime is refused with `ClaimLost`.
 - `PostgresStorage::release_worker` hands a stopped worker's registration
   back: every `Running` or `Queued` task it still owns returns to the queue,
   charged one attempt only when its handler had started, the lease token is
@@ -64,7 +69,8 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   the worker like a failed acknowledgement. Code that reads `status` sees
   buffered claims as `Queued`, and `running_jobs` counts only started tasks.
   A stream consumer that acknowledges without the middleware acknowledges
-  `Queued` rows as before.
+  `Queued` rows as before; one that runs tasks starts each claim with
+  `PgAck::start`, or a task that crashes the process is handed back uncharged.
 - Registration and the heartbeat stream refuse a schedule that cannot keep
   a registration fresh: `keep_alive` must be greater than zero and shorter
   than `reenqueue_orphaned_after`, or the first stream item is

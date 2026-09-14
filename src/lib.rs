@@ -316,6 +316,9 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// same way the automatic middleware does, so orphan recovery can reclaim
     /// the task. [`PgAck::new`] and [`PgAck::with_lease_token`] bind no
     /// liveness and leave the heartbeat running after a failure.
+    ///
+    /// A consumer that runs tasks without the backend middleware starts each
+    /// claim with [`PgAck::start`] before running it.
     #[must_use]
     pub fn acknowledger(&self) -> PgAck {
         PgAck::with_lease_registry(

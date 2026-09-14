@@ -1589,6 +1589,7 @@ mod tests {
                 )
                 .build();
             task.parts.data.insert(WorkerContext::new::<()>(worker));
+            task.parts.status.store(Status::Queued);
             if !matches!(history, ClaimHistory::Unrecorded) {
                 record_claim(&mut task.parts);
             }
@@ -1697,6 +1698,142 @@ mod tests {
                     ))
                 }
             })
+        }
+
+        #[derive(Debug)]
+        struct AcknowledgerStartObservation {
+            outcome: String,
+            /// The task's status after the call; the claim arrived `Queued`.
+            status: Status,
+            row_status: String,
+            owner_retired: bool,
+        }
+
+        /// A consumer without the backend middleware starts the seeded claim
+        /// through the storage's acknowledger.
+        async fn start_through_the_acknowledger(
+            row: RowAtDispatch,
+            history: ClaimHistory,
+            holder: Holder,
+        ) -> Result<crate::test_support::Outcome<AcknowledgerStartObservation>, String> {
+            let Some(pool) = crate::test_support::shared_pool().await? else {
+                return Ok(crate::test_support::Outcome::Skipped);
+            };
+            let queue = format!("ack-start-{}", Ulid::new());
+            let worker = format!("ack-start-worker-{}", Ulid::new());
+            let registered_token = match holder {
+                Holder::Current | Holder::RetiredLocally => START_TOKEN,
+                Holder::Replaced | Holder::ReplacedUnbound => "successor-token",
+            };
+            let observation = async {
+                let (id, lock_at) = seed_claim(
+                    pool.clone(),
+                    queue.clone(),
+                    worker.clone(),
+                    registered_token,
+                    row,
+                )
+                .await?;
+                let registry = crate::lease::LeaseRegistry::default();
+                let owner = registry.for_worker(&worker);
+                if matches!(holder, Holder::RetiredLocally) {
+                    owner.retire();
+                }
+                let acknowledger = PgAck {
+                    pool: pool.clone(),
+                    lease_token: match holder {
+                        Holder::ReplacedUnbound => None,
+                        _ => Some(Arc::from(START_TOKEN)),
+                    },
+                    leases: Some(registry.clone()),
+                };
+                let task = claimed_task(id, &queue, &worker, lock_at, history);
+                let outcome = match acknowledger.start(&task.parts).await {
+                    Ok(()) => "started".to_owned(),
+                    Err(crate::Error::ClaimLost { .. }) => "claim_lost".to_owned(),
+                    Err(crate::Error::WorkerRetired { .. }) => "retired".to_owned(),
+                    Err(error) => format!("unexpected: {error:?}"),
+                };
+                Ok::<_, String>(AcknowledgerStartObservation {
+                    outcome,
+                    status: task.parts.status.load(),
+                    row_status: row_status(pool.clone(), id).await?,
+                    owner_retired: owner.is_retired(),
+                })
+            }
+            .await;
+            remove_queue(pool, queue).await?;
+            observation.map(crate::test_support::Outcome::Completed)
+        }
+
+        fn started_by_the_acknowledger(
+            outcome: &'static str,
+            status: Status,
+            row_status: &'static str,
+            owner_retired: bool,
+        ) -> impl Fn(
+            &Result<crate::test_support::Outcome<AcknowledgerStartObservation>, String>,
+        ) -> AssertionResult {
+            crate::test_support::observe::<AcknowledgerStartObservation, _>(
+                "start through the acknowledger",
+                move |run| {
+                    if run.outcome == outcome
+                        && run.status == status
+                        && run.row_status == row_status
+                        && run.owner_retired == owner_retired
+                    {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "expected {outcome} with task status {status:?}, a {row_status} row and owner_retired={owner_retired}; got {run:?}"
+                        ))
+                    }
+                },
+            )
+        }
+
+        #[derive(Debug)]
+        struct AcknowledgerStartFailure {
+            result: Result<(), crate::Error>,
+            owner_retired: bool,
+        }
+
+        /// Starting through an acknowledger bound to a storage's liveness when
+        /// the database is unreachable, or before the database when the claim
+        /// names no owner.
+        async fn start_without_the_database(has_owner: bool) -> AcknowledgerStartFailure {
+            let registry = crate::lease::LeaseRegistry::default();
+            let owner = registry.for_worker("unreachable-owner");
+            let mut context = PgContext::new()
+                .with_queue("unreachable-queue".to_owned())
+                .with_lock_at(Some(1_700_000_000));
+            if has_owner {
+                context = context.with_lock_by(Some("unreachable-owner".to_owned()));
+            }
+            let mut task = TaskBuilder::new(())
+                .with_task_id(task_id())
+                .with_ctx(context)
+                .build();
+            record_claim(&mut task.parts);
+            let acknowledger = PgAck {
+                pool: unreachable_pool(),
+                lease_token: Some(Arc::from("unreachable-token")),
+                leases: Some(registry.clone()),
+            };
+            let result = acknowledger.start(&task.parts).await;
+            AcknowledgerStartFailure {
+                result,
+                owner_retired: owner.is_retired(),
+            }
+        }
+
+        fn missing_owner(error: &crate::Error) -> AssertionResult {
+            match error {
+                crate::Error::MissingField("lock_by") => Ok(()),
+                other => Err(AssertionError::new(vec![format!(
+                    "expected Error::MissingField(\"lock_by\"), got {other:?}"
+                )])),
+            }
         }
 
         /// How the handler behind the middleware ends when it runs.
@@ -2172,6 +2309,84 @@ mod tests {
                 }
             }
 
+            expect(start_through_the_acknowledger(row, history, holder).await) as starting_a_claim_without_the_middleware {
+                let row = RowAtDispatch::Claimed;
+                let history = ClaimHistory::Fresh;
+                let holder = Holder::Current;
+                to moves_the_row_and_the_task_to_running {
+                    started_by_the_acknowledger("started", Status::Running, "Running", false)
+                }
+                when the_claim_was_recovered_before_the_start {
+                    let row = RowAtDispatch::Recovered;
+                    to refuses_the_start_and_keeps_the_worker_active {
+                        started_by_the_acknowledger("claim_lost", Status::Queued, "Pending", false)
+                    }
+                }
+                when the_task_was_claimed_again_at_a_later_second {
+                    let row = RowAtDispatch::ReclaimedLater;
+                    to refuses_the_start_and_leaves_the_newer_claim_alone {
+                        started_by_the_acknowledger("claim_lost", Status::Queued, "Queued", false)
+                    }
+                }
+                when another_claim_of_the_same_epoch_already_started_the_row {
+                    let row = RowAtDispatch::Started;
+                    to refuses_the_second_start {
+                        started_by_the_acknowledger("claim_lost", Status::Queued, "Running", false)
+                    }
+                    when the_consumer_starts_a_claim_it_already_started {
+                        let history = ClaimHistory::AlreadyStarted;
+                        to accepts_the_repeat {
+                            started_by_the_acknowledger("started", Status::Running, "Running", false)
+                        }
+                    }
+                    when the_task_carries_no_claim_record {
+                        let history = ClaimHistory::Unrecorded;
+                        to starts_it_without_a_claim_identity_to_compare {
+                            started_by_the_acknowledger("started", Status::Running, "Running", false)
+                        }
+                    }
+                }
+                when the_task_carries_no_claim_record {
+                    let history = ClaimHistory::Unrecorded;
+                    to moves_the_row_and_the_task_to_running {
+                        started_by_the_acknowledger("started", Status::Running, "Running", false)
+                    }
+                }
+                when another_token_owns_the_registration {
+                    let holder = Holder::Replaced;
+                    to refuses_the_start_and_keeps_the_worker_active {
+                        started_by_the_acknowledger("claim_lost", Status::Queued, "Queued", false)
+                    }
+                    when the_acknowledger_binds_no_token {
+                        let holder = Holder::ReplacedUnbound;
+                        to starts_the_claim_without_a_registration_fence {
+                            started_by_the_acknowledger("started", Status::Running, "Running", false)
+                        }
+                    }
+                }
+                when the_worker_is_retired_locally {
+                    let holder = Holder::RetiredLocally;
+                    to starts_nothing_and_leaves_the_claim_for_recovery {
+                        started_by_the_acknowledger("retired", Status::Queued, "Queued", true)
+                    }
+                }
+            }
+
+            expect(start_without_the_database(has_owner).await) as starting_a_claim_without_a_reachable_database {
+                let has_owner = true;
+                to fails_and_retires_the_owner_so_recovery_hands_the_claim_back {
+                    have(result) be_err_and pool_error,
+                    have(owner_retired) be_true
+                }
+                when the_claim_names_no_owner {
+                    let has_owner = false;
+                    to refuses_before_the_database_without_retiring_anyone {
+                        have(result) be_err_and missing_owner,
+                        have(owner_retired) be_false
+                    }
+                }
+            }
+
             expect(acknowledge_outside_the_middleware(row, handler).await) as an_acknowledger_outside_the_middleware {
                 let row = RowAtDispatch::Claimed;
                 let handler = HandlerOutcome::Succeeds;
@@ -2231,6 +2446,73 @@ impl PgAck {
             lease_token: None,
             leases: None,
         }
+    }
+
+    /// Start a claimed task right before running it without the backend
+    /// middleware.
+    ///
+    /// A claim stays `Queued` until it is started, and recovery (the stale
+    /// sweep, a takeover, [`PostgresStorage::release_worker`]) hands a
+    /// `Queued` claim back without charging an attempt. The middleware returned
+    /// by `Backend::middleware()` starts every task it dispatches; a consumer
+    /// that takes tasks from a storage's stream and runs them itself calls this
+    /// first. A task that crashes the process after its start consumes an
+    /// attempt on recovery and is eventually killed. A claim run without a
+    /// start is handed back uncharged, so such a task can crash the process
+    /// again without limit.
+    ///
+    /// Keep the task's `Parts` from the claim, including `data`, as for an
+    /// acknowledgement. Starting a claim this process already started is
+    /// accepted.
+    ///
+    /// # Errors
+    /// - [`Error::ClaimLost`] if the claim was recovered, released or taken
+    ///   over, or another claim of the same epoch started the row. Do not run
+    ///   the task: it runs elsewhere.
+    /// - [`Error::WorkerRetired`] if the storage this acknowledger comes from
+    ///   retired the worker name locally. Do not run the task.
+    /// - [`Error::MissingField`] if `task_id`, `queue`, `lock_by` or `lock_at`
+    ///   is missing, and [`Error::InvalidArgument`] if the attempt count does
+    ///   not fit the attempts column.
+    /// - [`Error::Pool`], [`Error::Database`] and [`Error::Blocking`] for
+    ///   connection, SQL and executor failures.
+    ///
+    /// An acknowledger from [`PostgresStorage::acknowledger`] retires the
+    /// worker's local registration after a failure that may leave the claim
+    /// owned but not started, and when the returned future is dropped before
+    /// it completes, so recovery can hand the claim back.
+    ///
+    /// [`PostgresStorage::acknowledger`]: crate::PostgresStorage::acknowledger
+    /// [`PostgresStorage::release_worker`]: crate::PostgresStorage::release_worker
+    pub fn start(&self, parts: &Parts<PgContext, Ulid>) -> BoxFuture<'static, Result<(), Error>> {
+        let Some(worker_id) = parts.ctx.lock_by().clone() else {
+            return futures::future::ready(Err(Error::MissingField("lock_by"))).boxed();
+        };
+        let lease = self
+            .leases
+            .as_ref()
+            .map(|leases| leases.for_worker(&worker_id));
+        let mut obligation = lease.as_ref().map(|lease| lease.guard());
+        let start = start_claim(
+            self.pool.clone(),
+            self.lease_token.clone(),
+            lease,
+            worker_id,
+            parts,
+        );
+        async move {
+            let outcome = start.await;
+            if outcome
+                .as_ref()
+                .err()
+                .is_none_or(|refusal| !refusal.still_owed)
+                && let Some(guard) = obligation.as_mut()
+            {
+                guard.disarm();
+            }
+            outcome.map_err(|refusal| refusal.error)
+        }
+        .boxed()
     }
 
     /// Create a PostgreSQL acknowledger bound to a specific worker lease token.
@@ -2742,6 +3024,93 @@ fn is_preclaimed(lock_by: Option<&str>, worker_id: Option<&str>, has_lock_at: bo
     ) && has_lock_at
 }
 
+/// Why a claim was not started, and whether this worker may still own it
+/// unstarted.
+struct StartRefusal {
+    error: Error,
+    /// The claim may still be owned by this worker and not started, so the
+    /// caller keeps its obligation armed and a retirement lets recovery hand
+    /// it back. A lost claim, or a claim of a retired worker, owes nothing.
+    still_owed: bool,
+}
+
+/// Start a claimed task under its claim epoch right before it runs: the one
+/// path of the lock middleware and of [`PgAck::start`].
+///
+/// A locally retired name starts nothing. A row that a sweep, a takeover or a
+/// release recovered in the meantime, or that another claim of the same epoch
+/// already started, matches nothing: the task runs elsewhere and the refusal
+/// is [`Error::ClaimLost`]. A started claim is marked on its claim record, so
+/// a repeated start of it is accepted, and the task's status reads `Running`.
+fn start_claim(
+    pool: PgPool,
+    lease_token: Option<Arc<str>>,
+    lease: Option<Arc<crate::lease::WorkerLease>>,
+    worker_id: String,
+    parts: &Parts<PgContext, Ulid>,
+) -> BoxFuture<'static, Result<(), StartRefusal>> {
+    let task_id = parts.task_id;
+    let queue = parts.ctx.queue().clone();
+    let status = parts.status.clone();
+    let claim = parts.data.get::<ClaimAttempt>().cloned();
+    // A manually assembled task has no claim identity to tell a repeated start
+    // from a second claim; it starts either way.
+    let (lock_at, attempts, restart) = match claim.as_ref() {
+        Some(claim) => (claim.lock_at, claim.completed, claim.has_started()),
+        None => (*parts.ctx.lock_at(), parts.attempt.current(), true),
+    };
+    async move {
+        let owed = |error: Error| StartRefusal {
+            error,
+            still_owed: true,
+        };
+        if let Some(lease) = &lease {
+            lease.ensure_active().map_err(|error| StartRefusal {
+                error,
+                still_owed: false,
+            })?;
+        }
+        let task_id = task_id
+            .ok_or(Error::MissingField("task_id"))
+            .map_err(owed)?;
+        let queue = queue.ok_or(Error::MissingField("queue")).map_err(owed)?;
+        let lock_at = lock_at
+            .ok_or(Error::MissingField("lock_at"))
+            .map_err(owed)?;
+        let attempts = i32::try_from(attempts).map_err(|_| {
+            owed(Error::InvalidArgument(
+                "task attempt counter does not fit the attempts column".to_owned(),
+            ))
+        })?;
+        let started = queries::start_task(
+            pool,
+            queries::StartClaim {
+                task_id,
+                queue: queue.clone(),
+                worker_id: worker_id.clone(),
+                lock_at,
+                attempts,
+                restart,
+                lease_token,
+            },
+        )
+        .await
+        .map_err(owed)?;
+        if !started {
+            return Err(StartRefusal {
+                error: Error::claim_lost(task_id.to_string(), queue, worker_id),
+                still_owed: false,
+            });
+        }
+        if let Some(claim) = &claim {
+            claim.mark_started();
+        }
+        status.store(Status::Running);
+        Ok(())
+    }
+    .boxed()
+}
+
 impl<S, Args> Service<PgTask<Args>> for LockTaskService<S>
 where
     S: Service<PgTask<Args>> + Clone + Send + 'static,
@@ -2834,84 +3203,25 @@ where
                     .into());
                 }
                 if preclaimed {
-                    // A retired worker starts nothing: its claims are handed
-                    // back by the release or by recovery, without consuming an
-                    // attempt while they are still `Queued`.
-                    if let Some(lease) = &local_lease {
-                        if let Err(error) = lease.ensure_active() {
-                            completion_guard.disarm();
-                            return Err(AbortError::new(error).into());
-                        }
-                    }
-                    // The claim is `Queued`; start it under its epoch. A row that
-                    // a sweep, a takeover or a release recovered in the meantime,
-                    // or that another claim of the same epoch already started,
-                    // matches nothing: the task runs elsewhere, so this dispatch
-                    // is refused and nothing is owed.
-                    let (lock_at, attempts, restart) = match claim.as_ref() {
-                        Some(claim) => (
-                            claim.lock_at,
-                            i32::try_from(claim.completed).ok(),
-                            claim.has_started(),
-                        ),
-                        // A manually assembled task has no claim identity to tell
-                        // a re-dispatch from a second claim; it starts either way.
-                        None => (
-                            *req.parts.ctx.lock_at(),
-                            i32::try_from(req.parts.attempt.current()).ok(),
-                            true,
-                        ),
-                    };
-                    // None of these refusals starts anything, so the claim stays
-                    // owned and `Queued`: the armed guard retires the worker and
-                    // recovery hands the claim back without charging it.
-                    let Some(queue) = queue else {
-                        return Err(AbortError::new(Error::MissingField("queue")).into());
-                    };
-                    let Some(lock_at) = lock_at else {
-                        return Err(AbortError::new(Error::MissingField("lock_at")).into());
-                    };
-                    let Some(attempts) = attempts else {
-                        return Err(AbortError::new(Error::InvalidArgument(
-                            "task attempt counter does not fit the attempts column".to_owned(),
-                        ))
-                        .into());
-                    };
-                    let started = match queries::start_task(
+                    if let Err(refusal) = start_claim(
                         pool.clone(),
-                        queries::StartClaim {
-                            task_id: PgTaskId::new(task_id),
-                            queue: queue.clone(),
-                            worker_id: worker_id.clone(),
-                            lock_at,
-                            attempts,
-                            restart,
-                            lease_token: lease_token.clone(),
-                        },
+                        lease_token.clone(),
+                        local_lease.clone(),
+                        worker_id.clone(),
+                        &req.parts,
                     )
                     .await
                     {
-                        Ok(started) => started,
-                        Err(error) => {
-                            // The claim may still be owned and not started. The
-                            // armed guard retires the worker, so recovery hands
-                            // the claim back once the registration is stale.
-                            return Err(AbortError::new(error).into());
+                        // A claim that owes nothing, one that runs elsewhere or
+                        // belongs to a retired worker, disarms the obligation.
+                        // Any other refusal may leave it owned and not started:
+                        // the armed guard retires the worker so recovery hands
+                        // it back.
+                        if !refusal.still_owed {
+                            completion_guard.disarm();
                         }
-                    };
-                    if !started {
-                        completion_guard.disarm();
-                        return Err(AbortError::new(Error::claim_lost(
-                            task_id.to_string(),
-                            queue,
-                            worker_id,
-                        ))
-                        .into());
+                        return Err(AbortError::new(refusal.error).into());
                     }
-                    if let Some(claim) = claim.as_ref() {
-                        claim.mark_started();
-                    }
-                    req.parts.status.store(Status::Running);
                 } else {
                     if let Some(lease) = &local_lease {
                         lease.ensure_active().map_err(AbortError::new)?;

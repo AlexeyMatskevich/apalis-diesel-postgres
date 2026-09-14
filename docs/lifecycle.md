@@ -75,8 +75,8 @@ reports `StaleAcknowledgement`, a release reports zero rows.
 | 2 | `Pending`, `Failed` → `Queued` | poll claim (`fetch_next`) | `attempts < max_attempts`, `run_at <= now()`, registration current for the token; `ORDER BY priority DESC, run_at ASC LIMIT buffer_size FOR UPDATE SKIP LOCKED` | `lock_by`, `lock_at = date_trunc('second', now)`, `done_at = NULL` | unchanged |
 | 3 | `Pending`, `Failed` → `Queued` | notify claim (`queue_by_id`) | as 2, restricted to the notified ids | as 2 | unchanged |
 | 4 | `Pending`, `Failed` → `Queued` | compatibility claim (`apalis.get_jobs`) | as 2 without a token | as 2 | unchanged |
-| 5 | `Queued` → `Running` | start (backend middleware, right before the handler) | the claim epoch; status `Queued`, or `Running` for a re-dispatch of a claim this process already started; the token owns the registration when the middleware carries one; the name is not retired locally | `status` | unchanged |
-| 6 | `Pending`, `Failed` → `Running`; `Queued`, `Running` → `Running` | lock (`lock_task`, `lock_task_in_queue`, middleware for a task that carries no claim) | claimable, or already owned by the same name (idempotent, `lock_at` kept) | as 2, with status `Running` | unchanged |
+| 5 | `Queued` → `Running` | start (backend middleware right before the handler; `PgAck::start` for a consumer that runs claims without it) | the claim epoch; status `Queued`, or `Running` for a repeated start of a claim this process already started; the token owns the registration when the middleware or acknowledger carries one; the name is not retired locally | `status` | unchanged |
+| 6 | `Pending`, `Failed` → `Running`; `Queued`, `Running` → `Running` | lock (`lock_task`, `lock_task_in_queue`, middleware for a task whose context lacks this worker's `lock_by` or a `lock_at`) | claimable, or already owned by the same name (idempotent, `lock_at` kept) | as 2, with status `Running` | unchanged |
 | 7 | `Queued`, `Running` → `Done`, `Failed`, `Killed` | acknowledge (`PgAck`, middleware, a stream consumer acknowledging its claims) | `id`, `job_type`, `lock_by`, `lock_at`, `attempts` equal the claim epoch; status `Queued` or `Running`; the token owns the registration when the acknowledger carries one | `status`, `last_result`, `done_at = now`; owner columns kept | claim `+ 1` |
 | 8 | `Queued` → `Failed`, `Killed` | release of an undecodable payload | the claim epoch | `last_result` = codec error, `done_at = now`; owner kept | `+ 1` |
 | 9 | `Queued` → `Killed` | quarantine of a structurally malformed row (id or status unreadable) | the row was just claimed | owner cleared, `last_result` = conversion error, `done_at = now` | `+ 1` |
@@ -137,7 +137,7 @@ row to still carry exactly that epoch:
   started by the other claim of its epoch. The worker keeps running because
   it owes nothing for that claim. Like every refusal before the handler, it
   counts as a dispatch on the task's attempt counter, so a retry layer
-  outside the middleware stops after its budget. A start through the storage's middleware
+  outside the middleware stops after its budget. A start through the storage's middleware or acknowledger
   also requires the storage's token to own the registration, and a locally
   retired name starts nothing.
 - An acknowledgement whose epoch no longer matches reports
@@ -155,7 +155,10 @@ row to still carry exactly that epoch:
 `attempts` counts completed executions and lost ones; it grows by one per
 acknowledgement, undecodable release, quarantine, and recovery of a started
 (`Running`) row. Handing back a `Queued` claim that no handler started
-charges nothing. `max_attempts` is
+charges nothing. A consumer that runs claims without the backend middleware
+starts each one with `PgAck::start`; a claim it runs without starting is
+handed back uncharged, so a task that crashes the process is retried without
+limit. `max_attempts` is
 fixed at enqueue. A `Failed` row is eligible for its next claim at once:
 the backend adds no delay between attempts. Delay a retry from the handler,
 or enqueue with a later `run_at` and a smaller budget, when the failure is
@@ -280,9 +283,10 @@ waiting.
 | Heartbeat updates no row | `WorkerNotRegistered`: the registration was refused, or the name was taken over or released elsewhere. A release is then a no-op that reports `WorkerNotRegistered`; the current owner holds the claims. |
 | Claim fails before any row was claimed | The task stream yields the error; nothing is owned. |
 | Claim transaction produced rows but the commit was not confirmed | `ClaimOutcomeUnknown`; the name is retired locally so recovery can proceed. |
-| Acknowledgement fails or is lost | The storage's acknowledger retires the name; the row stays `Running` until recovery. `PgAck::new` and `with_lease_token` bind no liveness and leave the heartbeat running. |
+| Acknowledgement fails or is lost | The storage's acknowledger retires the name; the row stays `Running`, or `Queued` for a claim that was never started, until recovery. `PgAck::new` and `with_lease_token` bind no liveness and leave the heartbeat running. |
 | Start fails (pool timeout, connection lost) | The dispatch aborts before the handler and the name is retired locally. Recovery hands the claim back after the stale deadline, charging an attempt only if the start had committed unseen. |
 | Start matches nothing | `ClaimLost`: the claim was recovered, released, taken over, or started by another claim of its epoch. The handler does not run and the worker continues. An acknowledger attached outside the middleware records nothing for the refusal. |
+| Consumer without the middleware crashes while running a claim it did not start | The claim is handed back uncharged, and the task can crash the process again without limit. Start claims with `PgAck::start`. |
 | Payload does not decode | The row is released through its budget (`Failed`, then `Killed`) with bounded retries; persistent failure retires the name. |
 | Handler hangs | Nothing: liveness is per worker, not per task. The row stays `Running` while the heartbeat continues (`STALE_RUNNING_JOBS` counts it after an hour). Bound handlers with a timeout layer. |
 
