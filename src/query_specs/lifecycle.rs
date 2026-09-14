@@ -823,6 +823,186 @@ fn returned_to_the_queue(
     })
 }
 
+/// Claim-and-release rounds on each side of the prune race.
+const PRUNE_RACE_ROUNDS: usize = 300;
+
+/// A stale, token-free registration is claimed through `apalis.get_jobs` and
+/// released again, over and over, while prune batches run beside it. Returns
+/// how many batches failed on the foreign key from `apalis.jobs`, and how many
+/// failed for another reason.
+async fn prune_beside_repeated_claims() -> Result<Outcome<(usize, usize)>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-prune-race-{}", Ulid::new());
+    let worker = format!("prune-race-worker-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let run = async {
+        {
+            let (queue, worker) = (queue.clone(), worker.clone());
+            with_conn(pool.clone(), move |conn| {
+                seed_worker(conn, &queue, &worker, None, 3_600)?;
+                seed_job(
+                    conn,
+                    &queue,
+                    &JobSeed {
+                        status: "Pending",
+                        attempts: 0,
+                        max_attempts: 1_000_000,
+                        owner: None,
+                        done_at_age_secs: None,
+                        run_at_age_secs: 60,
+                        last_result: None,
+                    },
+                )
+                .map(drop)
+            })
+            .await?;
+        }
+        let claimer = {
+            let (pool, queue, worker) = (pool.clone(), queue.clone(), worker.clone());
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let mut conn = pool.get().map_err(|e| e.to_string())?;
+                for _ in 0..PRUNE_RACE_ROUNDS {
+                    sql_query(
+                        "INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at)
+                         VALUES ($1, $2, 'PostgresStorage', '', clock_timestamp() - INTERVAL '1 hour', clock_timestamp())
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind::<Text, _>(&worker)
+                    .bind::<Text, _>(&queue)
+                    .execute(&mut conn)
+                    .map_err(|e| e.to_string())?;
+                    // The prune may delete the registration first; the claim
+                    // then fails, which is what pruning a stale name means.
+                    let _ = sql_query("SELECT id FROM apalis.get_jobs($1, $2, 1)")
+                        .bind::<Text, _>(&worker)
+                        .bind::<Text, _>(&queue)
+                        .execute(&mut conn);
+                    sql_query(
+                        "UPDATE apalis.jobs SET status = 'Pending', lock_by = NULL, lock_at = NULL
+                         WHERE job_type = $1 AND status = 'Queued'",
+                    )
+                    .bind::<Text, _>(&queue)
+                    .execute(&mut conn)
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+        };
+        let pruner = {
+            let (pool, queue) = (pool.clone(), queue.clone());
+            tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
+                let mut conn = pool.get().map_err(|e| e.to_string())?;
+                let (mut foreign_key, mut other) = (0, 0);
+                for _ in 0..PRUNE_RACE_ROUNDS {
+                    match retention::prune_workers_batch(&mut conn, &queue, Duration::from_secs(60), 10)
+                    {
+                        Ok(_) => {}
+                        Err(crate::Error::Database {
+                            source:
+                                diesel::result::Error::DatabaseError(
+                                    diesel::result::DatabaseErrorKind::ForeignKeyViolation,
+                                    _,
+                                ),
+                            ..
+                        }) => foreign_key += 1,
+                        Err(_) => other += 1,
+                    }
+                }
+                Ok((foreign_key, other))
+            })
+        };
+        claimer.await.map_err(|e| e.to_string())??;
+        pruner.await.map_err(|e| e.to_string())?
+    }
+    .await;
+    cleanup_queue(pool, queue).await?;
+    run.map(Outcome::Completed)
+}
+
+fn no_batch_failed() -> impl Fn(&Result<Outcome<(usize, usize)>, String>) -> AssertionResult {
+    observe::<(usize, usize), _>("prune beside claims", |(foreign_key, other)| {
+        if *foreign_key == 0 && *other == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected every prune batch to skip a registration claimed meanwhile; {foreign_key} failed on the foreign key and {other} otherwise"
+            ))
+        }
+    })
+}
+
+/// Rows deleted by a prune delete step, and the registrations left.
+type DeleteStep = (usize, Vec<String>);
+
+/// The delete step of a prune batch, handed two locked candidates of which one
+/// was claimed after the candidates were selected. Returns how many rows it
+/// deleted and which registrations remain.
+async fn delete_step_with_a_claimed_candidate() -> Result<Outcome<DeleteStep>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-prune-delete-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let run = {
+        let queue = queue.clone();
+        with_conn(pool.clone(), move |conn| {
+            #[derive(QueryableByName)]
+            struct Name {
+                #[diesel(sql_type = Text)]
+                id: String,
+            }
+            seed_worker(conn, &queue, "unreferenced", None, 3_600)?;
+            seed_worker(conn, &queue, "claimed", None, 3_600)?;
+            seed_job(
+                conn,
+                &queue,
+                &JobSeed {
+                    status: "Queued",
+                    attempts: 0,
+                    max_attempts: 3,
+                    owner: Some("claimed"),
+                    done_at_age_secs: None,
+                    run_at_age_secs: 60,
+                    last_result: None,
+                },
+            )?;
+            let deleted = retention::delete_unreferenced_registrations(
+                conn,
+                &queue,
+                vec!["unreferenced".to_owned(), "claimed".to_owned()],
+            )
+            .map_err(|e| e.to_string())?;
+            let remaining =
+                sql_query("SELECT id FROM apalis.workers WHERE worker_type = $1 ORDER BY id")
+                    .bind::<Text, _>(&queue)
+                    .load::<Name>(conn)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|name| name.id)
+                    .collect();
+            Ok((deleted, remaining))
+        })
+        .await
+    };
+    cleanup_queue(pool, queue).await?;
+    run.map(Outcome::Completed)
+}
+
+fn keeps_the_claimed_candidate() -> impl Fn(&Result<Outcome<DeleteStep>, String>) -> AssertionResult
+{
+    observe::<DeleteStep, _>("prune delete step", |(deleted, remaining)| {
+        if *deleted == 1 && remaining.as_slice() == ["claimed".to_owned()] {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the unreferenced registration deleted and the claimed one kept, without an error; deleted {deleted}, remaining {remaining:?}"
+            ))
+        }
+    })
+}
+
 fn deletes_exactly(expected: usize) -> impl Fn(&Result<Outcome<usize>, String>) -> AssertionResult {
     observe::<usize, _>("batch under a rescanning plan", move |deleted| {
         if *deleted == expected {
@@ -1177,6 +1357,14 @@ lets_expect! { #tokio_test
                 to hands_it_back_uncharged_because_the_worker_stopped_on_purpose { returned_to_the_queue(1, false) }
             }
         }
+    }
+
+    expect(delete_step_with_a_claimed_candidate().await) as deleting_a_locked_prune_batch {
+        to keeps_a_candidate_claimed_after_the_candidates_were_selected { keeps_the_claimed_candidate() }
+    }
+
+    expect(prune_beside_repeated_claims().await) as pruning_beside_claims_of_the_same_registration {
+        to never_fails_a_batch_on_a_claim_committed_meanwhile { no_batch_failed() }
     }
 
     expect(run_batch_under_a_rescanning_plan(batch).await) as a_batch_under_a_plan_that_rescans_its_candidates {

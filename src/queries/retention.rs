@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use diesel::{
-    PgConnection, QueryableByName, RunQueryDsl, sql_query,
-    sql_types::{BigInt, Double, Text},
+    Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
+    sql_types::{Array, BigInt, Double, Text},
 };
 
 use crate::{
@@ -21,9 +21,9 @@ use crate::{
 /// than this many rows at once; a larger backlog drains across statements.
 pub(crate) const PURGE_BATCH_LIMIT: i64 = 10_000;
 
-/// Registrations deleted per statement by [`prune_workers`]. Every deleted
-/// row also runs the foreign-key probe over the queue's history, so the
-/// batch stays as small as the orphan sweep's.
+/// Registrations locked, and then deleted, per batch by [`prune_workers`].
+/// Every deleted row also runs the foreign-key probe over the queue's
+/// history, so the batch stays as small as the orphan sweep's.
 pub(crate) const PRUNE_BATCH_LIMIT: i64 = 1_000;
 
 #[derive(QueryableByName)]
@@ -134,38 +134,99 @@ pub(crate) fn validate_prune_window(config: &Config, stale_for: Duration) -> Res
 }
 
 /// Delete one batch of registrations of `queue` that have been stale for at
-/// least `stale_for` and that no job references any more. A row another
-/// transaction holds (a claim, a takeover, a release) is skipped rather than
-/// waited for: it is in use by definition. The foreign key from
-/// `apalis.jobs.lock_by` remains the last line of defense, so a row that
-/// still owns history cannot disappear.
+/// least `stale_for` and that no job references any more, and return how
+/// many were deleted. A row another transaction holds (a claim, a takeover, a
+/// release) is skipped rather than waited for: it is in use by definition. A
+/// registration claimed while the batch selects its candidates is kept.
+#[cfg(all(test, feature = "tokio"))]
 pub(crate) fn prune_workers_batch(
     conn: &mut PgConnection,
     queue: &str,
     stale_for: Duration,
     limit: i64,
 ) -> Result<usize, Error> {
-    // Select the batch once, for the reason given in `purge_terminal_batch`.
-    sql_query(
-        "WITH candidates AS MATERIALIZED (
-            SELECT w.id, w.worker_type FROM apalis.workers w
-            WHERE w.worker_type = $1
-                AND EXTRACT(EPOCH FROM (clock_timestamp() - w.last_seen)) >= $2
-                AND NOT EXISTS (
-                    SELECT 1 FROM apalis.jobs j
-                    WHERE j.job_type = w.worker_type AND j.lock_by = w.id
-                )
-            ORDER BY w.id
-            LIMIT $3
-            FOR UPDATE SKIP LOCKED
+    prune_workers_batch_counted(conn, queue, stale_for, limit).map(|batch| batch.deleted)
+}
+
+/// How many registrations one prune batch locked and how many it deleted.
+struct PruneBatch {
+    locked: usize,
+    deleted: usize,
+}
+
+fn prune_workers_batch_counted(
+    conn: &mut PgConnection,
+    queue: &str,
+    stale_for: Duration,
+    limit: i64,
+) -> Result<PruneBatch, Error> {
+    #[derive(QueryableByName)]
+    struct Candidate {
+        #[diesel(sql_type = Text)]
+        id: String,
+    }
+    conn.transaction(|tx| {
+        // Lock the batch first. The reference check here reads this
+        // statement's snapshot, so a claim that commits before a candidate is
+        // locked can still reference it; deleting in the same statement would
+        // then fail the whole batch on the foreign key. The delete checks
+        // again under a later snapshot, taken after the locks, which no new
+        // claim can pass because a claim needs a share lock on the
+        // registration. A plain locking SELECT runs once, so the batch keeps
+        // its limit.
+        let candidates = sql_query(
+            "SELECT w.id FROM apalis.workers w
+             WHERE w.worker_type = $1
+                 AND EXTRACT(EPOCH FROM (clock_timestamp() - w.last_seen)) >= $2
+                 AND NOT EXISTS (
+                     SELECT 1 FROM apalis.jobs j
+                     WHERE j.job_type = w.worker_type AND j.lock_by = w.id
+                 )
+             ORDER BY w.id
+             LIMIT $3
+             FOR UPDATE SKIP LOCKED",
         )
-        DELETE FROM apalis.workers USING candidates
-        WHERE apalis.workers.id = candidates.id
-            AND apalis.workers.worker_type = candidates.worker_type",
+        .bind::<Text, _>(queue)
+        .bind::<Double, _>(timeout_seconds(stale_for))
+        .bind::<BigInt, _>(limit)
+        .load::<Candidate>(tx)
+        .map_err(Error::database("locking stale workers to prune"))?;
+        let locked = candidates.len();
+        let deleted = if locked == 0 {
+            0
+        } else {
+            delete_unreferenced_registrations(
+                tx,
+                queue,
+                candidates
+                    .into_iter()
+                    .map(|candidate| candidate.id)
+                    .collect(),
+            )?
+        };
+        Ok(PruneBatch { locked, deleted })
+    })
+}
+
+/// Delete the registrations `ids` of `queue` that no job references under
+/// this statement's snapshot. Prune calls it with those registrations locked,
+/// so no claim can reference one between the check and the delete.
+pub(crate) fn delete_unreferenced_registrations(
+    conn: &mut PgConnection,
+    queue: &str,
+    ids: Vec<String>,
+) -> Result<usize, Error> {
+    sql_query(
+        "DELETE FROM apalis.workers w
+         WHERE w.worker_type = $1
+             AND w.id = ANY($2)
+             AND NOT EXISTS (
+                 SELECT 1 FROM apalis.jobs j
+                 WHERE j.job_type = w.worker_type AND j.lock_by = w.id
+             )",
     )
     .bind::<Text, _>(queue)
-    .bind::<Double, _>(timeout_seconds(stale_for))
-    .bind::<BigInt, _>(limit)
+    .bind::<Array<Text>, _>(ids)
     .execute(conn)
     .map_err(Error::database("pruning stale workers"))
 }
@@ -182,12 +243,15 @@ pub(crate) async fn prune_workers(
     let mut total = 0;
     loop {
         let batch_queue = queue.clone();
-        let deleted = with_conn(pool.clone(), move |conn| {
-            prune_workers_batch(conn, &batch_queue, stale_for, PRUNE_BATCH_LIMIT)
+        let batch = with_conn(pool.clone(), move |conn| {
+            prune_workers_batch_counted(conn, &batch_queue, stale_for, PRUNE_BATCH_LIMIT)
         })
         .await?;
-        total += deleted;
-        if i64::try_from(deleted).is_ok_and(|deleted| deleted < PRUNE_BATCH_LIMIT) {
+        total += batch.deleted;
+        // A batch that locked fewer rows than its limit found every prunable
+        // row. One whose candidates were claimed meanwhile deletes fewer than
+        // it locked, and the next batch goes on.
+        if i64::try_from(batch.locked).is_ok_and(|locked| locked < PRUNE_BATCH_LIMIT) {
             return Ok(total);
         }
     }
