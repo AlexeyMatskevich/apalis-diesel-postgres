@@ -116,6 +116,15 @@ enum Recovery {
 }
 
 impl Recovery {
+    /// Whether a claim that no handler started is charged too. A worker that
+    /// failed may have failed on that claim, for example while decoding its
+    /// payload, so the sweep and a takeover charge it and a task that crashes
+    /// its workers reaches `Killed`. A worker that released its registration
+    /// stopped on purpose, so its buffered claims keep their budget.
+    fn charges_unstarted(self) -> bool {
+        !matches!(self, Self::Release)
+    }
+
     fn result(self) -> serde_json::Value {
         let message = match self {
             Self::StaleSweep | Self::Takeover => "Re-enqueued due to worker heartbeat timeout.",
@@ -125,12 +134,14 @@ impl Recovery {
     }
 }
 
-/// Hand the active claims of `workers` back. A `Queued` row was claimed but
-/// no handler started it, so it keeps its attempt count and its last result;
-/// a `Running` row may have executed partially, so it consumes one attempt
-/// and records the reason when it had no result yet. Either row becomes
-/// `Pending`, or `Killed` with the reason when its budget leaves no attempt:
-/// recovery never leaves a row waiting that no claim can take.
+/// Hand the active claims of `workers` back. A `Running` row may have
+/// executed partially, so it consumes one attempt and records the reason when
+/// it had no result yet. A `Queued` row was claimed but no handler started it:
+/// a release keeps its attempt count and last result, while the sweep and a
+/// takeover charge it like a `Running` row (`Recovery::charges_unstarted`).
+/// Every row becomes `Pending`, or `Killed` with the reason when its budget
+/// leaves no attempt: recovery never leaves a row waiting that no claim can
+/// take.
 fn recover_owned(
     conn: &mut PgConnection,
     queue: &str,
@@ -150,8 +161,8 @@ fn recover_owned(
     // more rows as earlier candidates leave the active states.
     sql_query(format!(
         "WITH candidates AS MATERIALIZED (
-        SELECT id, max_attempts, status = 'Running' AS started,
-            CASE WHEN status = 'Running' THEN LEAST(attempts::bigint+1,max_attempts)
+        SELECT id, max_attempts, (status = 'Running' OR $5) AS charged,
+            CASE WHEN status = 'Running' OR $5 THEN LEAST(attempts::bigint+1,max_attempts)
                  ELSE attempts::bigint END AS next_attempts
         FROM apalis.jobs WHERE job_type=$1 AND lock_by=ANY($2)
             AND status IN ('Running','Queued') ORDER BY id LIMIT $3 FOR UPDATE {skip}
@@ -162,7 +173,7 @@ fn recover_owned(
         lock_by=NULL, lock_at=NULL,
         attempts=candidates.next_attempts::integer,
         last_result=CASE WHEN candidates.next_attempts>=candidates.max_attempts
-                OR (candidates.started AND apalis.jobs.last_result IS NULL)
+                OR (candidates.charged AND apalis.jobs.last_result IS NULL)
             THEN $4 ELSE apalis.jobs.last_result END
         FROM candidates
         WHERE apalis.jobs.status IN ('Running','Queued') AND apalis.jobs.id=candidates.id"
@@ -171,6 +182,7 @@ fn recover_owned(
     .bind::<Array<Text>, _>(workers)
     .bind::<Nullable<BigInt>, _>(bounded.then_some(i64::from(REENQUEUE_ORPHANED_BATCH_LIMIT)))
     .bind::<Jsonb, _>(recovery.result())
+    .bind::<Bool, _>(recovery.charges_unstarted())
     .execute(conn)
     .map_err(Error::database("re-enqueueing orphaned jobs"))
 }

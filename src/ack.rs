@@ -2451,15 +2451,13 @@ impl PgAck {
     /// Start a claimed task right before running it without the backend
     /// middleware.
     ///
-    /// A claim stays `Queued` until it is started, and recovery (the stale
-    /// sweep, a takeover, [`PostgresStorage::release_worker`]) hands a
-    /// `Queued` claim back without charging an attempt. The middleware returned
-    /// by `Backend::middleware()` starts every task it dispatches; a consumer
-    /// that takes tasks from a storage's stream and runs them itself calls this
-    /// first. A task that crashes the process after its start consumes an
-    /// attempt on recovery and is eventually killed. A claim run without a
-    /// start is handed back uncharged, so such a task can crash the process
-    /// again without limit.
+    /// A claim stays `Queued` until it is started, and
+    /// [`PostgresStorage::release_worker`] hands a `Queued` claim back without
+    /// charging an attempt. The middleware returned by `Backend::middleware()`
+    /// starts every task it dispatches; a consumer that takes tasks from a
+    /// storage's stream and runs them itself calls this first, so a release
+    /// charges the claims it was running and a claim lost in the meantime is
+    /// refused before it runs.
     ///
     /// Keep the task's `Parts` from the claim, including `data`, as for an
     /// acknowledgement. Starting a claim this process already started is

@@ -380,10 +380,9 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
             .unwrap()
             .unwrap()
             .unwrap();
-        // Recovery charges an attempt only for a claim that was started.
-        let charged = usize::from(matches!(path, Path::Fallback));
+        // A takeover charges every claim of the incumbent, started or not.
         observation.recovered =
-            recovered.parts.task_id == Some(id) && recovered.parts.attempt.current() == charged;
+            recovered.parts.task_id == Some(id) && recovered.parts.attempt.current() == 1;
         recovered.parts.attempt = Attempt::new_with_value(2);
         recovered.parts.data.insert(worker.clone());
         let mut service = replacement.middleware().layer(Handler(effects.clone()));
@@ -392,8 +391,8 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
             .unwrap();
         service.call(recovered).await.unwrap();
         let done = replacement.fetch_by_id(&id).await.unwrap().unwrap();
-        observation.recovered &= done.parts.status.load().to_string() == "Done"
-            && done.parts.attempt.current() == charged + 1;
+        observation.recovered &=
+            done.parts.status.load().to_string() == "Done" && done.parts.attempt.current() == 2;
         drop(next);
         observation.effects = effects.load(Ordering::SeqCst);
     }

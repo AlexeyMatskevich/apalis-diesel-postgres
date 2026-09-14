@@ -58,9 +58,10 @@ predicates tolerate the result as described in section 3):
 - `Done` and `Killed` rows have `done_at`.
 - `attempts` never decreases. A migration repair and an administrator
   restoring retry budget are the only writers that change it otherwise.
-- Every transition out of `Running` increments `attempts`. A `Queued` row
-  handed back keeps its count; section 4 describes how the start keeps two
-  claims that share an epoch from both running.
+- Every transition out of `Running` increments `attempts`, and so does
+  recovering a `Queued` row after its worker failed. A `Queued` row that
+  `release_worker` hands back keeps its count; section 4 describes how the
+  start keeps two claims that share an epoch from both running.
 
 ## 3. Transitions
 
@@ -80,16 +81,19 @@ reports `StaleAcknowledgement`, a release reports zero rows.
 | 7 | `Queued`, `Running` → `Done`, `Failed`, `Killed` | acknowledge (`PgAck`, middleware, a stream consumer acknowledging its claims) | `id`, `job_type`, `lock_by`, `lock_at`, `attempts` equal the claim epoch; status `Queued` or `Running`; the token owns the registration when the acknowledger carries one | `status`, `last_result`, `done_at = now`; owner columns kept | claim `+ 1` |
 | 8 | `Queued` → `Failed`, `Killed` | release of an undecodable payload | the claim epoch | `last_result` = codec error, `done_at = now`; owner kept | `+ 1` |
 | 9 | `Queued` → `Killed` | quarantine of a structurally malformed row (id or status unreadable) | the row was just claimed | owner cleared, `last_result` = conversion error, `done_at = now` | `+ 1` |
-| 10 | `Running`, `Queued` → `Pending`, `Killed` | recovery: stale-worker sweep, registration takeover, `release_worker` | the owner is stale, taken over, or releasing | owner cleared; `done_at` null for `Pending`, now for `Killed`; `last_result` set when a `Running` row had none, and when killed | `Running`: `+ 1`; `Queued`: unchanged |
+| 10 | `Running`, `Queued` → `Pending`, `Killed` | recovery: stale-worker sweep, registration takeover, `release_worker` | the owner is stale, taken over, or releasing | owner cleared; `done_at` null for `Pending`, now for `Killed`; `last_result` set when a charged row had none, and when killed | `+ 1`, except a `Queued` row that `release_worker` hands back: unchanged |
 | 11 | terminal → ∅ | retention (`purge_terminal_tasks`, `Vacuum`) | terminal and older than the window | row deleted | |
 
 The status written by 7, 8 and 10 follows one rule: with budget left after
 the increment (`attempts + 1 < max_attempts`) a failed execution becomes
 `Failed` (7, 8) or `Pending` (10); otherwise it becomes `Killed`. A
-successful acknowledgement is always `Done`. A `Queued` row handed back by
-10 never started, so nothing is charged: it becomes `Pending` with its count
-unchanged, or `Killed` when that count already leaves no attempt, which only
-a row edited outside this crate can carry because a claim requires budget.
+successful acknowledgement is always `Done`. The sweep and a takeover charge a
+`Queued` row like a `Running` one: its worker failed, possibly on that claim,
+for example while decoding it. A `Queued` row that `release_worker` hands
+back never started and its worker stopped on purpose, so nothing is charged:
+it becomes `Pending` with its count unchanged, or `Killed` when that count
+already leaves no attempt, which only a row edited outside this crate can
+carry because a claim requires budget.
 
 There is no transition out of a terminal state and no rescheduling of an
 active row. An administrator who wants to run a `Killed` task again restores
@@ -104,10 +108,10 @@ stateDiagram-v2
     Queued --> Running: start by the owner, or lock
     Pending --> Running: lock
     Failed --> Running: lock
-    Queued --> Pending: recovery, nothing charged
+    Queued --> Pending: release uncharged, or recovery after a failure, budget left
     Queued --> Done: ack Ok by a stream consumer
     Queued --> Failed: undecodable payload or ack Err, budget left
-    Queued --> Killed: undecodable or malformed payload, ack Err, budget exhausted
+    Queued --> Killed: undecodable or malformed payload, ack Err or recovery after a failure, budget exhausted
     Running --> Done: ack Ok
     Running --> Failed: ack Err, budget left
     Running --> Killed: ack Err, budget exhausted
@@ -127,7 +131,7 @@ row to still carry exactly that epoch:
 - `lock_at` is truncated to the second; the epoch therefore relies on
   `attempts` to separate two claims of the same task by the same worker, and
   every transition out of `Running` increments `attempts`. A `Queued` row
-  handed back keeps its count, so a new claim of it by the same name within
+  handed back by a release keeps its count, so a new claim of it by the same name within
   the same second repeats the epoch. The start admits one of the two: a
   claim this process has not started requires status `Queued`, and only a
   re-dispatch of a claim this process already started, such as a retry
@@ -153,12 +157,11 @@ row to still carry exactly that epoch:
 ## 5. Retry budget
 
 `attempts` counts completed executions and lost ones; it grows by one per
-acknowledgement, undecodable release, quarantine, and recovery of a started
-(`Running`) row. Handing back a `Queued` claim that no handler started
-charges nothing. A consumer that runs claims without the backend middleware
-starts each one with `PgAck::start`; a claim it runs without starting is
-handed back uncharged, so a task that crashes the process is retried without
-limit. `max_attempts` is
+acknowledgement, undecodable release, quarantine, and recovery, except when
+`release_worker` hands back a `Queued` claim that no handler started. A codec
+that panics on a payload counts as an undecodable payload. A consumer that
+runs claims without the backend middleware starts each one with
+`PgAck::start`, so a release charges the claims it was running. `max_attempts` is
 fixed at enqueue. A `Failed` row is eligible for its next claim at once:
 the backend adds no delay between attempts. Delay a retry from the handler,
 or enqueue with a later `run_at` and a smaller budget, when the failure is
@@ -284,10 +287,10 @@ waiting.
 | Claim fails before any row was claimed | The task stream yields the error; nothing is owned. |
 | Claim transaction produced rows but the commit was not confirmed | `ClaimOutcomeUnknown`; the name is retired locally so recovery can proceed. |
 | Acknowledgement fails or is lost | The storage's acknowledger retires the name; the row stays `Running`, or `Queued` for a claim that was never started, until recovery. `PgAck::new` and `with_lease_token` bind no liveness and leave the heartbeat running. |
-| Start fails (pool timeout, connection lost) | The dispatch aborts before the handler and the name is retired locally. Recovery hands the claim back after the stale deadline, charging an attempt only if the start had committed unseen. |
+| Start fails (pool timeout, connection lost) | The dispatch aborts before the handler and the name is retired locally. Recovery hands the claim back after the stale deadline and charges it. |
 | Start matches nothing | `ClaimLost`: the claim was recovered, released, taken over, or started by another claim of its epoch. The handler does not run and the worker continues. An acknowledger attached outside the middleware records nothing for the refusal. |
-| Consumer without the middleware crashes while running a claim it did not start | The claim is handed back uncharged, and the task can crash the process again without limit. Start claims with `PgAck::start`. |
-| Payload does not decode | The row is released through its budget (`Failed`, then `Killed`) with bounded retries; persistent failure retires the name. |
+| Process crashes on a claim, started or not | Recovery after the stale deadline, by the sweep or a takeover, charges every claim the worker held, so a task that crashes the process reaches `Killed`. |
+| Payload does not decode, or the codec panics on it | The row is released through its budget (`Failed`, then `Killed`) with bounded retries; persistent failure retires the name. |
 | Handler hangs | Nothing: liveness is per worker, not per task. The row stays `Running` while the heartbeat continues (`STALE_RUNNING_JOBS` counts it after an hour). Bound handlers with a timeout layer. |
 
 ## 7. Queue lifecycle

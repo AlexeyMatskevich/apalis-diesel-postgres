@@ -11,9 +11,9 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 - `PgAck::start` starts a claimed task for a consumer that takes tasks from a
   storage's stream and runs them without the backend middleware. A claim
-  stays `Queued` until it is started, and recovery charges an attempt only
-  for a started claim, so such a consumer starts each claim before running
-  it; a claim lost in the meantime is refused with `ClaimLost`.
+  stays `Queued` until it is started, and a release hands a `Queued` claim
+  back uncharged, so such a consumer starts each claim before running it; a
+  claim lost in the meantime is refused with `ClaimLost`.
 - `PostgresStorage::release_worker` hands a stopped worker's registration
   back: every `Running` or `Queued` task it still owns returns to the queue,
   charged one attempt only when its handler had started, the lease token is
@@ -54,12 +54,13 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 ### Changed (breaking)
 
 - A claimed task stays `Queued` until the backend middleware starts it,
-  right before its handler runs; only then does it become `Running`. The
-  stale sweep, a takeover and `release_worker` hand a `Queued` task back to
-  `Pending` without consuming an attempt or recording a result, so the tasks
-  a poll fetcher had buffered when its worker stopped or died keep their
-  budget; before, each lost an attempt, and a task allowed one attempt was
-  killed without running. A dispatch whose claim was recovered, released,
+  right before its handler runs; only then does it become `Running`.
+  `release_worker` hands a `Queued` task back to `Pending` without consuming
+  an attempt or recording a result, so the tasks a poll fetcher had buffered
+  when its worker stopped keep their budget; before, each lost an attempt,
+  and a task allowed one attempt was killed without running. The stale sweep
+  and a takeover still charge every claim of a worker that failed, started
+  or not, so a task that crashes the process still reaches `Killed`. A dispatch whose claim was recovered, released,
   or taken over in the meantime is refused before the handler runs with the
   new `Error::ClaimLost`, and the worker continues. An acknowledger attached
   outside the middleware records nothing for that refusal. Every refusal before the
@@ -70,7 +71,7 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   buffered claims as `Queued`, and `running_jobs` counts only started tasks.
   A stream consumer that acknowledges without the middleware acknowledges
   `Queued` rows as before; one that runs tasks starts each claim with
-  `PgAck::start`, or a task that crashes the process is handed back uncharged.
+  `PgAck::start`, so a release charges the claims it was running.
 - Registration and the heartbeat stream refuse a schedule that cannot keep
   a registration fresh: `keep_alive` must be greater than zero and shorter
   than `reenqueue_orphaned_after`, or the first stream item is
@@ -112,6 +113,10 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ### Fixed
 
+- A codec that panicked while decoding a claimed payload took the worker
+  down, and the claim waited for recovery. The panic is now treated as an
+  undecodable payload: the row is released through its retry budget and the
+  rest of the batch is delivered.
 - The heartbeat stream could renew before the task stream had registered the
   name: Apalis polls both streams from the start, so a registration that took
   longer than one `keep_alive` (a slow database, a large startup sweep, a

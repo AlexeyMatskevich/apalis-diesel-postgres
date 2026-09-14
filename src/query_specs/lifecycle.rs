@@ -3,7 +3,7 @@
 //! stale registrations. SQL is used only for fixtures and observations.
 
 use crate::{
-    PgPool,
+    Config, PgPool,
     queries::{retention, worker},
     test_support as support,
 };
@@ -731,6 +731,98 @@ async fn run_batch_under_a_rescanning_plan(
     run.map(Outcome::Completed)
 }
 
+/// How a claim returns to the queue without its worker acknowledging it.
+#[derive(Clone, Copy, Debug)]
+enum RecoveryKind {
+    /// The periodic sweep of a registration past its deadline.
+    StaleSweep,
+    /// A fresh token registering the name of a stale incumbent.
+    Takeover,
+    /// The worker releasing its own registration after it stopped.
+    Release,
+}
+
+/// One claim, seeded with one attempt of three, recovered by `kind`.
+async fn recover_claim(
+    kind: RecoveryKind,
+    status: &'static str,
+) -> Result<Outcome<JobAfter>, String> {
+    let Some(pool) = test_pool().await? else {
+        return Ok(Outcome::Skipped);
+    };
+    let queue = format!("apalis-spec-recovery-{}", Ulid::new());
+    let worker = format!("recovery-worker-{}", Ulid::new());
+    cleanup_queue(pool.clone(), queue.clone()).await?;
+    let run = {
+        let queue = queue.clone();
+        with_conn(pool.clone(), move |conn| {
+            let age = match kind {
+                RecoveryKind::Release => 0,
+                RecoveryKind::StaleSweep | RecoveryKind::Takeover => 3_600,
+            };
+            seed_worker(conn, &queue, &worker, Some(HELD_TOKEN), age)?;
+            let id = seed_job(
+                conn,
+                &queue,
+                &JobSeed {
+                    status,
+                    attempts: 1,
+                    max_attempts: 3,
+                    owner: Some(&worker),
+                    done_at_age_secs: None,
+                    run_at_age_secs: 1,
+                    last_result: None,
+                },
+            )?;
+            match kind {
+                RecoveryKind::StaleSweep => worker::reenqueue_orphaned_blocking(
+                    conn,
+                    &Config::new(&queue).set_reenqueue_orphaned_after(Duration::from_secs(60)),
+                )
+                .map(drop),
+                RecoveryKind::Takeover => worker::register_worker_blocking(
+                    conn,
+                    &queue,
+                    &WorkerContext::new::<()>(&worker),
+                    "PostgresStorage",
+                    "successor-token",
+                    Duration::from_secs(60),
+                ),
+                RecoveryKind::Release => {
+                    worker::release_worker_blocking(conn, &queue, &worker, HELD_TOKEN).map(drop)
+                }
+            }
+            .map_err(|e| e.to_string())?;
+            job_after(conn, &id)
+        })
+        .await
+    };
+    cleanup_queue(pool, queue).await?;
+    run.map(Outcome::Completed)
+}
+
+/// An unowned `Pending` row with `attempts` and, when `charged`, the
+/// recovery's reason as its result.
+fn returned_to_the_queue(
+    attempts: i32,
+    charged: bool,
+) -> impl Fn(&Result<Outcome<JobAfter>, String>) -> AssertionResult {
+    observe::<JobAfter, _>("recovered claim", move |job| {
+        if job.status == "Pending"
+            && job.attempts == attempts
+            && job.lock_by.is_none()
+            && !job.done_at_present
+            && job.last_result.is_some() == charged
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected an unowned Pending row with {attempts} attempt(s) and a recorded reason={charged}; got {job:?}"
+            ))
+        }
+    })
+}
+
 fn deletes_exactly(expected: usize) -> impl Fn(&Result<Outcome<usize>, String>) -> AssertionResult {
     observe::<usize, _>("batch under a rescanning plan", move |deleted| {
         if *deleted == expected {
@@ -1057,6 +1149,34 @@ lets_expect! { #tokio_test
 
     expect(run_batched_purge().await) as a_purge_larger_than_one_batch {
         to drains_the_backlog_across_batches { drains_in_batches() }
+    }
+
+    expect(recover_claim(kind, status).await) as recovering_a_claim {
+        let kind = RecoveryKind::StaleSweep;
+        let status = "Running";
+        to charges_the_execution_that_may_have_run { returned_to_the_queue(2, true) }
+        when the_claim_never_started {
+            let status = "Queued";
+            // A worker that died may have died on this claim, for example
+            // decoding it; charging keeps such a task from looping forever.
+            to charges_it_because_its_worker_failed { returned_to_the_queue(2, true) }
+        }
+        when a_fresh_token_takes_the_name_over {
+            let kind = RecoveryKind::Takeover;
+            to charges_the_execution_that_may_have_run { returned_to_the_queue(2, true) }
+            when the_claim_never_started {
+                let status = "Queued";
+                to charges_it_because_its_worker_failed { returned_to_the_queue(2, true) }
+            }
+        }
+        when the_worker_released_its_registration {
+            let kind = RecoveryKind::Release;
+            to charges_the_execution_that_may_have_run { returned_to_the_queue(2, true) }
+            when the_claim_never_started {
+                let status = "Queued";
+                to hands_it_back_uncharged_because_the_worker_stopped_on_purpose { returned_to_the_queue(1, false) }
+            }
+        }
     }
 
     expect(run_batch_under_a_rescanning_plan(batch).await) as a_batch_under_a_plan_that_rescans_its_candidates {

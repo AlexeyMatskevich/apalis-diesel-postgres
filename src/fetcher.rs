@@ -83,6 +83,16 @@ where
         .boxed()
 }
 
+/// The decode error of a row whose codec panicked on its payload.
+fn codec_panic(payload: Box<dyn std::any::Any + Send>) -> Error {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "the panic carried no message".to_owned());
+    Error::Decode(format!("the codec panicked: {message}").into())
+}
+
 /// Decode a compact task stream into an `Args`-typed task stream by mapping
 /// every yielded row through the configured codec. Shared between the polling
 /// and notify backends so the decode logic exists in exactly one place.
@@ -184,9 +194,18 @@ where
                                 *task.parts.ctx.lock_at(),
                                 i32::try_from(task.parts.attempt.current()),
                             );
-                            match task.try_map(|t| {
-                                Decode::decode(&t).map_err(|e| Error::Decode(e.into()))
-                            }) {
+                            // A codec that panics on a corrupt payload fails that
+                            // row like a reported decode error: the claim is
+                            // released through its budget and the batch goes
+                            // on, instead of the panic taking the worker down.
+                            let decoded =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                    task.try_map(|t| {
+                                        Decode::decode(&t).map_err(|e| Error::Decode(e.into()))
+                                    })
+                                }))
+                                .unwrap_or_else(|panic| Err(codec_panic(panic)));
+                            match decoded {
                                 Ok(decoded) => return Some((Ok(Some(decoded)), (compact, None))),
                                 Err(decode_error) => match identity {
                                     (Some(task_id), Some(lock_at), Ok(attempts)) => {

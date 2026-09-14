@@ -517,9 +517,9 @@ The middleware returned by `Backend::middleware()` and the acknowledger from
 `PostgresStorage::acknowledger()` carry that storage's registration token and
 local liveness. A consumer that takes tasks from the storage's stream and runs
 them without that middleware starts each claim with `PgAck::start` right
-before running it: a claim stays `Queued` until it is started, recovery hands
-a `Queued` claim back without charging an attempt, and a task that crashes
-the process before it was started would be retried without limit.
+before running it: a claim stays `Queued` until it is started, and a release
+hands a `Queued` claim back without charging an attempt, so a claim the
+consumer was running but never started would be handed back uncharged.
 `PgMiddleware::new`, `PgMiddleware::with_lease_token`,
 `PgAck::new` and `PgAck::with_lease_token` bind at most a token: like
 `lock_task`, they do not manage local retirement, so a dropped or failed
@@ -544,9 +544,9 @@ storage token cannot take over a still-fresh registration with the same name:
 restart may need to wait for the stale deadline unless the previous storage
 released its registration with `release_worker`. After the last committed
 heartbeat expires, another worker can recover unfinished tasks.
-Recovery charges one attempt for a task whose handler had started and
-respects the retry budget; a claimed task that never started returns
-uncharged. Taking over the
+Recovery after the deadline charges one attempt for every claim of the
+failed worker and respects the retry budget; only a release hands claims
+that never started back uncharged. Taking over the
 same worker name recovers all of that registration's claims before renewal;
 this can be a large transaction after a large in-flight batch.
 Storage clones retain one local liveness record per distinct worker name until

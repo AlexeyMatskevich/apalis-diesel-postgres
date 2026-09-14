@@ -365,8 +365,9 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// `Queued` task was claimed but never started, such as the tasks the
     /// poll fetcher buffered and the stopped worker never handed to a
     /// handler; it returns to `Pending` with its attempt count and result
-    /// unchanged. A task the worker acknowledged before stopping is not
-    /// touched.
+    /// unchanged. Orphan recovery after a failure charges `Queued` tasks as
+    /// well, because the failed worker may have failed on them. A task the
+    /// worker acknowledged before stopping is not touched.
     /// The registration row itself is kept because completed tasks reference
     /// it as their last owner; [`Self::prune_workers`] removes it once
     /// nothing references it any more.
