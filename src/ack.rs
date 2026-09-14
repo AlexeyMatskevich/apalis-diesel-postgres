@@ -1073,6 +1073,8 @@ mod tests {
         struct ValidationObservation {
             result: Result<(), BoxDynError>,
             handler_calls: usize,
+            /// The task's attempt counter after the dispatch.
+            attempt: usize,
             owner_retired: bool,
             cloned_owner_retired: bool,
             unrelated_retired: bool,
@@ -1117,10 +1119,12 @@ mod tests {
             futures::future::poll_fn(|cx| service.poll_ready(cx))
                 .await
                 .expect("recording handler is ready");
+            let attempt = task.parts.attempt.clone();
             let result = service.call(task).await;
             ValidationObservation {
                 result,
                 handler_calls: handler_calls.load(Ordering::SeqCst),
+                attempt: attempt.current(),
                 owner_retired: owner.is_retired(),
                 cloned_owner_retired: registry.clone().for_worker("validation-owner").is_retired(),
                 unrelated_retired: unrelated.is_retired(),
@@ -1456,6 +1460,9 @@ mod tests {
         struct StartObservation {
             outcome: String,
             handled: Vec<Status>,
+            /// The task's attempt counter after the dispatch; the claim was
+            /// fetched with a count of one.
+            attempt: usize,
             row_status: String,
             owner_retired: bool,
         }
@@ -1630,9 +1637,9 @@ mod tests {
                 futures::future::poll_fn(|cx| service.poll_ready(cx))
                     .await
                     .map_err(|e| e.to_string())?;
-                let result = service
-                    .call(claimed_task(id, &queue, &worker, lock_at, history))
-                    .await;
+                let task = claimed_task(id, &queue, &worker, lock_at, history);
+                let attempt = task.parts.attempt.clone();
+                let result = service.call(task).await;
                 let outcome = match &result {
                     Ok(()) => "ran".to_owned(),
                     Err(error) => match error
@@ -1652,6 +1659,7 @@ mod tests {
                 Ok::<_, String>(StartObservation {
                     outcome,
                     handled,
+                    attempt: attempt.current(),
                     row_status: row_status(pool.clone(), id).await?,
                     owner_retired: owner.is_retired(),
                 })
@@ -1664,6 +1672,7 @@ mod tests {
         fn started(
             outcome: &'static str,
             handled: &'static [Status],
+            attempt: usize,
             row_status: &'static str,
             owner_retired: bool,
         ) -> impl Fn(&Result<crate::test_support::Outcome<StartObservation>, String>) -> AssertionResult
@@ -1671,13 +1680,14 @@ mod tests {
             crate::test_support::observe::<StartObservation, _>("start of a claim", move |run| {
                 if run.outcome == outcome
                     && run.handled == handled
+                    && run.attempt == attempt
                     && run.row_status == row_status
                     && run.owner_retired == owner_retired
                 {
                     Ok(())
                 } else {
                     Err(format!(
-                        "expected {outcome} with the handler seeing {handled:?}, a {row_status} row and owner_retired={owner_retired}; got {run:?}"
+                        "expected {outcome} with the handler seeing {handled:?}, attempt counter {attempt}, a {row_status} row and owner_retired={owner_retired}; got {run:?}"
                     ))
                 }
             })
@@ -1751,6 +1761,7 @@ mod tests {
                 to retires_only_the_owner_when_the_start_cannot_reach_the_database {
                     have(result) be_err_and abort_pool_error,
                     have(handler_calls) equal(0),
+                        have(attempt) equal(1),
                     have(owner_retired) be_true,
                     have(cloned_owner_retired) be_true,
                     have(unrelated_retired) be_false
@@ -1761,6 +1772,7 @@ mod tests {
                     to retires_only_the_owner_without_calling_the_handler {
                         have(result) be_err_and abort_missing_field("queue"),
                         have(handler_calls) equal(0),
+                        have(attempt) equal(1),
                         have(owner_retired) be_true,
                         have(cloned_owner_retired) be_true,
                         have(unrelated_retired) be_false
@@ -1772,6 +1784,7 @@ mod tests {
                     to retires_only_the_owner_without_calling_the_handler {
                         have(result) be_err_and abort_missing_field("task_id"),
                         have(handler_calls) equal(0),
+                        have(attempt) equal(1),
                         have(owner_retired) be_true,
                         have(cloned_owner_retired) be_true,
                         have(unrelated_retired) be_false
@@ -1783,6 +1796,7 @@ mod tests {
                     to preserves_workers_after_a_known_acquisition_failure {
                         have(result) be_err_and abort_pool_error,
                         have(handler_calls) equal(0),
+                        have(attempt) equal(1),
                         have(owner_retired) be_false,
                         have(cloned_owner_retired) be_false,
                         have(unrelated_retired) be_false
@@ -1792,6 +1806,7 @@ mod tests {
                         to rejects_without_creating_a_completion_obligation {
                             have(result) be_err_and abort_missing_field("task_id"),
                             have(handler_calls) equal(0),
+                        have(attempt) equal(1),
                             have(owner_retired) be_false,
                             have(cloned_owner_retired) be_false,
                             have(unrelated_retired) be_false
@@ -1830,10 +1845,10 @@ mod tests {
             expect(preclaimed_redispatch(marker, dispatch).await) as a_claim_dispatched_again_in_process {
                 let marker = Marker::Unset;
                 let dispatch = Dispatch::Polled;
-                to reaches_the_database_to_start_the_claim_and_retires_the_worker_when_that_fails {
+                to reaches_the_database_to_start_the_claim_counts_the_dispatch_and_retires_the_worker_when_that_fails {
                     have(result) aborted_on_the_pool,
                     have(handler_calls) equal(0),
-                    have(attempt) equal(0),
+                    have(attempt) equal(1),
                     have(owner_retired) be_true
                 }
                 when the_dispatch_is_dropped_before_its_first_poll {
@@ -1916,60 +1931,60 @@ mod tests {
                 let history = ClaimHistory::Fresh;
                 let holder = Holder::Current;
                 to moves_the_row_to_running_before_the_handler_runs_once {
-                    started("ran", &[Status::Running], "Running", false)
+                    started("ran", &[Status::Running], 1, "Running", false)
                 }
                 when the_claim_was_recovered_before_the_dispatch {
                     let row = RowAtDispatch::Recovered;
                     to refuses_the_dispatch_and_keeps_the_worker_active {
-                        started("claim_lost", &[], "Pending", false)
+                        started("claim_lost", &[], 2, "Pending", false)
                     }
                 }
                 when the_task_was_claimed_again_at_a_later_second {
                     let row = RowAtDispatch::ReclaimedLater;
                     to refuses_the_dispatch_and_leaves_the_newer_claim_alone {
-                        started("claim_lost", &[], "Queued", false)
+                        started("claim_lost", &[], 2, "Queued", false)
                     }
                 }
                 when another_claim_of_the_same_epoch_already_started_the_row {
                     let row = RowAtDispatch::Started;
                     to refuses_the_second_start {
-                        started("claim_lost", &[], "Running", false)
+                        started("claim_lost", &[], 2, "Running", false)
                     }
                     when the_dispatch_repeats_a_claim_this_process_started {
                         let history = ClaimHistory::AlreadyStarted;
                         to runs_the_handler_again {
-                            started("ran", &[Status::Running], "Running", false)
+                            started("ran", &[Status::Running], 1, "Running", false)
                         }
                     }
                     when the_task_carries_no_claim_record {
                         let history = ClaimHistory::Unrecorded;
                         to starts_it_without_a_claim_identity_to_compare {
-                            started("ran", &[Status::Running], "Running", false)
+                            started("ran", &[Status::Running], 1, "Running", false)
                         }
                     }
                 }
                 when the_task_carries_no_claim_record {
                     let history = ClaimHistory::Unrecorded;
                     to moves_the_row_to_running_before_the_handler_runs_once {
-                        started("ran", &[Status::Running], "Running", false)
+                        started("ran", &[Status::Running], 1, "Running", false)
                     }
                 }
                 when another_token_owns_the_registration {
                     let holder = Holder::Replaced;
                     to refuses_the_dispatch_and_keeps_the_worker_active {
-                        started("claim_lost", &[], "Queued", false)
+                        started("claim_lost", &[], 2, "Queued", false)
                     }
                     when the_middleware_binds_no_token {
                         let holder = Holder::ReplacedUnbound;
                         to starts_the_claim_without_a_registration_fence {
-                            started("ran", &[Status::Running], "Running", false)
+                            started("ran", &[Status::Running], 1, "Running", false)
                         }
                     }
                 }
                 when the_worker_is_retired_locally {
                     let holder = Holder::RetiredLocally;
                     to starts_nothing_and_leaves_the_claim_for_recovery {
-                        started("retired", &[], "Queued", true)
+                        started("retired", &[], 2, "Queued", true)
                     }
                 }
             }
@@ -2340,7 +2355,9 @@ impl<S> Layer<S> for LockTaskLayer {
 /// [`Error::AlreadyAcknowledged`] inside an `AbortError` for the repeat, and
 /// the handler does not run again: the persisted retry budget schedules the
 /// next attempt. The refusal counts as a dispatch on the task's attempt
-/// counter so counter-based retry policies terminate.
+/// counter so counter-based retry policies terminate. Every other refusal
+/// before the handler, such as [`Error::ClaimLost`] or
+/// [`Error::WorkerRetired`], counts the same way.
 #[derive(Debug, Clone)]
 pub struct PgMiddleware {
     lock: LockTaskLayer,
@@ -2561,141 +2578,156 @@ where
         let mut ready_inner = std::mem::replace(&mut self.inner, clone);
 
         async move {
-            let worker_id =
-                worker_id.ok_or_else(|| AbortError::new(Error::MissingField("worker_context")))?;
-            let task_id = task_id.ok_or_else(|| AbortError::new(Error::MissingField("task_id")))?;
-            // Read the marker when the dispatch runs: an acknowledgement in
-            // flight when this future was created may have committed since.
-            if preclaimed && claim.as_ref().is_some_and(ClaimAttempt::is_acknowledged) {
-                // This claim's acknowledgement already committed: the database
-                // retry budget schedules any further attempt. Refuse before the
-                // handler runs, count the dispatch as the worker's Tracker
-                // would so counter-based retry layers converge, and keep the
-                // lease: no obligation was lost.
-                let _ = req.parts.attempt.increment();
-                completion_guard.disarm();
-                return Err(AbortError::new(Error::already_acknowledged(
-                    task_id.to_string(),
-                    queue.unwrap_or_default(),
-                    worker_id,
-                ))
-                .into());
-            }
-            if preclaimed {
-                // A retired worker starts nothing: its claims are handed
-                // back by the release or by recovery, without consuming an
-                // attempt while they are still `Queued`.
-                if let Some(lease) = &local_lease {
-                    if let Err(error) = lease.ensure_active() {
-                        completion_guard.disarm();
-                        return Err(AbortError::new(error).into());
-                    }
-                }
-                // The claim is `Queued`; start it under its epoch. A row that
-                // a sweep, a takeover or a release recovered in the meantime,
-                // or that another claim of the same epoch already started,
-                // matches nothing: the task runs elsewhere, so this dispatch
-                // is refused and nothing is owed.
-                let (lock_at, attempts, restart) = match claim.as_ref() {
-                    Some(claim) => (
-                        claim.lock_at,
-                        i32::try_from(claim.completed).ok(),
-                        claim.has_started(),
-                    ),
-                    // A manually assembled task has no claim identity to tell
-                    // a re-dispatch from a second claim; it starts either way.
-                    None => (
-                        *req.parts.ctx.lock_at(),
-                        i32::try_from(req.parts.attempt.current()).ok(),
-                        true,
-                    ),
-                };
-                // None of these refusals starts anything, so the claim stays
-                // owned and `Queued`: the armed guard retires the worker and
-                // recovery hands the claim back without charging it.
-                let Some(queue) = queue else {
-                    return Err(AbortError::new(Error::MissingField("queue")).into());
-                };
-                let Some(lock_at) = lock_at else {
-                    return Err(AbortError::new(Error::MissingField("lock_at")).into());
-                };
-                let Some(attempts) = attempts else {
-                    return Err(AbortError::new(Error::InvalidArgument(
-                        "task attempt counter does not fit the attempts column".to_owned(),
-                    ))
-                    .into());
-                };
-                let started = match queries::start_task(
-                    pool.clone(),
-                    queries::StartClaim {
-                        task_id: PgTaskId::new(task_id),
-                        queue: queue.clone(),
-                        worker_id: worker_id.clone(),
-                        lock_at,
-                        attempts,
-                        restart,
-                        lease_token: lease_token.clone(),
-                    },
-                )
-                .await
-                {
-                    Ok(started) => started,
-                    Err(error) => {
-                        // The claim may still be owned and not started. The
-                        // armed guard retires the worker, so recovery hands
-                        // the claim back once the registration is stale.
-                        return Err(AbortError::new(error).into());
-                    }
-                };
-                if !started {
+            // Every refusal below happens before the handler, where the
+            // worker's Tracker would have counted the dispatch. Count it here,
+            // in one place, so a counter-based retry layer outside this
+            // middleware stops after its budget instead of re-dispatching the
+            // refusal.
+            let attempt = req.parts.attempt.clone();
+            let admitted: Result<PgTask<Args>, BoxDynError> = async {
+                let worker_id = worker_id
+                    .ok_or_else(|| AbortError::new(Error::MissingField("worker_context")))?;
+                let task_id =
+                    task_id.ok_or_else(|| AbortError::new(Error::MissingField("task_id")))?;
+                // Read the marker when the dispatch runs: an acknowledgement in
+                // flight when this future was created may have committed since.
+                if preclaimed && claim.as_ref().is_some_and(ClaimAttempt::is_acknowledged) {
+                    // This claim's acknowledgement already committed: the database
+                    // retry budget schedules any further attempt. Refuse before the
+                    // handler runs and keep the lease: no obligation was lost.
                     completion_guard.disarm();
-                    return Err(AbortError::new(Error::claim_lost(
+                    return Err(AbortError::new(Error::already_acknowledged(
                         task_id.to_string(),
-                        queue,
+                        queue.unwrap_or_default(),
                         worker_id,
                     ))
                     .into());
                 }
-                if let Some(claim) = claim.as_ref() {
-                    claim.mark_started();
-                }
-                req.parts.status.store(Status::Running);
-            } else {
-                if let Some(lease) = &local_lease {
-                    lease.ensure_active().map_err(AbortError::new)?;
-                }
-                completion_guard.guard = local_lease.as_ref().map(|lease| lease.guard());
-                let claimed = match queries::fetch::lock_task_with_token(
-                    pool,
-                    task_id,
-                    worker_id,
-                    queue,
-                    lease_token,
-                )
-                .await
-                {
-                    Ok(claimed) => claimed,
-                    Err(error) => {
-                        // A rejected transaction did not transfer ownership;
-                        // an unconfirmed commit may have. Keep its obligation
-                        // armed, including a panic after COMMIT instrumentation.
-                        if !matches!(&error, Error::ClaimOutcomeUnknown { .. }) {
+                if preclaimed {
+                    // A retired worker starts nothing: its claims are handed
+                    // back by the release or by recovery, without consuming an
+                    // attempt while they are still `Queued`.
+                    if let Some(lease) = &local_lease {
+                        if let Err(error) = lease.ensure_active() {
                             completion_guard.disarm();
+                            return Err(AbortError::new(error).into());
                         }
-                        return Err(AbortError::new(error).into());
                     }
-                };
-                req.parts.ctx = claimed.parts.ctx;
-                req.parts.attempt = claimed.parts.attempt;
-                req.parts.status.store(Status::Running);
-                record_claim(&mut req.parts);
-                // `lock_task` claims and starts in one statement.
-                let recorded = req.parts.data.get::<ClaimAttempt>().cloned();
-                if let Some(recorded) = recorded.as_ref() {
-                    recorded.mark_started();
+                    // The claim is `Queued`; start it under its epoch. A row that
+                    // a sweep, a takeover or a release recovered in the meantime,
+                    // or that another claim of the same epoch already started,
+                    // matches nothing: the task runs elsewhere, so this dispatch
+                    // is refused and nothing is owed.
+                    let (lock_at, attempts, restart) = match claim.as_ref() {
+                        Some(claim) => (
+                            claim.lock_at,
+                            i32::try_from(claim.completed).ok(),
+                            claim.has_started(),
+                        ),
+                        // A manually assembled task has no claim identity to tell
+                        // a re-dispatch from a second claim; it starts either way.
+                        None => (
+                            *req.parts.ctx.lock_at(),
+                            i32::try_from(req.parts.attempt.current()).ok(),
+                            true,
+                        ),
+                    };
+                    // None of these refusals starts anything, so the claim stays
+                    // owned and `Queued`: the armed guard retires the worker and
+                    // recovery hands the claim back without charging it.
+                    let Some(queue) = queue else {
+                        return Err(AbortError::new(Error::MissingField("queue")).into());
+                    };
+                    let Some(lock_at) = lock_at else {
+                        return Err(AbortError::new(Error::MissingField("lock_at")).into());
+                    };
+                    let Some(attempts) = attempts else {
+                        return Err(AbortError::new(Error::InvalidArgument(
+                            "task attempt counter does not fit the attempts column".to_owned(),
+                        ))
+                        .into());
+                    };
+                    let started = match queries::start_task(
+                        pool.clone(),
+                        queries::StartClaim {
+                            task_id: PgTaskId::new(task_id),
+                            queue: queue.clone(),
+                            worker_id: worker_id.clone(),
+                            lock_at,
+                            attempts,
+                            restart,
+                            lease_token: lease_token.clone(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(started) => started,
+                        Err(error) => {
+                            // The claim may still be owned and not started. The
+                            // armed guard retires the worker, so recovery hands
+                            // the claim back once the registration is stale.
+                            return Err(AbortError::new(error).into());
+                        }
+                    };
+                    if !started {
+                        completion_guard.disarm();
+                        return Err(AbortError::new(Error::claim_lost(
+                            task_id.to_string(),
+                            queue,
+                            worker_id,
+                        ))
+                        .into());
+                    }
+                    if let Some(claim) = claim.as_ref() {
+                        claim.mark_started();
+                    }
+                    req.parts.status.store(Status::Running);
+                } else {
+                    if let Some(lease) = &local_lease {
+                        lease.ensure_active().map_err(AbortError::new)?;
+                    }
+                    completion_guard.guard = local_lease.as_ref().map(|lease| lease.guard());
+                    let claimed = match queries::fetch::lock_task_with_token(
+                        pool,
+                        task_id,
+                        worker_id,
+                        queue,
+                        lease_token,
+                    )
+                    .await
+                    {
+                        Ok(claimed) => claimed,
+                        Err(error) => {
+                            // A rejected transaction did not transfer ownership;
+                            // an unconfirmed commit may have. Keep its obligation
+                            // armed, including a panic after COMMIT instrumentation.
+                            if !matches!(&error, Error::ClaimOutcomeUnknown { .. }) {
+                                completion_guard.disarm();
+                            }
+                            return Err(AbortError::new(error).into());
+                        }
+                    };
+                    req.parts.ctx = claimed.parts.ctx;
+                    req.parts.attempt = claimed.parts.attempt;
+                    req.parts.status.store(Status::Running);
+                    record_claim(&mut req.parts);
+                    // `lock_task` claims and starts in one statement.
+                    let recorded = req.parts.data.get::<ClaimAttempt>().cloned();
+                    if let Some(recorded) = recorded.as_ref() {
+                        recorded.mark_started();
+                    }
+                    completion_guard.claim = recorded;
                 }
-                completion_guard.claim = recorded;
+                Ok(req)
             }
+            .await;
+            let req = match admitted {
+                Ok(req) => req,
+                Err(refusal) => {
+                    let _ = attempt.increment();
+                    return Err(refusal);
+                }
+            };
             let result = ready_inner.call(req).await.map_err(Into::into);
             // A completed handler error is a valid acknowledged outcome. PgAck
             // retires on acknowledgement failure; this guard covers cancellation.

@@ -135,7 +135,9 @@ row to still carry exactly that epoch:
 - A start that matches nothing refuses the dispatch with `ClaimLost` before
   the handler runs: the claim was recovered, released, taken over, or
   started by the other claim of its epoch. The worker keeps running because
-  it owes nothing for that claim. A start through the storage's middleware
+  it owes nothing for that claim. Like every refusal before the handler, it
+  counts as a dispatch on the task's attempt counter, so a retry layer
+  outside the middleware stops after its budget. A start through the storage's middleware
   also requires the storage's token to own the registration, and a locally
   retired name starts nothing.
 - An acknowledgement whose epoch no longer matches reports

@@ -477,7 +477,10 @@ Each claim is acknowledged at most once. An in-process re-dispatch of an
 already acknowledged claim, for example by a retry layer placed outside the
 backend middleware, is refused with `AlreadyAcknowledged` before the handler
 runs again; the persisted retry budget schedules the next attempt, and the
-worker registration stays active.
+worker registration stays active. Every refusal before the handler, such as a
+lost claim or a retired worker, counts as a dispatch on the task's attempt
+counter, so a retry layer outside the middleware stops after its budget
+instead of retrying the refusal.
 If automatic acknowledgement loses its result through a database or
 serialization error, the affected worker registration is retired locally.
 A claim whose transaction produced tasks but whose commit cannot be confirmed
