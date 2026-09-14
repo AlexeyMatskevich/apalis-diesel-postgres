@@ -68,7 +68,8 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
   layer outside the middleware stops after its budget. Starting a task costs one
   more transaction per task, and a start that fails on the database retires
   the worker like a failed acknowledgement. Code that reads `status` sees
-  buffered claims as `Queued`, and `running_jobs` counts only started tasks.
+  buffered claims as `Queued`, and `running_jobs` counts only started tasks, while
+  `stale_running_jobs` and `longest_running_job_mins` count every claim.
   A stream consumer that acknowledges without the middleware acknowledges
   `Queued` rows as before; one that runs tasks starts each claim with
   `PgAck::start`, so a release charges the claims it was running.

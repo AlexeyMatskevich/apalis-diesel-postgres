@@ -292,7 +292,7 @@ waiting.
 | Start matches nothing | `ClaimLost`: the claim was recovered, released, taken over, or started by another claim of its epoch. The handler does not run and the worker continues. An acknowledger attached outside the middleware records nothing for the refusal. |
 | Process crashes on a claim, started or not | Recovery after the stale deadline, by the sweep or a takeover, charges every claim the worker held, so a task that crashes the process reaches `Killed`. |
 | Payload does not decode, or the codec panics on it | The row is released through its budget (`Failed`, then `Killed`) with bounded retries; persistent failure retires the name. |
-| Handler hangs | Nothing: liveness is per worker, not per task. The row stays `Running` while the heartbeat continues (`STALE_RUNNING_JOBS` counts it after an hour). Bound handlers with a timeout layer. |
+| Handler hangs | Nothing: liveness is per worker, not per task. The row stays `Running`, and the claims buffered behind it stay `Queued`, while the heartbeat continues; `STALE_RUNNING_JOBS` counts both after an hour. Bound handlers with a timeout layer. |
 
 ## 7. Queue lifecycle
 

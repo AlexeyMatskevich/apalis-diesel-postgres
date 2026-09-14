@@ -457,7 +457,7 @@ const LIST_QUEUES_SQL: &str =
                COUNT(*) FILTER (WHERE status = 'Pending') AS pending_jobs,
                COUNT(*) FILTER (WHERE status = 'Failed') AS failed_jobs,
                COUNT(*) FILTER (WHERE status IN ('Pending', 'Queued', 'Running')) AS active_jobs,
-               COUNT(*) FILTER (WHERE status = 'Running' AND run_at < now() - INTERVAL '1 hour') AS stale_running_jobs,
+               COUNT(*) FILTER (WHERE status IN ('Queued', 'Running') AND run_at < now() - INTERVAL '1 hour') AS stale_running_jobs,
                ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'Killed') / NULLIF(COUNT(*), 0), 2) AS kill_rate,
                COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '1 hour') AS jobs_past_hour,
                COUNT(*) FILTER (
@@ -481,7 +481,7 @@ const LIST_QUEUES_SQL: &str =
                ) AS avg_job_duration_mins,
                ROUND(
                    COALESCE(MAX(EXTRACT(EPOCH FROM (now() - run_at)) / 60.0)
-                       FILTER (WHERE status = 'Running'), 0),
+                       FILTER (WHERE status IN ('Queued', 'Running')), 0),
                    2
                ) AS longest_running_job_mins,
                COUNT(*) FILTER (WHERE run_at >= now() - INTERVAL '7 days') AS jobs_past_7_days,
@@ -588,7 +588,7 @@ fn build_metrics_sql(by_queue: bool) -> String {
                         COUNT(*) FILTER (WHERE status = 'Failed')::TEXT AS failed_jobs,
                         COUNT(*) FILTER (WHERE status IN ('Pending', 'Running', 'Queued'))::TEXT AS active_jobs,
                         COUNT(*) FILTER (
-                            WHERE status = 'Running'
+                            WHERE status IN ('Queued', 'Running')
                                 AND run_at < now() - INTERVAL '1 hour'
                         )::TEXT AS stale_running_jobs,
                         ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'Killed') / NULLIF(COUNT(*), 0), 2)::TEXT AS kill_rate,
@@ -615,7 +615,7 @@ fn build_metrics_sql(by_queue: bool) -> String {
                         )::TEXT AS avg_job_duration_mins,
                         ROUND(
                             COALESCE(MAX(EXTRACT(EPOCH FROM (now() - run_at)) / 60.0)
-                                FILTER (WHERE status = 'Running'), 0),
+                                FILTER (WHERE status IN ('Queued', 'Running')), 0),
                             2
                         )::TEXT AS longest_running_job_mins,
                         COUNT(*) FILTER (WHERE status = 'Pending' AND run_at <= now())::TEXT AS queue_backlog,
