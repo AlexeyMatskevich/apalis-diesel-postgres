@@ -217,7 +217,7 @@ mod tests {
     use apalis_core::{
         error::BoxDynError,
         layers::Service,
-        task::{Parts, attempt::Attempt, builder::TaskBuilder, status::Status, task_id::TaskId},
+        task::{builder::TaskBuilder, status::Status, task_id::TaskId},
         worker::ext::ack::Acknowledge,
     };
     use futures::{executor::block_on, task::noop_waker_ref};
@@ -252,41 +252,48 @@ mod tests {
             counter: Counter,
             identity: Identity,
         ) -> Result<(usize, usize), Error> {
-            let mut parts = parts_for_ack(completed, 3);
-            parts.task_id = Some(PgTaskId::from_ulid(Ulid::from(0u128)));
-            parts.ctx = parts
-                .ctx
-                .with_queue("claim-queue".to_owned())
-                .with_lock_by(Some("claim-worker".to_owned()))
-                .with_lock_at(Some(1_700_000_000));
-            record_claim(&mut parts);
+            const QUEUE: &str = "claim-queue";
+            const OWNER: &str = "claim-worker";
+            const LOCK_AT: u64 = 1_700_000_000;
+            let id = PgTaskId::from_ulid(Ulid::from(0u128));
+            let mut task = parts_for_ack(completed, 3)
+                .into_builder()
+                .task_id(id.clone())
+                .queue(QUEUE.into())
+                .lock_by(Some(OWNER.to_owned()))
+                .lock_at(Some(LOCK_AT))
+                .build();
+            record_claim(&mut task);
             match counter {
                 Counter::Tracked => {
-                    let _ = parts.attempt.increment();
+                    task = task
+                        .into_builder()
+                        .attempt(completed.saturating_add(1))
+                        .build();
                 }
                 Counter::Unchanged => {}
-                Counter::Replaced => parts.attempt = Attempt::new_with_value(99),
+                Counter::Replaced => task = task.into_builder().attempt(99).build(),
             }
-            match identity {
-                Identity::Valid => {}
-                Identity::MissingId => parts.task_id = None,
-                Identity::MissingOwner => parts.ctx = parts.ctx.with_lock_by(None),
-                Identity::MissingQueue => {
-                    parts.ctx = PgContext::new()
-                        .with_lock_by(Some("claim-worker".to_owned()))
-                        .with_lock_at(Some(1_700_000_000));
-                }
-                Identity::MissingTimestamp => parts.ctx = parts.ctx.with_lock_at(None),
-                Identity::DifferentId => {
-                    parts.task_id = Some(PgTaskId::from_ulid(Ulid::from(1u128)));
-                }
+            let (id, queue, owner, lock_at) = match identity {
+                Identity::Valid => (Some(id), Some(QUEUE), Some(OWNER), Some(LOCK_AT)),
+                Identity::MissingId => (None, Some(QUEUE), Some(OWNER), Some(LOCK_AT)),
+                Identity::MissingOwner => (Some(id), Some(QUEUE), None, Some(LOCK_AT)),
+                Identity::MissingQueue => (Some(id), None, Some(OWNER), Some(LOCK_AT)),
+                Identity::MissingTimestamp => (Some(id), Some(QUEUE), Some(OWNER), None),
+                Identity::DifferentId => (
+                    Some(PgTaskId::from_ulid(Ulid::from(1u128))),
+                    Some(QUEUE),
+                    Some(OWNER),
+                    Some(LOCK_AT),
+                ),
                 Identity::DifferentTimestamp => {
-                    parts.ctx = parts.ctx.with_lock_at(Some(1_700_000_001));
+                    (Some(id), Some(QUEUE), Some(OWNER), Some(LOCK_AT + 1))
                 }
-            }
+            };
+            let task = with_identity(task, id, queue, owner, lock_at);
             Ok((
-                acknowledgement_attempt(&parts)?,
-                acknowledgement_attempt(&parts.clone())?,
+                acknowledgement_attempt(&task)?,
+                acknowledgement_attempt(&task.clone())?,
             ))
         }
 
@@ -414,17 +421,45 @@ mod tests {
         }
     }
 
-    fn task_id() -> TaskId<Ulid> {
+    fn task_id() -> TaskId {
         PgTaskId::from_ulid(Ulid::generate())
     }
 
-    fn parts_for_ack(attempts: usize, max_attempts: i32) -> Parts<PgContext, Ulid> {
+    fn parts_for_ack(attempts: usize, max_attempts: usize) -> PgTask<()> {
         TaskBuilder::new(())
             .task_id(task_id())
             .attempt(attempts)
-            .with_ctx(PgContext::new().with_max_attempts(max_attempts))
+            .max_attempts(max_attempts)
             .build()
-            .parts
+    }
+
+    /// `task` with its claim identity replaced, `None` leaving a field unset:
+    /// apalis 1.0's builder cannot clear a task id or queue. The counters,
+    /// status and data carry over.
+    fn with_identity(
+        task: PgTask<()>,
+        task_id: Option<PgTaskId>,
+        queue: Option<&str>,
+        lock_by: Option<&str>,
+        lock_at: Option<u64>,
+    ) -> PgTask<()> {
+        let mut builder = TaskBuilder::new(())
+            .attempt(task.attempt())
+            .status(task.status())
+            .with_data(task.data().clone())
+            .with_metadata(task.metadata().clone())
+            .lock_by(lock_by.map(str::to_owned))
+            .lock_at(lock_at);
+        if let Some(max_attempts) = task.max_attempts() {
+            builder = builder.max_attempts(max_attempts);
+        }
+        if let Some(task_id) = task_id {
+            builder = builder.task_id(task_id);
+        }
+        if let Some(queue) = queue {
+            builder = builder.queue(queue.into());
+        }
+        builder.build()
     }
 
     fn box_error(message: &'static str) -> BoxDynError {
@@ -438,25 +473,19 @@ mod tests {
         has_lock_at: bool,
     ) -> Result<(), crate::Error> {
         block_on(async move {
-            let mut parts = parts_for_ack(1, 3);
-            if !has_task_id {
-                parts.task_id = None;
-            }
-            let mut ctx = parts.ctx.clone();
-            if has_lock_by {
-                ctx = ctx.with_lock_by(Some("ack-worker".to_owned()));
-            }
-            if has_queue {
-                ctx = ctx.with_queue("ack-queue".to_owned());
-            }
-            if has_lock_at {
-                ctx = ctx.with_lock_at(Some(1_700_000_000));
-            }
-            parts.ctx = ctx;
+            let task = parts_for_ack(1, 3);
+            let id = task.task_id().cloned().filter(|_| has_task_id);
+            let task = with_identity(
+                task,
+                id,
+                has_queue.then_some("ack-queue"),
+                has_lock_by.then_some("ack-worker"),
+                has_lock_at.then_some(1_700_000_000),
+            );
 
             let mut ack = PgAck::new(&unreachable_pool());
             let result: Result<(), BoxDynError> = Ok(());
-            ack.ack(&result, &parts).await
+            ack.ack(&result, &task).await
         })
     }
 
@@ -506,13 +535,13 @@ mod tests {
         has_task_id: bool,
     ) -> Result<(), BoxDynError> {
         let mut task = TaskBuilder::new(())
-            .with_ctx(PgContext::new().with_queue("lock-service-unit".to_owned()))
+            .queue("lock-service-unit".into())
             .build();
         if has_worker {
             task.inject_data(WorkerContext::new("lock-service-worker"));
         }
         if has_task_id {
-            task.edit(|t| t.task_id(task_id()));
+            task = task.into_builder().task_id(task_id()).build();
         }
 
         let mut service = LockTaskService {
@@ -959,25 +988,23 @@ mod tests {
         /// would silently mismatch the row's `attempts` column and surface
         /// as a spurious `StaleAcknowledgement`.
         async fn ack_with_attempt_overflow(claimed: bool) -> Result<(), crate::Error> {
-            let mut parts = parts_for_ack(1, 3);
             // Force an overflow regardless of host pointer width.
-            parts.attempt = Attempt::new_with_value(i32::MAX as usize + 1);
-            parts.ctx = parts
-                .ctx
-                .clone()
-                .with_queue("ack-queue".to_owned())
-                .with_lock_by(Some("ack-worker".to_owned()))
-                .with_lock_at(Some(1_700_000_000));
+            let mut task = parts_for_ack(i32::MAX as usize + 1, 3)
+                .into_builder()
+                .queue("ack-queue".into())
+                .lock_by(Some("ack-worker".to_owned()))
+                .lock_at(Some(1_700_000_000))
+                .build();
             if claimed {
-                parts.attempt = Attempt::new_with_value(i32::MAX as usize);
-                record_claim(&mut parts);
+                task = task.into_builder().attempt(i32::MAX as usize).build();
+                record_claim(&mut task);
                 // A handler counter must not hide the unrepresentable next
                 // attempt selected from the persisted claim history.
-                parts.attempt = Attempt::new();
+                task = task.into_builder().attempt(0).build();
             }
             let mut ack = PgAck::new(&unreachable_pool());
             let result: Result<(), BoxDynError> = Ok(());
-            ack.ack(&result, &parts).await
+            ack.ack(&result, &task).await
         }
 
         fn invalid_attempt_overflow(error: &crate::Error) -> AssertionResult {
@@ -1003,23 +1030,17 @@ mod tests {
         }
 
         async fn ack_with_unserializable_result() -> Result<(), crate::Error> {
-            let mut parts: Parts<PgContext, Ulid> = TaskBuilder::new(())
+            let task = TaskBuilder::new(())
                 .task_id(task_id())
                 .attempt(1)
-                .with_ctx(
-                    PgContext::new()
-                        .with_max_attempts(3)
-                        .with_queue("ack-queue".to_owned())
-                        .with_lock_by(Some("ack-worker".to_owned()))
-                        .with_lock_at(Some(1_700_000_000)),
-                )
-                .build()
-                .parts;
-            // Need a Parts whose payload-channel type matches PoisonOk.
-            let _ = &mut parts;
+                .max_attempts(3)
+                .queue("ack-queue".into())
+                .lock_by(Some("ack-worker".to_owned()))
+                .lock_at(Some(1_700_000_000))
+                .build();
             let mut ack = PgAck::new(&unreachable_pool());
             let result: Result<PoisonOk, BoxDynError> = Ok(PoisonOk);
-            ack.ack(&result, &parts).await
+            ack.ack(&result, &task).await
         }
 
         fn json_serialize_error(error: &crate::Error) -> AssertionResult {
@@ -1039,12 +1060,9 @@ mod tests {
         async fn lock_service_call_preclaimed() -> Result<(), BoxDynError> {
             let mut task = TaskBuilder::new(())
                 .task_id(task_id())
-                .with_ctx(
-                    PgContext::new()
-                        .with_queue("lock-service-unit".to_owned())
-                        .with_lock_by(Some("lock-service-worker".to_owned()))
-                        .with_lock_at(Some(1_700_000_000)),
-                )
+                .queue("lock-service-unit".into())
+                .lock_by(Some("lock-service-worker".to_owned()))
+                .lock_at(Some(1_700_000_000))
                 .build();
             task.inject_data(WorkerContext::new("lock-service-worker"));
 
@@ -1099,8 +1117,9 @@ mod tests {
         struct ValidationObservation {
             result: Result<(), BoxDynError>,
             handler_calls: usize,
-            /// The task's attempt counter after the dispatch.
-            attempt: usize,
+            /// The dispatch's status after the call: a refusal before the
+            /// handler marks it `Killed`.
+            status: Status,
             owner_retired: bool,
             cloned_owner_retired: bool,
             unrelated_retired: bool,
@@ -1115,19 +1134,16 @@ mod tests {
             let owner = registry.for_worker("validation-owner");
             let unrelated = registry.for_worker("validation-unrelated");
             let handler_calls = Arc::new(AtomicUsize::new(0));
-            let mut context = PgContext::new();
+            let mut builder = TaskBuilder::new(()).task_id(task_id());
             if has_queue {
-                context = context.with_queue("validation-queue".to_owned());
+                builder = builder.queue("validation-queue".into());
             }
             if acquired {
-                context = context
-                    .with_lock_by(Some("validation-owner".to_owned()))
-                    .with_lock_at(Some(1_700_000_000));
+                builder = builder
+                    .lock_by(Some("validation-owner".to_owned()))
+                    .lock_at(Some(1_700_000_000));
             }
-            let mut task = TaskBuilder::new(())
-                .task_id(task_id())
-                .with_ctx(context)
-                .build();
+            let mut task = builder.build();
             if !has_id {
                 // Model identity lost after claim as well as malformed input
                 // before claim; only the former has a completion obligation.
@@ -1144,12 +1160,12 @@ mod tests {
             futures::future::poll_fn(|cx| service.poll_ready(cx))
                 .await
                 .expect("recording handler is ready");
-            let attempt = task.parts.attempt.clone();
+            let status = task.raw_status().clone();
             let result = service.call(task).await;
             ValidationObservation {
                 result,
                 handler_calls: handler_calls.load(Ordering::SeqCst),
-                attempt: attempt.current(),
+                status: status.load(),
                 owner_retired: owner.is_retired(),
                 cloned_owner_retired: registry.clone().for_worker("validation-owner").is_retired(),
                 unrelated_retired: unrelated.is_retired(),
@@ -1174,7 +1190,9 @@ mod tests {
         struct RedispatchObservation {
             result: Option<Result<(), BoxDynError>>,
             handler_calls: usize,
-            attempt: usize,
+            /// The dispatch's status after the call: a refusal before the
+            /// handler marks it `Killed`.
+            status: Status,
             owner_retired: bool,
         }
 
@@ -1204,18 +1222,14 @@ mod tests {
             let handler_calls = Arc::new(AtomicUsize::new(0));
             let mut task = TaskBuilder::new(())
                 .task_id(task_id())
-                .with_ctx(
-                    PgContext::new()
-                        .with_queue("redispatch-queue".to_owned())
-                        .with_lock_by(Some("redispatch-owner".to_owned()))
-                        .with_lock_at(Some(1_700_000_000)),
-                )
+                .queue("redispatch-queue".into())
+                .lock_by(Some("redispatch-owner".to_owned()))
+                .lock_at(Some(1_700_000_000))
                 .build();
             task.inject_data(WorkerContext::new("redispatch-owner"));
-            record_claim(&mut task.parts);
+            record_claim(&mut task);
             let claim = task
-                .parts
-                .data
+                .data()
                 .get::<ClaimAttempt>()
                 .expect("claim recorded")
                 .clone();
@@ -1246,7 +1260,7 @@ mod tests {
             RedispatchObservation {
                 result,
                 handler_calls: handler_calls.load(Ordering::SeqCst),
-                attempt: task.attempt(),
+                status: task.status(),
                 owner_retired: owner.is_retired(),
             }
         }
@@ -1296,16 +1310,15 @@ mod tests {
         async fn manual_ack_of_claim(acknowledged: bool) -> RepeatedAck {
             let registry = crate::lease::LeaseRegistry::default();
             let owner = registry.for_worker("ack-worker");
-            let mut parts = parts_for_ack(0, 3);
-            parts.ctx = parts
-                .ctx
-                .with_queue("ack-queue".to_owned())
-                .with_lock_by(Some("ack-worker".to_owned()))
-                .with_lock_at(Some(1_700_000_000));
-            record_claim(&mut parts);
+            let mut task = parts_for_ack(0, 3)
+                .into_builder()
+                .queue("ack-queue".into())
+                .lock_by(Some("ack-worker".to_owned()))
+                .lock_at(Some(1_700_000_000))
+                .build();
+            record_claim(&mut task);
             if acknowledged {
-                parts
-                    .data
+                task.data()
                     .get::<ClaimAttempt>()
                     .expect("claim recorded")
                     .mark_acknowledged();
@@ -1314,7 +1327,7 @@ mod tests {
             ack.leases = Some(registry);
             let result: Result<(), BoxDynError> = Ok(());
             RepeatedAck {
-                result: ack.ack(&result, &parts.clone()).await,
+                result: ack.ack(&result, &task.clone()).await,
                 owner_retired: owner.is_retired(),
             }
         }
@@ -1333,13 +1346,13 @@ mod tests {
                 &unreachable_pool(),
                 &crate::Config::new("manual-ack-queue"),
             );
-            let mut parts = parts_for_ack(0, 3);
-            parts.ctx = parts
-                .ctx
-                .with_queue("manual-ack-queue".to_owned())
-                .with_lock_by(Some("manual-ack-worker".to_owned()))
-                .with_lock_at(Some(1_700_000_000));
-            record_claim(&mut parts);
+            let mut task = parts_for_ack(0, 3)
+                .into_builder()
+                .queue("manual-ack-queue".into())
+                .lock_by(Some("manual-ack-worker".to_owned()))
+                .lock_at(Some(1_700_000_000))
+                .build();
+            record_claim(&mut task);
             let mut ack = match acknowledger {
                 Acknowledger::Storage => storage.acknowledger(),
                 Acknowledger::TokenFree => PgAck::new(storage.pool()),
@@ -1348,7 +1361,7 @@ mod tests {
                 }
             };
             let result: Result<(), BoxDynError> = Ok(());
-            assert!(ack.ack(&result, &parts).await.is_err());
+            assert!(ack.ack(&result, &task).await.is_err());
             storage.leases.for_worker("manual-ack-worker").is_retired()
         }
 
@@ -1490,8 +1503,11 @@ mod tests {
             outcome: String,
             handled: Vec<Status>,
             /// The task's attempt counter after the dispatch; the claim was
-            /// fetched with a count of one.
+            /// fetched with a count of one. The handler here has no apalis
+            /// lifecycle layer around it, so nothing advances the counter.
             attempt: usize,
+            /// The dispatch's status after the call.
+            status: Status,
             row_status: String,
             owner_retired: bool,
         }
@@ -1604,34 +1620,29 @@ mod tests {
             let mut task = TaskBuilder::new(())
                 .task_id(PgTaskId::from_ulid(id))
                 .attempt(1)
-                .with_ctx(
-                    PgContext::new()
-                        .with_queue(queue.to_owned())
-                        .with_lock_by(Some(worker.to_owned()))
-                        .with_lock_at(Some(lock_at)),
-                )
+                .queue(queue.into())
+                .lock_by(Some(worker.to_owned()))
+                .lock_at(Some(u64::try_from(lock_at).expect("a positive lock_at")))
                 .build();
             task.inject_data(WorkerContext::new(worker));
-            task.parts.status.store(Status::Queued);
+            task.raw_status().store(Status::Queued);
             if matches!(history, ClaimHistory::UnrecordedCounterAhead) {
-                task.edit(|t| t.attempt(2));
+                task = task.into_builder().attempt(2).build();
             }
             if !matches!(
                 history,
                 ClaimHistory::Unrecorded | ClaimHistory::UnrecordedCounterAhead
             ) {
-                record_claim(&mut task.parts);
+                record_claim(&mut task);
             }
             if matches!(history, ClaimHistory::AlreadyStarted) {
-                task.parts
-                    .data
+                task.data()
                     .get::<ClaimAttempt>()
                     .expect("claim recorded")
                     .mark_started();
             }
             if matches!(history, ClaimHistory::Acknowledged) {
-                task.parts
-                    .data
+                task.data()
                     .get::<ClaimAttempt>()
                     .expect("claim recorded")
                     .mark_acknowledged();
@@ -1681,7 +1692,8 @@ mod tests {
                     .await
                     .map_err(|e| e.to_string())?;
                 let task = claimed_task(id, &queue, &worker, lock_at, history);
-                let attempt = task.parts.attempt.clone();
+                let attempt = task.raw_attempt().clone();
+                let status = task.raw_status().clone();
                 let result = service.call(task).await;
                 let outcome = match &result {
                     Ok(()) => "ran".to_owned(),
@@ -1703,6 +1715,7 @@ mod tests {
                     outcome,
                     handled,
                     attempt: attempt.current(),
+                    status: status.load(),
                     row_status: row_status(pool.clone(), id).await?,
                     owner_retired: owner.is_retired(),
                 })
@@ -1724,13 +1737,16 @@ mod tests {
                 if run.outcome == outcome
                     && run.handled == handled
                     && run.attempt == attempt
+                    // A refusal marks the dispatch `Killed` so a retry layer
+                    // outside the middleware stops redispatching it.
+                    && (outcome == "ran" || run.status == Status::Killed)
                     && run.row_status == row_status
                     && run.owner_retired == owner_retired
                 {
                     Ok(())
                 } else {
                     Err(format!(
-                        "expected {outcome} with the handler seeing {handled:?}, attempt counter {attempt}, a {row_status} row and owner_retired={owner_retired}; got {run:?}"
+                        "expected {outcome} with the handler seeing {handled:?}, attempt counter {attempt}, a Killed dispatch unless it ran, a {row_status} row and owner_retired={owner_retired}; got {run:?}"
                     ))
                 }
             })
@@ -1843,17 +1859,13 @@ mod tests {
         async fn start_without_the_database(has_owner: bool) -> AcknowledgerStartFailure {
             let registry = crate::lease::LeaseRegistry::default();
             let owner = registry.for_worker("unreachable-owner");
-            let mut context = PgContext::new()
-                .with_queue("unreachable-queue".to_owned())
-                .with_lock_at(Some(1_700_000_000));
-            if has_owner {
-                context = context.with_lock_by(Some("unreachable-owner".to_owned()));
-            }
             let mut task = TaskBuilder::new(())
                 .task_id(task_id())
-                .with_ctx(context)
+                .queue("unreachable-queue".into())
+                .lock_at(Some(1_700_000_000))
+                .lock_by(has_owner.then(|| "unreachable-owner".to_owned()))
                 .build();
-            record_claim(&mut task.parts);
+            record_claim(&mut task);
             let acknowledger = PgAck {
                 pool: unreachable_pool(),
                 lease_token: Some(Arc::from("unreachable-token")),
@@ -1873,36 +1885,6 @@ mod tests {
                     "expected Error::MissingField(\"lock_by\"), got {other:?}"
                 )])),
             }
-        }
-
-        /// A dispatch of a claim, created and then dropped before it was
-        /// polled. Returns the worker's task count while the dispatch exists
-        /// and after it is dropped.
-        fn dispatch_tracking() -> (usize, usize) {
-            let worker = WorkerContext::new("tracked-worker");
-            let mut task = TaskBuilder::new(())
-                .task_id(task_id())
-                .with_ctx(
-                    PgContext::new()
-                        .with_queue("tracked-queue".to_owned())
-                        .with_lock_by(Some("tracked-worker".to_owned()))
-                        .with_lock_at(Some(1_700_000_000)),
-                )
-                .build();
-            task.inject_data(worker.clone());
-            record_claim(&mut task.parts);
-            let mut service = LockTaskService {
-                inner: RecordingHandler(Arc::new(AtomicUsize::new(0))),
-                pool: unreachable_pool(),
-                leases: None,
-                lease_token: None,
-            };
-            let mut cx = Context::from_waker(noop_waker_ref());
-            assert!(matches!(service.poll_ready(&mut cx), Poll::Ready(Ok(()))));
-            let dispatch = service.call(task);
-            let while_dispatched = worker.task_count();
-            drop(dispatch);
-            (while_dispatched, worker.task_count())
         }
 
         /// How the handler behind the middleware ends when it runs.
@@ -2171,7 +2153,7 @@ mod tests {
                 to retires_only_the_owner_when_the_start_cannot_reach_the_database {
                     have(result) be_err_and abort_pool_error,
                     have(handler_calls) equal(0),
-                        have(attempt) equal(1),
+                        have(status) equal(Status::Killed),
                     have(owner_retired) be_true,
                     have(cloned_owner_retired) be_true,
                     have(unrelated_retired) be_false
@@ -2182,7 +2164,7 @@ mod tests {
                     to retires_only_the_owner_without_calling_the_handler {
                         have(result) be_err_and abort_missing_field("queue"),
                         have(handler_calls) equal(0),
-                        have(attempt) equal(1),
+                        have(status) equal(Status::Killed),
                         have(owner_retired) be_true,
                         have(cloned_owner_retired) be_true,
                         have(unrelated_retired) be_false
@@ -2194,7 +2176,7 @@ mod tests {
                     to retires_only_the_owner_without_calling_the_handler {
                         have(result) be_err_and abort_missing_field("task_id"),
                         have(handler_calls) equal(0),
-                        have(attempt) equal(1),
+                        have(status) equal(Status::Killed),
                         have(owner_retired) be_true,
                         have(cloned_owner_retired) be_true,
                         have(unrelated_retired) be_false
@@ -2206,7 +2188,7 @@ mod tests {
                     to preserves_workers_after_a_known_acquisition_failure {
                         have(result) be_err_and abort_pool_error,
                         have(handler_calls) equal(0),
-                        have(attempt) equal(1),
+                        have(status) equal(Status::Killed),
                         have(owner_retired) be_false,
                         have(cloned_owner_retired) be_false,
                         have(unrelated_retired) be_false
@@ -2216,7 +2198,7 @@ mod tests {
                         to rejects_without_creating_a_completion_obligation {
                             have(result) be_err_and abort_missing_field("task_id"),
                             have(handler_calls) equal(0),
-                        have(attempt) equal(1),
+                        have(status) equal(Status::Killed),
                             have(owner_retired) be_false,
                             have(cloned_owner_retired) be_false,
                             have(unrelated_retired) be_false
@@ -2255,10 +2237,10 @@ mod tests {
             expect(preclaimed_redispatch(marker, dispatch).await) as a_claim_dispatched_again_in_process {
                 let marker = Marker::Unset;
                 let dispatch = Dispatch::Polled;
-                to reaches_the_database_to_start_the_claim_counts_the_dispatch_and_retires_the_worker_when_that_fails {
+                to reaches_the_database_to_start_the_claim_kills_the_dispatch_and_retires_the_worker_when_that_fails {
                     have(result) aborted_on_the_pool,
                     have(handler_calls) equal(0),
-                    have(attempt) equal(1),
+                    have(status) equal(Status::Killed),
                     have(owner_retired) be_true
                 }
                 when the_dispatch_is_dropped_before_its_first_poll {
@@ -2266,16 +2248,16 @@ mod tests {
                     to retires_the_worker_for_the_lost_obligation {
                         have(result) never_polled,
                         have(handler_calls) equal(0),
-                        have(attempt) equal(0),
+                        have(status) equal(Status::Pending),
                         have(owner_retired) be_true
                     }
                 }
                 when the_claim_was_acknowledged_before_the_dispatch_was_created {
                     let marker = Marker::SetBeforeCall;
-                    to refuses_before_the_handler_counts_the_dispatch_and_keeps_the_worker_active {
+                    to refuses_before_the_handler_kills_the_dispatch_and_keeps_the_worker_active {
                         have(result) refused_as_already_acknowledged,
                         have(handler_calls) equal(0),
-                        have(attempt) equal(1),
+                        have(status) equal(Status::Killed),
                         have(owner_retired) be_false
                     }
                     when the_dispatch_is_dropped_before_its_first_poll {
@@ -2283,17 +2265,17 @@ mod tests {
                         to keeps_the_worker_active {
                             have(result) never_polled,
                             have(handler_calls) equal(0),
-                            have(attempt) equal(0),
+                            have(status) equal(Status::Pending),
                             have(owner_retired) be_false
                         }
                     }
                 }
                 when the_claim_was_acknowledged_after_the_dispatch_was_created {
                     let marker = Marker::SetAfterCall;
-                    to refuses_before_the_handler_counts_the_dispatch_and_keeps_the_worker_active {
+                    to refuses_before_the_handler_kills_the_dispatch_and_keeps_the_worker_active {
                         have(result) refused_as_already_acknowledged,
                         have(handler_calls) equal(0),
-                        have(attempt) equal(1),
+                        have(status) equal(Status::Killed),
                         have(owner_retired) be_false
                     }
                     when the_dispatch_is_dropped_before_its_first_poll {
@@ -2301,7 +2283,7 @@ mod tests {
                         to keeps_the_worker_active {
                             have(result) never_polled,
                             have(handler_calls) equal(0),
-                            have(attempt) equal(0),
+                            have(status) equal(Status::Pending),
                             have(owner_retired) be_false
                         }
                     }
@@ -2346,19 +2328,19 @@ mod tests {
                 when the_claim_was_recovered_before_the_dispatch {
                     let row = RowAtDispatch::Recovered;
                     to refuses_the_dispatch_and_keeps_the_worker_active {
-                        started("claim_lost", &[], 2, "Pending", false)
+                        started("claim_lost", &[], 1, "Pending", false)
                     }
                 }
                 when the_task_was_claimed_again_at_a_later_second {
                     let row = RowAtDispatch::ReclaimedLater;
                     to refuses_the_dispatch_and_leaves_the_newer_claim_alone {
-                        started("claim_lost", &[], 2, "Queued", false)
+                        started("claim_lost", &[], 1, "Queued", false)
                     }
                 }
                 when another_claim_of_the_same_epoch_already_started_the_row {
                     let row = RowAtDispatch::Started;
                     to refuses_the_second_start {
-                        started("claim_lost", &[], 2, "Running", false)
+                        started("claim_lost", &[], 1, "Running", false)
                     }
                     when the_dispatch_repeats_a_claim_this_process_started {
                         let history = ClaimHistory::AlreadyStarted;
@@ -2388,7 +2370,7 @@ mod tests {
                 when another_token_owns_the_registration {
                     let holder = Holder::Replaced;
                     to refuses_the_dispatch_and_keeps_the_worker_active {
-                        started("claim_lost", &[], 2, "Queued", false)
+                        started("claim_lost", &[], 1, "Queued", false)
                     }
                     when the_middleware_binds_no_token {
                         let holder = Holder::ReplacedUnbound;
@@ -2400,7 +2382,7 @@ mod tests {
                 when the_worker_is_retired_locally {
                     let holder = Holder::RetiredLocally;
                     to starts_nothing_and_leaves_the_claim_for_recovery {
-                        started("retired", &[], 2, "Queued", true)
+                        started("retired", &[], 1, "Queued", true)
                     }
                 }
             }
@@ -2499,13 +2481,6 @@ mod tests {
                         have(owner_retired) be_false
                     }
                 }
-            }
-
-            expect(dispatch_tracking()) as a_dispatch_of_a_claim {
-                // A graceful stop waits for the worker's tasks. Counting the
-                // dispatch from its creation keeps a stop from dropping a
-                // start whose transaction may still commit `Running`.
-                to counts_as_a_task_of_its_worker_until_it_ends_or_is_dropped { equal((1, 0)) }
             }
 
             expect(acknowledge_outside_the_middleware(row, handler, conditions).await) as an_acknowledger_outside_the_middleware {
@@ -2995,10 +2970,12 @@ impl<S> Layer<S> for LockTaskLayer {
 /// that re-dispatches a task in-process, such as a retry layer, receives
 /// [`Error::AlreadyAcknowledged`] inside an `AbortError` for the repeat, and
 /// the handler does not run again: the persisted retry budget schedules the
-/// next attempt. The refusal counts as a dispatch on the task's attempt
-/// counter so counter-based retry policies terminate. Every other refusal
+/// next attempt. The refusal marks the dispatch [`Status::Killed`], which
+/// stops apalis's `RetryPolicy` from dispatching it again. Every other refusal
 /// before the handler, such as [`Error::ClaimLost`] or
-/// [`Error::WorkerRetired`], counts the same way.
+/// [`Error::WorkerRetired`], is marked the same way. The handler's attempt
+/// counter is not advanced: apalis 1.0 advances it only in the worker's
+/// lifecycle layer, which a refused dispatch never reaches.
 #[derive(Debug, Clone)]
 pub struct PgMiddleware {
     lock: LockTaskLayer,

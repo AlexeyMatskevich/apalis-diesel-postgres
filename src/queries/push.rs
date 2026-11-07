@@ -467,6 +467,7 @@ fn insert_reporting_conflicts(conn: &mut PgConnection, batch: PreparedBatch) -> 
 
 #[cfg(test)]
 mod tests {
+    use apalis_core::task::builder::TaskBuilder;
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
@@ -573,8 +574,9 @@ mod tests {
         }
     }
     fn prepared_schedule(run_at: u64) -> Result<Vec<i64>, Error> {
-        let mut task = PgTask::<CompactType>::new(Vec::new());
-        task.edit(|t| t.run_at_timestamp(run_at));
+        let task = TaskBuilder::new(Vec::new())
+            .run_at_timestamp(run_at)
+            .build();
         prepare_batch(&Config::new("schedule"), vec![task]).map(|batch| {
             batch
                 .into_iter()

@@ -206,7 +206,7 @@ mod tests {
         id: Option<&'static str>,
         status: Option<&'static str>,
         result: Option<serde_json::Value>,
-    ) -> Result<apalis_core::backend::TaskResult<String, Ulid>, Error> {
+    ) -> Result<apalis_core::backend::TaskResult<String>, Error> {
         task_result_from_row::<String>(task_result_row_with(id, status, result))
     }
 
@@ -221,13 +221,7 @@ mod tests {
 
     fn id_row_error(error: &Error) -> AssertionResult {
         match error {
-            Error::Row(cause)
-                if cause
-                    .downcast_ref::<apalis_core::task::task_id::TaskIdError<ulid::DecodeError>>()
-                    .is_some() =>
-            {
-                Ok(())
-            }
+            Error::Row(cause) if cause.downcast_ref::<ulid::DecodeError>().is_some() => Ok(()),
             other => Err(AssertionError::new(vec![format!(
                 "expected ULID parse cause, got {other:?}"
             )])),
@@ -260,7 +254,7 @@ mod tests {
     fn exact_task_result(
         expected_status: Status,
         success: bool,
-    ) -> impl Fn(&apalis_core::backend::TaskResult<String, Ulid>) -> AssertionResult {
+    ) -> impl Fn(&apalis_core::backend::TaskResult<String>) -> AssertionResult {
         move |result| {
             let expected_result = if success {
                 Ok("processed".to_owned())

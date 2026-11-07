@@ -12,7 +12,9 @@ use std::{
 
 pub use apalis_codec::json::JsonCodec;
 use apalis_core::{
-    backend::{Backend, BackendConfig, WireFormatBackend, codec::Codec, finalize::Durable},
+    backend::{
+        Backend, BackendConfig, WireFormatBackend, codec::Codec, finalize::Durable, queue::Queue,
+    },
     task::{Task, builder::TaskBuilder, task_id::TaskId},
     worker::context::WorkerContext,
 };
@@ -340,6 +342,13 @@ impl<Args> PostgresStorage<Args> {
 }
 
 impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
+    /// The queue this storage pushes to and polls, as apalis-sql's
+    /// `BackendExt::get_queue` returned it.
+    #[must_use]
+    pub fn get_queue(&self) -> Queue {
+        self.config.queue().clone()
+    }
+
     /// An acknowledger bound to this storage's registration token and local
     /// liveness, for manual acknowledgement of tasks claimed by this
     /// storage's worker streams.
@@ -1029,27 +1038,26 @@ impl<Args, Decode: Send + 'static, Fetcher> WireFormatBackend
 
 #[cfg(test)]
 mod tests {
-    use apalis_core::{backend::Backend, task::status::Status};
-    use apalis_sql::{DateTime, DateTimeExt, from_row::FromRowError};
+    use apalis_core::task::status::Status;
+
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
-    use crate::unreachable::unreachable_pool;
+    use crate::{
+        config::{DateTime, DateTimeExt},
+        models::JobRow,
+        unreachable::unreachable_pool,
+    };
 
-    fn row(
-        id: &str,
-        status: &str,
-        run_at: Option<DateTime>,
-        idempotency_key: Option<&str>,
-    ) -> TaskRow {
-        TaskRow {
+    fn row(id: &str, status: &str, idempotency_key: Option<&str>) -> JobRow {
+        JobRow {
             job: b"payload".to_vec(),
             id: id.to_owned(),
             job_type: "unit-queue".to_owned(),
             status: status.to_owned(),
             attempts: 2,
-            max_attempts: Some(3),
-            run_at,
+            max_attempts: 3,
+            run_at: DateTime::now(),
             last_result: None,
             lock_at: None,
             lock_by: Some("worker-a".to_owned()),
@@ -1061,16 +1069,16 @@ mod tests {
     }
 
     fn compact_task_has_expected_parts(
-        result: &Result<PgTask<CompactType>, FromRowError>,
+        result: &Result<PgTask<CompactType>, Error>,
     ) -> AssertionResult {
         match result {
             Ok(task)
                 if task.args == b"payload"
                     && task.attempt() == 2
                     && task.status() == Status::Pending
-                    && task.priority() == 7
-                    && task.lock_by() == &Some("worker-a".to_owned())
-                    && task.idempotency_key() == Some("same-key".to_owned()) =>
+                    && task.priority() == Some(7)
+                    && task.lock_by() == Some("worker-a")
+                    && task.idempotency_key() == Some("same-key") =>
             {
                 Ok(())
             }
@@ -1084,7 +1092,7 @@ mod tests {
     }
 
     fn compact_task_omits_idempotency_key(
-        result: &Result<PgTask<CompactType>, FromRowError>,
+        result: &Result<PgTask<CompactType>, Error>,
     ) -> AssertionResult {
         match result {
             Ok(task) if task.idempotency_key().is_none() => Ok(()),
@@ -1098,18 +1106,9 @@ mod tests {
         }
     }
 
-    fn column_not_found(column: &'static str) -> impl Fn(&FromRowError) -> AssertionResult {
-        move |error| match error {
-            FromRowError::ColumnNotFound(found) if found == column => Ok(()),
-            other => Err(AssertionError::new(vec![format!(
-                "expected missing column {column}, got {other:?}"
-            )])),
-        }
-    }
-
-    fn decode_error(error: &FromRowError) -> AssertionResult {
+    fn decode_error(error: &Error) -> AssertionResult {
         match error {
-            FromRowError::DecodeError(_) => Ok(()),
+            Error::Row(_) => Ok(()),
             other => Err(AssertionError::new(vec![format!(
                 "expected decode error, got {other:?}"
             )])),
@@ -1269,11 +1268,10 @@ mod tests {
 
     fn constructs_backend_traits(result: &(String, String, String)) -> AssertionResult {
         let (middleware, heartbeat, compact) = result;
-        // `std::any::type_name_of_val` resolves type aliases away, so neither
-        // `BoxStream` nor `PgContext` ever appears literally — `BoxStream<T>`
-        // always prints as its expansion `Pin<Box<dyn Stream<Item = T> + Send>>`,
-        // and `PgContext` as its expansion `SqlContext<PgPool>`. Match those
-        // expansions instead of the alias names.
+        // `std::any::type_name_of_val` resolves type aliases away, so
+        // `BoxStream` never appears literally — `BoxStream<T>` always prints as
+        // its expansion `Pin<Box<dyn Stream<Item = T> + Send>>`. Match that
+        // expansion instead of the alias name.
         //
         // The heartbeat is `Beat = BoxStream<'static, Result<(), Error>>`: a bare
         // `()` beat, so its type name carries the `Result`/`Error` item shape but
@@ -1284,17 +1282,16 @@ mod tests {
             && heartbeat.contains("Stream")
             && heartbeat.contains("Result")
             && heartbeat.contains("Error")
-            && !heartbeat.contains("SqlContext")
             && !heartbeat.contains("Task<");
         // The compact stream is `CompactStream = TaskStream<PgTask<CompactType>,
-        // Error>` = `BoxStream<'static, Result<Option<Task<Vec<u8>, PgContext,
-        // Ulid>>, Error>>`: it must name the `Option`-wrapped task with its
-        // `SqlContext`, distinguishing it from the bare heartbeat beat.
+        // Error>` = `BoxStream<'static, Result<Option<Task<Vec<u8>>>, Error>>`:
+        // it must name the `Option`-wrapped task, distinguishing it from the
+        // bare heartbeat beat.
         let compact_is_task_stream = compact.contains("Pin")
             && compact.contains("Box")
             && compact.contains("Stream")
             && compact.contains("Option")
-            && compact.contains("SqlContext")
+            && compact.contains("Task<")
             && compact.contains("Error");
         if middleware.contains("PgMiddleware") && heartbeat_is_beat_stream && compact_is_task_stream
         {
@@ -1392,10 +1389,9 @@ mod tests {
             to returns_the_crate_name { equal("apalis-diesel-postgres") }
         }
 
-        expect(row(id, status, run_at, idempotency_key).try_into_task_compact::<Ulid, PgPool>()) as compact_task_record {
+        expect(row(id, status, idempotency_key).into_task()) as compact_task_record {
             let id = &Ulid::generate().to_string();
             let status = "Pending";
-            let run_at = Some(DateTime::now());
             let idempotency_key = Some("same-key");
 
             when row_has_all_required_fields {
@@ -1405,11 +1401,6 @@ mod tests {
             when idempotency_key_is_absent {
                 let idempotency_key = None;
                 to omits_the_idempotency_key { compact_task_omits_idempotency_key }
-            }
-
-            when run_time_is_missing {
-                let run_at = None;
-                to rejects_the_row { be_err_and column_not_found("run_at") }
             }
 
             when status_is_unknown {

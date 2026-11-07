@@ -492,9 +492,9 @@ pub(crate) mod test_support {
     pub(crate) fn saturated(ids: &[PgTaskId]) -> (SharedFetcher, Vec<PgTaskId>) {
         let (mut sender, receiver) = mpsc::channel(1);
         let mut accepted = Vec::new();
-        for &id in ids {
-            match sender.try_send(id) {
-                Ok(()) => accepted.push(id),
+        for id in ids {
+            match sender.try_send(id.clone()) {
+                Ok(()) => accepted.push(id.clone()),
                 Err(error) if error.is_full() => {}
                 Err(error) => panic!("fresh receiver disconnected: {error}"),
             }
@@ -524,7 +524,6 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use apalis_core::backend::Backend;
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
@@ -862,7 +861,7 @@ mod tests {
             ],
         );
         let id = new_task_id();
-        deliver_to_queue(&mut registry, "shared-deliver-fanout", &[id]);
+        deliver_to_queue(&mut registry, "shared-deliver-fanout", &[id.clone()]);
 
         let got_id =
             |receiver: &mut Receiver<PgTaskId>| matches!(receiver.try_recv(), Ok(got) if got == id);

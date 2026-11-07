@@ -1,7 +1,10 @@
 //! Regression specs for retained decode cleanup and local stream ownership.
 use crate::test_support as support;
-use crate::{CompactType, Config, Error, PgTask, PgTaskId, queries};
-use apalis_core::{backend::TaskStream, task::status::Status, worker::context::WorkerContext};
+use crate::{CompactType, Config, Error, PgTask, PgTaskId, TaskStream, queries};
+use apalis_core::{
+    task::{builder::TaskBuilder, status::Status},
+    worker::context::WorkerContext,
+};
 use diesel::{
     RunQueryDsl, sql_query,
     sql_types::{Integer, Text},
@@ -37,6 +40,7 @@ enum DecodeFailure {
 
 /// Decodes JSON like the default codec, but panics on a payload it cannot
 /// parse instead of returning the error.
+#[derive(Clone)]
 struct PanickingCodec;
 
 impl apalis_core::backend::codec::Codec<String> for PanickingCodec {
@@ -47,7 +51,7 @@ impl apalis_core::backend::codec::Codec<String> for PanickingCodec {
         serde_json::to_vec(value)
     }
 
-    fn decode(compact: &CompactType) -> Result<String, Self::Error> {
+    fn decode(&self, compact: &CompactType) -> Result<String, Self::Error> {
         match serde_json::from_slice(compact) {
             Ok(value) => Ok(value),
             Err(error) => panic!("corrupt payload: {error}"),
@@ -59,7 +63,7 @@ impl apalis_core::backend::codec::Codec<String> for PanickingCodec {
 struct DecodeOutcome {
     errors: Vec<&'static str>,
     corrupt_state: State,
-    sibling: Option<PgTask<String>>,
+    sibling: Option<PgTask<CompactType>>,
     expected_sibling_id: PgTaskId,
     expected_worker: String,
     retired_after_next: bool,
@@ -108,11 +112,13 @@ async fn decode_cleanup(
     .map_err(|error| error.to_string())?;
     let bad_id = PgTaskId::from_ulid(ulid::Ulid::generate());
     let expected_sibling_id = PgTaskId::from_ulid(ulid::Ulid::generate());
-    let mut invalid = PgTask::new(b"{bad-json".to_vec());
-    invalid.edit(|t| t.task_id(bad_id.clone()));
-    invalid.parts.ctx = crate::PgContext::new().with_max_attempts(max_attempts);
-    let mut sibling = PgTask::new(serde_json::to_vec("healthy-sibling").unwrap());
-    sibling.edit(|t| t.task_id(expected_sibling_id.clone()));
+    let invalid = TaskBuilder::new(b"{bad-json".to_vec())
+        .task_id(bad_id.clone())
+        .max_attempts(usize::try_from(max_attempts).map_err(|error| error.to_string())?)
+        .build();
+    let sibling = TaskBuilder::new(serde_json::to_vec("healthy-sibling").unwrap())
+        .task_id(expected_sibling_id.clone())
+        .build();
     queries::flush_tasks(pool.clone(), config.clone(), vec![invalid, sibling])
         .await
         .map_err(|failure| failure.into_error().to_string())?;
@@ -137,6 +143,7 @@ async fn decode_cleanup(
         DecodeFailure::Reported => {
             crate::fetcher::decode_task_stream::<String, crate::JsonCodec<CompactType>>(
                 compact,
+                crate::JsonCodec::default(),
                 pool.clone(),
                 name.clone().into(),
                 Some(token),
@@ -145,6 +152,7 @@ async fn decode_cleanup(
         }
         DecodeFailure::Panicked => crate::fetcher::decode_task_stream::<String, PanickingCodec>(
             compact,
+            PanickingCodec,
             pool.clone(),
             name.clone().into(),
             Some(token),
@@ -183,7 +191,7 @@ async fn decode_cleanup(
             drop(released_later);
         });
     }
-    fn kind(item: &Option<Result<Option<PgTask<String>>, Error>>) -> &'static str {
+    fn kind(item: &Option<Result<Option<PgTask<CompactType>>, Error>>) -> &'static str {
         match item {
             Some(Err(Error::Decode(_))) => "decode",
             Some(Err(Error::Pool(_))) => "pool",
@@ -250,10 +258,10 @@ fn recovered(
             "Failed"
         };
         let sibling_delivered = outcome.sibling.as_ref().is_some_and(|sibling| {
-            sibling.args == "healthy-sibling"
-                && sibling.task_id().cloned() == Some(outcome.expected_sibling_id)
+            sibling.args == serde_json::to_vec("healthy-sibling").unwrap()
+                && sibling.task_id() == Some(&outcome.expected_sibling_id)
                 && sibling.status() == Status::Queued
-                && sibling.lock_by().as_deref() == Some(outcome.expected_worker.as_str())
+                && sibling.lock_by() == Some(outcome.expected_worker.as_str())
                 && sibling.lock_at().is_some()
                 && sibling.attempt() == 0
         });

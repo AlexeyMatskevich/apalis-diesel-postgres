@@ -815,9 +815,7 @@ mod tests {
 
     fn successful_fetch_observation() -> PollObservation {
         let mut fetcher = buffered_fetcher();
-        let task = TaskBuilder::new(vec![1, 2, 3])
-            .with_ctx(PgContext::new())
-            .build();
+        let task = TaskBuilder::new(vec![1, 2, 3]).build();
         fetcher.state = StreamState::Fetch(future::ready(Ok(vec![task])).boxed());
         poll_observation(&mut fetcher)
     }
@@ -884,9 +882,7 @@ mod tests {
     }
 
     fn synthetic_task(payload: &[u8]) -> PgTask<CompactType> {
-        TaskBuilder::new(payload.to_vec())
-            .with_ctx(PgContext::new())
-            .build()
+        TaskBuilder::new(payload.to_vec()).build()
     }
 
     fn take_pending_count(state_kind: &'static str) -> usize {
@@ -1020,11 +1016,9 @@ mod tests {
 
     fn independent_pollers(factory_enabled: bool) -> (&'static str, &'static str) {
         use apalis_core::backend::ext::poll_strategy::{Strategy, StreamStrategy};
-        let config = Config::new("independent-strategies").with_poll_interval(
-            Strategy::new()
-                .apply(StreamStrategy::new(stream::pending::<()>()))
-                .build(),
-        );
+        let config = Config::new("independent-strategies").with_poll_strategy(|| {
+            Strategy::new().apply(StreamStrategy::new(stream::pending::<()>()))
+        });
         let factory = factory_enabled
             .then(|| PollStrategyFactory::new(|| StreamStrategy::new(stream::pending::<()>())));
         let pool = unreachable_pool();
@@ -1154,9 +1148,11 @@ mod tests {
         expect(independent_pollers(factory_enabled)) as independent_polling_strategies {
             let factory_enabled = true;
             to gives_each_worker_an_independent_pending_strategy { equal(("pending", "pending")) }
-            when a_legacy_config_is_reused_without_a_factory {
+            when a_config_is_reused_without_a_factory {
                 let factory_enabled = false;
-                to reports_the_consumed_strategy_instead_of_bypassing_its_gate { equal(("pending", "error")) }
+                // The config holds a strategy factory, not a strategy that the
+                // first worker consumes, so the second worker gets its own.
+                to gives_each_worker_its_own_strategy_from_the_config { equal(("pending", "pending")) }
             }
         }
         expect(strategy_reports_eof_once()) as exhausted_polling_strategy {
@@ -1358,7 +1354,7 @@ mod tests {
 
         #[allow(clippy::type_complexity)]
         fn poll_error_mentions_connection_failure(
-            result: &Option<Result<Option<Task<CompactType, PgContext, ulid::Ulid>>, Error>>,
+            result: &Option<Result<Option<PgTask<CompactType>>, Error>>,
         ) -> AssertionResult {
             match result {
                 Some(Err(Error::Pool(_))) => Ok(()),
@@ -1373,7 +1369,7 @@ mod tests {
         /// starts a fetch; if it dropped the permit it would fall back to the
         /// pending tail and the stream would hang instead of erroring.
         async fn wait_for_poll_permit_launches_fetch()
-        -> Option<Result<Option<Task<CompactType, PgContext, ulid::Ulid>>, Error>> {
+        -> Option<Result<Option<PgTask<CompactType>>, Error>> {
             let mut fetcher = buffered_fetcher();
             let poller: Poller =
                 Box::pin(stream::once(future::ready(())).chain(stream::pending::<()>()));

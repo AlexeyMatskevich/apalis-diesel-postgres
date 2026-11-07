@@ -136,10 +136,12 @@ fn observe_fetched(task: crate::PgTask<crate::CompactType>) -> FetchedRow {
     FetchedRow {
         id: task.task_id().cloned().unwrap().to_string(),
         status: task.status().to_string(),
-        lock_by: task.lock_by().clone(),
+        lock_by: task.lock_by().map(str::to_owned),
         lock_at_present: task.lock_at().is_some(),
-        done_at_null: task.parts.ctx.done_at().is_none(),
-        priority: task.priority(),
+        done_at_null: task.done_at().is_none(),
+        priority: task
+            .priority()
+            .map_or(0, |priority| i32::try_from(priority).unwrap_or(i32::MAX)),
     }
 }
 

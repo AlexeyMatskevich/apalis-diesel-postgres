@@ -50,9 +50,6 @@ pub(crate) struct JobRow {
     pub(crate) idempotency_key: Option<String>,
 }
 
-/// The default `max_attempts` of a row that has none, as `apalis-sql` used.
-const DEFAULT_MAX_ATTEMPTS: usize = 25;
-
 impl JobRow {
     /// Build the compact task this row stores.
     ///
@@ -70,13 +67,15 @@ impl JobRow {
             .queue(self.job_type.into())
             .status(status)
             .attempt(self.attempts.max(0) as usize)
-            .max_attempts(usize::try_from(self.max_attempts).unwrap_or(DEFAULT_MAX_ATTEMPTS))
-            .priority(self.priority.unwrap_or_default().max(0) as usize)
+            .max_attempts(self.max_attempts.max(0) as usize)
             .run_at_timestamp(run_at)
             .lock_at(self.lock_at.and_then(unix))
             .lock_by(self.lock_by)
             .done_at(self.done_at.and_then(unix))
             .with_metadata(metadata_from_json(self.metadata));
+        if let Some(priority) = self.priority {
+            task = task.priority(priority.max(0) as usize);
+        }
         if let Some(key) = self.idempotency_key {
             task = task.idempotency_key(key);
         }
@@ -262,7 +261,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apalis_core::backend::StatType;
+    use apalis_core::backend::{StatType, queue::Queue};
     use lets_expect::{AssertionError, AssertionResult, *};
     use serde_json::json;
 
@@ -415,12 +414,12 @@ mod tests {
 
     /// Convert a `JobRow` carrying the given `metadata` JSON into a compact task
     /// and return its metadata re-serialized. apalis-sql's
-    /// `try_into_task_compact` does `metadata.as_object().cloned().unwrap()`
+    /// `try_into_task_compact` did `metadata.as_object().cloned().unwrap()`
     /// (`from_row.rs`), so any non-object JSONB — which a third-party writer can
     /// insert straight into `apalis.jobs`, bypassing this crate's push API —
     /// used to panic during row conversion. In the polling path that panic
     /// fires mid-batch, stranding every co-claimed row as `Queued`. Coercing
-    /// non-object metadata to an empty object in `From<JobRow>` keeps the
+    /// non-object metadata to an empty object in `JobRow::into_task` keeps the
     /// conversion total, matching apalis-sql's own defensive `try_into_task`.
     fn compact_metadata_json(metadata: Value) -> Result<String, String> {
         let mut row = job_row(
@@ -431,18 +430,22 @@ mod tests {
             None,
             Some(json!({"ok": true})),
         );
-        // `try_into_task_compact` parses `id` and `status`; the shared `job_row`
-        // helper stores placeholders that only the (non-parsing) `From`
-        // conversion tolerates, so give it a real ULID and a parseable status.
         row.id = Ulid::generate().to_string();
         row.status = "Pending".to_owned();
-        let task = TaskRow::from(row)
-            .try_into_task_compact::<Ulid, crate::PgPool>()
-            .map_err(|error| error.to_string())?;
-        serde_json::to_string(task.metadata()).map_err(|error| error.to_string())
+        let task = row.into_task().map_err(|error| error.to_string())?;
+        serde_json::to_string(&metadata_to_json(task.metadata())).map_err(|error| error.to_string())
     }
 
-    fn forwarded_task_record(has_completion: bool) -> TaskRow {
+    /// The task a row converts to. `into_task` parses `id` and `status`; the
+    /// shared `job_row` helper stores placeholders, so give it a real ULID and
+    /// a parseable status.
+    fn task_from(mut row: JobRow) -> PgTask<CompactType> {
+        row.id = Ulid::from(1u128).to_string();
+        row.status = "Pending".to_owned();
+        row.into_task().expect("the row converts")
+    }
+
+    fn forwarded_task_record(has_completion: bool) -> PgTask<CompactType> {
         let mut row = job_row(
             1,
             3,
@@ -455,7 +458,7 @@ mod tests {
         row.lock_at = has_completion.then(|| <DateTime as DateTimeExt>::from_unix_timestamp(456));
         row.lock_by = has_completion.then(|| "worker-1".to_owned());
         row.done_at = has_completion.then(|| <DateTime as DateTimeExt>::from_unix_timestamp(789));
-        TaskRow::from(row)
+        task_from(row)
     }
 
     lets_expect! {
@@ -463,27 +466,27 @@ mod tests {
             let has_completion = true;
             when ownership_and_completion_are_present {
                 to preserves_the_record_fields {
-                    have(job) equal(vec![1, 2, 3]),
-                    have(id) equal("task-1".to_owned()),
-                    have(job_type) equal("email".to_owned()),
-                    have(status) equal("pending".to_owned()),
-                    have(run_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(123))),
-                    have(lock_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(456))),
-                    have(lock_by) equal(Some("worker-1".to_owned())),
-                    have(done_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(789)))
+                    have(args.clone()) equal(vec![1, 2, 3]),
+                    have(task_id()) equal(Some(&TaskId::from_ulid(Ulid::from(1u128)))),
+                    have(queue()) equal(Some(&Queue::from("email"))),
+                    have(status()) equal(Status::Pending),
+                    have(run_at()) equal(Some(123)),
+                    have(lock_at()) equal(Some(456)),
+                    have(lock_by()) equal(Some("worker-1")),
+                    have(done_at()) equal(Some(789))
                 }
             }
             when ownership_and_completion_are_absent {
                 let has_completion = false;
                 to preserves_the_unowned_record {
-                    have(job) equal(vec![1, 2, 3]),
-                    have(id) equal("task-1".to_owned()),
-                    have(job_type) equal("email".to_owned()),
-                    have(status) equal("pending".to_owned()),
-                    have(run_at) equal(Some(<DateTime as DateTimeExt>::from_unix_timestamp(123))),
-                    have(lock_at) equal(None),
-                    have(lock_by) equal(None),
-                    have(done_at) equal(None)
+                    have(args.clone()) equal(vec![1, 2, 3]),
+                    have(task_id()) equal(Some(&TaskId::from_ulid(Ulid::from(1u128)))),
+                    have(queue()) equal(Some(&Queue::from("email"))),
+                    have(status()) equal(Status::Pending),
+                    have(run_at()) equal(Some(123)),
+                    have(lock_at()) equal(None),
+                    have(lock_by()) equal(None),
+                    have(done_at()) equal(None)
                 }
             }
         }
@@ -523,7 +526,7 @@ mod tests {
             }
         }
 
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_attempt_count {
+        expect(task_from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_attempt_count {
             let attempts = 1;
             let max_attempts = 3;
             let priority = Some(9);
@@ -531,20 +534,20 @@ mod tests {
             let idempotency_key = expected_idempotency_key();
             let last_result: Option<Value> = Some(json!({"ok": true}));
 
-            to preserves_the_positive_attempt_count { have(attempts) equal(1) }
+            to preserves_the_positive_attempt_count { have(attempt()) equal(1) }
 
             when attempts_is_zero {
                 let attempts = 0;
-                to preserves_zero_attempts { have(attempts) equal(0) }
+                to preserves_zero_attempts { have(attempt()) equal(0) }
             }
 
             when attempts_is_negative {
                 let attempts = -1;
-                to clamps_attempts_to_zero { have(attempts) equal(0) }
+                to clamps_attempts_to_zero { have(attempt()) equal(0) }
             }
         }
 
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_attempt_budget {
+        expect(task_from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_attempt_budget {
             let attempts = 1;
             let max_attempts = 3;
             let priority = Some(9);
@@ -552,20 +555,20 @@ mod tests {
             let idempotency_key = expected_idempotency_key();
             let last_result: Option<Value> = Some(json!({"ok": true}));
 
-            to preserves_the_positive_attempt_limit { have(max_attempts) equal(Some(3)) }
+            to preserves_the_positive_attempt_limit { have(max_attempts()) equal(Some(3)) }
 
             when max_attempts_is_zero {
                 let max_attempts = 0;
-                to preserves_zero_as_the_attempt_limit { have(max_attempts) equal(Some(0)) }
+                to preserves_zero_as_the_attempt_limit { have(max_attempts()) equal(Some(0)) }
             }
 
             when max_attempts_is_negative {
                 let max_attempts = -1;
-                to clamps_the_attempt_limit_to_zero { have(max_attempts) equal(Some(0)) }
+                to clamps_the_attempt_limit_to_zero { have(max_attempts()) equal(Some(0)) }
             }
         }
 
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_priority {
+        expect(task_from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_priority {
             let attempts = 1;
             let max_attempts = 3;
             let priority = Some(9);
@@ -575,23 +578,23 @@ mod tests {
 
             when priority_is_absent {
                 let priority = None;
-                to leaves_priority_absent { have(priority) equal(None) }
+                to leaves_priority_absent { have(priority()) equal(None) }
             }
 
-            to preserves_the_positive_priority { have(priority) equal(Some(9)) }
+            to preserves_the_positive_priority { have(priority()) equal(Some(9)) }
 
             when priority_is_zero {
                 let priority = Some(0);
-                to preserves_zero_priority { have(priority) equal(Some(0)) }
+                to preserves_zero_priority { have(priority()) equal(Some(0)) }
             }
 
             when priority_is_negative {
                 let priority = Some(-1);
-                to clamps_priority_to_zero { have(priority) equal(Some(0)) }
+                to clamps_priority_to_zero { have(priority()) equal(Some(0)) }
             }
         }
 
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_metadata {
+        expect(task_from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_metadata {
             let attempts = 1;
             let max_attempts = 3;
             let priority = Some(9);
@@ -599,14 +602,14 @@ mod tests {
             let idempotency_key = expected_idempotency_key();
             let last_result: Option<Value> = Some(json!({"ok": true}));
 
-            to preserves_present_metadata { have(metadata) equal(expected_metadata()) }
+            to preserves_present_metadata { have(metadata()) equal(&metadata_from_json(expected_metadata())) }
             when metadata_is_absent {
                 let metadata = None;
-                to leaves_metadata_absent { have(metadata) equal(None) }
+                to leaves_metadata_absent { have(metadata()) equal(&MetadataStore::new()) }
             }
         }
 
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_deduplication_key {
+        expect(task_from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_deduplication_key {
             let attempts = 1;
             let max_attempts = 3;
             let priority = Some(9);
@@ -614,32 +617,10 @@ mod tests {
             let idempotency_key = expected_idempotency_key();
             let last_result: Option<Value> = Some(json!({"ok": true}));
 
-            to preserves_the_key { have(idempotency_key) equal(expected_idempotency_key()) }
+            to preserves_the_key { have(idempotency_key()) equal(Some("same-request")) }
             when the_key_is_absent {
                 let idempotency_key = None;
-                to leaves_the_key_absent { have(idempotency_key) equal(None) }
-            }
-        }
-
-        expect(TaskRow::from(job_row(attempts, max_attempts, priority, metadata.clone(), idempotency_key.clone(), last_result.clone()))) as task_last_result {
-            let attempts = 1;
-            let max_attempts = 3;
-            let priority = Some(9);
-            let metadata = expected_metadata();
-            let idempotency_key = expected_idempotency_key();
-            let last_result: Option<Value> = Some(json!({"ok": true}));
-
-            to forwards_the_present_last_result { have(last_result) equal(Some(json!({"ok": true}))) }
-
-            when last_result_is_null {
-                // `last_result` is `Nullable<Jsonb>`; NULL is a legitimate,
-                // documented state (a task that has never produced a result).
-                // `From<JobRow>` forwards it verbatim (`last_result:
-                // row.last_result`), so a regression that dropped or defaulted
-                // it to `None` for a non-null row — or vice versa — must fail
-                // here rather than only on a SQL round-trip.
-                let last_result: Option<Value> = None;
-                to forwards_the_absent_last_result { have(last_result) equal(None) }
+                to leaves_the_key_absent { have(idempotency_key()) equal(None) }
             }
         }
 

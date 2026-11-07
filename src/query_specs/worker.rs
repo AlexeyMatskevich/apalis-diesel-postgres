@@ -11,9 +11,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::config::{DateTime, DateTimeExt};
 use apalis_core::task::task_id::TaskId;
 use apalis_diesel_postgres::{PgPool, PgTaskId};
-use apalis_sql::{DateTime, DateTimeExt};
 use diesel::{
     Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text, Timestamptz},
