@@ -574,3 +574,24 @@ pub fn metadata_store(
             .collect(),
     )
 }
+
+/// The `timestamptz` columns as the crate reads them, which apalis-sql
+/// exported before apalis 1.0.
+#[allow(dead_code)]
+pub type DateTime = chrono::DateTime<chrono::Utc>;
+
+#[allow(dead_code)]
+pub trait DateTimeExt {
+    fn from_unix_timestamp(secs: i64) -> Self;
+    fn to_unix_timestamp(&self) -> i64;
+}
+
+impl DateTimeExt for DateTime {
+    fn from_unix_timestamp(secs: i64) -> Self {
+        Self::from_timestamp(secs, 0).unwrap_or_default()
+    }
+
+    fn to_unix_timestamp(&self) -> i64 {
+        self.timestamp()
+    }
+}

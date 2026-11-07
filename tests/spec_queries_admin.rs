@@ -95,7 +95,7 @@ fn now_unix() -> u64 {
 }
 
 fn fresh_task_id() -> String {
-    TaskId::<Ulid>::from_str(&Ulid::generate().to_string())
+    TaskId::from_str(&Ulid::generate().to_string())
         .expect("generated ULID parses as task id")
         .to_string()
 }

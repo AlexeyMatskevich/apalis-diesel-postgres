@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use apalis_core::{
     backend::{
-        Backend, TaskSink,
+        TaskSink,
         ext::poll_strategy::{Strategy, StreamStrategy},
     },
     worker::context::WorkerContext,
@@ -63,11 +63,9 @@ async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
 }
 
 fn notify_only_config(queue: &str) -> Config {
-    Config::new(queue).set_buffer_size(2).with_poll_interval(
-        Strategy::new()
-            .apply(StreamStrategy::new(stream::pending::<()>()))
-            .build(),
-    )
+    Config::new(queue)
+        .set_buffer_size(2)
+        .with_poll_strategy(|| Strategy::new().apply(StreamStrategy::new(stream::pending::<()>())))
 }
 
 async fn next_task<Args>(

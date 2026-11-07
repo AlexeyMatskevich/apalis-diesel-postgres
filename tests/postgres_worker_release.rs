@@ -20,7 +20,7 @@ use std::{
 
 use apalis::prelude::*;
 use apalis_core::{
-    backend::{Backend, FetchById, TaskSink, Vacuum},
+    backend::{FetchById, TaskSink, Vacuum},
     task::status::Status,
     worker::context::WorkerContext,
 };

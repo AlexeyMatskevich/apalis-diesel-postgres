@@ -90,11 +90,11 @@ async fn failed_batch(
             .build()
     };
     storage
-        .feed(task(first_id))
+        .feed(task(first_id.clone()))
         .await
         .map_err(|e| e.to_string())?;
     storage
-        .feed(task(second_id))
+        .feed(task(second_id.clone()))
         .await
         .map_err(|e| e.to_string())?;
     let first_conflict = matches!(
@@ -166,7 +166,7 @@ async fn completion_boundary(
     let id = PgTaskId::from_ulid(ulid::Ulid::generate());
     // A keyed batch takes an explicit transaction, whose COMMIT the proxy observes.
     let task = TaskBuilder::new(b"{}".to_vec())
-        .task_id(id)
+        .task_id(id.clone())
         .idempotency_key("boundary")
         .queue(queue.into())
         .build();
@@ -262,7 +262,10 @@ async fn interleaved_submission() -> Result<support::Outcome<InterleavingObserva
     };
     let mut storage = Storage::new_with_config(&pool, &config);
     let holder = pool.get().map_err(|e| e.to_string())?;
-    storage.feed(task(a)).await.map_err(|e| e.to_string())?;
+    storage
+        .feed(task(a.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
     // Reserve capacity for B before beginning a flush of A. Every start_send
     // is preceded by a successful poll_ready, as the public Sink requires.
     futures::future::poll_fn(|cx| Pin::new(&mut storage).poll_ready(cx))
@@ -273,7 +276,7 @@ async fn interleaved_submission() -> Result<support::Outcome<InterleavingObserva
             .await
             .is_pending();
     Pin::new(&mut storage)
-        .start_send(task(b))
+        .start_send(task(b.clone()))
         .map_err(|e| e.to_string())?;
     drop(holder);
     storage.flush().await.map_err(|e| e.to_string())?;

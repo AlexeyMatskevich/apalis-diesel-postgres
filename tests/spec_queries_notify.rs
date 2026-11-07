@@ -33,7 +33,7 @@ mod support;
 
 use std::time::Duration;
 
-use apalis_core::{backend::Backend, worker::context::WorkerContext};
+use apalis_core::worker::context::WorkerContext;
 use apalis_diesel_postgres::{Config, PgPool, PgTask, PostgresStorage};
 use diesel::{PgConnection, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
@@ -438,15 +438,15 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
     .await?;
 
     // Spin up the storage stream (it LISTENs).
-    let config = Config::new(&queue).set_buffer_size(8).with_poll_interval(
-        apalis_core::backend::ext::poll_strategy::Strategy::new()
-            .apply(
+    let config = Config::new(&queue)
+        .set_buffer_size(8)
+        .with_poll_strategy(|| {
+            apalis_core::backend::ext::poll_strategy::Strategy::new().apply(
                 apalis_core::backend::ext::poll_strategy::StreamStrategy::new(
                     futures::stream::pending::<()>(),
                 ),
             )
-            .build(),
-    );
+        });
     let storage = PostgresStorage::<String>::new_with_notify(&pool, &config);
     let worker = WorkerContext::new(&format!("notify-legacy-worker-{queue}"));
     let mut stream = storage.clone().poll(&worker);

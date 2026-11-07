@@ -3,7 +3,6 @@
 #[path = "support/one_at_a_time.rs"]
 mod one_at_a_time;
 mod support;
-use support::EditTask;
 #[path = "support/unreachable.rs"]
 mod unreachable;
 async fn database_case<T, F: Future<Output = T>>(
@@ -64,7 +63,7 @@ fn completion_recovered()
 }
 
 mod claims {
-    use apalis_core::{backend::Backend, worker::context::WorkerContext};
+    use apalis_core::worker::context::WorkerContext;
     use apalis_diesel_postgres::{Config, PgPool, PostgresStorage, build_pool, setup};
     use diesel::{
         QueryableByName, RunQueryDsl, sql_query,
@@ -338,7 +337,6 @@ mod races {
     use crate::support::EditTask;
     use apalis_core::{
         error::BoxDynError,
-        task::attempt::Attempt,
         worker::{context::WorkerContext, ext::ack::Acknowledge},
     };
     use apalis_diesel_postgres::{Config, PgAck, PgPool, PostgresStorage, build_pool, setup};
@@ -491,9 +489,9 @@ mod races {
 mod retirement {
     use crate::support::EditTask;
     use apalis_core::{
-        backend::{Backend, FetchById, TaskSink},
+        backend::{FetchById, TaskSink},
         layers::{Layer, Service},
-        task::{attempt::Attempt, builder::TaskBuilder},
+        task::builder::TaskBuilder,
         worker::context::WorkerContext,
     };
     use apalis_diesel_postgres::{
@@ -709,7 +707,7 @@ mod retirement {
 
 mod registered_middleware {
     use apalis_core::{
-        backend::{Backend, FetchById, TaskSink},
+        backend::{FetchById, TaskSink},
         layers::{Layer, Service},
         task::builder::TaskBuilder,
         worker::context::WorkerContext,
@@ -911,7 +909,7 @@ mod registered_middleware {
 mod unpolled_stream {
     use crate::support::EditTask;
     use apalis_core::{
-        backend::{Backend, TaskSink, ext::poll_strategy::IntervalStrategy},
+        backend::{TaskSink, ext::poll_strategy::IntervalStrategy},
         task::Task,
         worker::context::WorkerContext,
     };
@@ -1214,7 +1212,7 @@ mod dropped_stream {
 // The persisted retry budget schedules attempts; an in-process re-dispatch of
 // an acknowledged claim is refused instead of running and reporting stale.
 mod redispatched_claim {
-    use apalis::layers::{WorkerBuilderExt, retry::RetryPolicy};
+    use apalis::layers::retry::RetryPolicy;
     use apalis_core::{
         backend::{FetchById, TaskSink, ext::poll_strategy::IntervalStrategy},
         error::{BoxDynError, WorkerError},
@@ -1589,7 +1587,7 @@ mod token_free_registration {
     use apalis_core::{
         backend::{RegisterWorker, TaskSink},
         error::BoxDynError,
-        task::{attempt::Attempt, builder::TaskBuilder},
+        task::builder::TaskBuilder,
         worker::{context::WorkerContext, ext::ack::Acknowledge},
     };
     use apalis_diesel_postgres::{
@@ -1774,7 +1772,7 @@ mod attempt_accounting {
     use apalis_core::{
         backend::RegisterWorker,
         layers::{Layer, Service},
-        task::{attempt::Attempt, builder::TaskBuilder},
+        task::builder::TaskBuilder,
         worker::{context::WorkerContext, ext::ack::Acknowledge},
     };
     use apalis_diesel_postgres::{
@@ -1784,10 +1782,7 @@ mod attempt_accounting {
         QueryableByName, RunQueryDsl, sql_query,
         sql_types::{Integer, Jsonb},
     };
-    use futures::{
-        FutureExt, StreamExt,
-        future::{BoxFuture, Either},
-    };
+    use futures::{FutureExt, StreamExt, future::BoxFuture};
     use lets_expect::*;
     use serde_json::{Value, json};
     use std::{

@@ -15,16 +15,15 @@ use std::{
 
 use apalis_core::backend::{ListQueues, ListWorkers};
 use apalis_core::{
-    backend::{Backend, RegisterWorker, TaskSink, TaskSinkError},
+    backend::{RegisterWorker, TaskSink, TaskSinkError},
     error::BoxDynError,
-    task::{Task, attempt::Attempt, builder::TaskBuilder, status::Status, task_id::TaskId},
+    task::{Task, builder::TaskBuilder, status::Status, task_id::TaskId},
     worker::{context::WorkerContext, ext::ack::Acknowledge},
 };
 use apalis_diesel_postgres::{
     Config, Error as PgError, PgAck, PgPool, PgTaskId, PostgresStorage,
     refresh_queue_stats_snapshot, setup, verify_schema,
 };
-use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
 use diesel::{
     Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz},
@@ -33,6 +32,7 @@ use futures::StreamExt;
 use lets_expect::{AssertionResult, *};
 use serde_json::Value;
 use std::sync::Arc;
+use support::{DateTime, DateTimeExt};
 use ulid::Ulid;
 
 async fn test_pool() -> Result<Option<PgPool>, String> {
@@ -65,17 +65,12 @@ fn task_id() -> PgTaskId {
     TaskId::from_str(&Ulid::generate().to_string()).expect("generated ULID parses as task id")
 }
 
-fn task(
-    payload: &'static str,
-    run_at: u64,
-    attempts: usize,
-    max_attempts: i32,
-) -> Task<String, Ulid> {
+fn task(payload: &'static str, run_at: u64, attempts: usize, max_attempts: i32) -> Task<String> {
     TaskBuilder::new(payload.to_owned())
         .task_id(task_id())
         .run_at_timestamp(run_at)
         .attempt(attempts)
-        .with_ctx(SqlContext::new().with_max_attempts(max_attempts))
+        .max_attempts(usize::try_from(max_attempts).expect("a non-negative max_attempts"))
         .build()
 }
 
@@ -1527,7 +1522,7 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
         .task_id(task_id())
         .run_at_timestamp(now_unix())
         .attempt(0)
-        .with_ctx(SqlContext::new().with_max_attempts(5))
+        .max_attempts(5)
         .idempotency_key("shared-key")
         .build();
     seed_storage
@@ -1541,7 +1536,7 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
     // accountant in `push_tasks_on_conn` (src/queries/push.rs).
     let config = Config::new(&queue).set_buffer_size(3);
     let mut batch_storage = PostgresStorage::<String>::new_with_config(&pool, &config);
-    let batch: Vec<Task<String, Ulid>> = (0..3)
+    let batch: Vec<Task<String>> = (0..3)
         .map(|i| {
             TaskBuilder::new(format!("dup-{i}"))
                 .task_id(task_id())
@@ -1655,7 +1650,7 @@ async fn run_mixed_batch_conflict() -> Result<Outcome<PartialBatchRun>, String> 
         .task_id(task_id())
         .run_at_timestamp(now_unix())
         .attempt(0)
-        .with_ctx(SqlContext::new().with_max_attempts(5))
+        .max_attempts(5)
         .idempotency_key("shared-key")
         .build();
     seed_storage
@@ -1668,7 +1663,7 @@ async fn run_mixed_batch_conflict() -> Result<Outcome<PartialBatchRun>, String> 
     let config = Config::new(&queue).set_buffer_size(3);
     let mut batch_storage = PostgresStorage::<String>::new_with_config(&pool, &config);
     let keys = ["fresh-a", "shared-key", "fresh-b"];
-    let batch: Vec<Task<String, Ulid>> = keys
+    let batch: Vec<Task<String>> = keys
         .into_iter()
         .enumerate()
         .map(|(i, key)| {
@@ -1780,7 +1775,7 @@ async fn run_intrabatch_dup_with_nulls() -> Result<Outcome<PartialBatchRun>, Str
     let config = Config::new(&queue).set_buffer_size(4);
     let mut batch_storage = PostgresStorage::<String>::new_with_config(&pool, &config);
     let specs: [Option<&str>; 4] = [Some("dup-key"), None, Some("dup-key"), Some("unique-key")];
-    let batch: Vec<Task<String, Ulid>> = specs
+    let batch: Vec<Task<String>> = specs
         .into_iter()
         .enumerate()
         .map(|(i, key)| {
@@ -1900,12 +1895,12 @@ async fn run_metadata_cap(meta_payload_len: usize) -> Result<Outcome<MetadataCap
         "payload".to_owned(),
         serde_json::Value::String("x".repeat(value_len)),
     );
-    let ctx = PgContext::new().with_max_attempts(5).with_meta(meta);
     let task = TaskBuilder::new("metadata-cap-target".to_owned())
         .task_id(task_id())
         .run_at_timestamp(now_unix())
         .attempt(0)
-        .with_ctx(ctx)
+        .max_attempts(5)
+        .with_metadata(support::metadata_store(&meta))
         .build();
 
     let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
@@ -2072,12 +2067,11 @@ async fn run_idempotency_cap(key_len: usize) -> Result<Outcome<IdempotencyCapRun
     let queue = format!("apalis-spec-idem-cap-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    let ctx = PgContext::new().with_max_attempts(5);
     let task = TaskBuilder::new("idempotency-cap-target".to_owned())
         .task_id(task_id())
         .run_at_timestamp(now_unix())
         .attempt(0)
-        .with_ctx(ctx)
+        .max_attempts(5)
         .idempotency_key("k".repeat(key_len))
         .build();
 
@@ -2175,12 +2169,11 @@ async fn run_queue_name_cap(name_len: usize) -> Result<Outcome<QueueNameCapRun>,
     let queue = format!("{prefix}{}", "x".repeat(pad));
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
-    let ctx = PgContext::new().with_max_attempts(5);
     let task = TaskBuilder::new("queue-name-cap-target".to_owned())
         .task_id(task_id())
         .run_at_timestamp(now_unix())
         .attempt(0)
-        .with_ctx(ctx)
+        .max_attempts(5)
         .build();
 
     let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
@@ -2440,20 +2433,18 @@ async fn run_ack_predicate(setup: AckSetup) -> Result<Outcome<AckPredicateRun>, 
     let parts_task_id = if setup.fabricate_unknown_task_id {
         TaskId::from_str(&Ulid::generate().to_string()).map_err(|e| e.to_string())?
     } else {
-        id
+        id.clone()
     };
     let parts = TaskBuilder::new(())
         .task_id(parts_task_id)
         .attempt(attempt_value)
-        .with_ctx(
-            PgContext::new()
-                .with_max_attempts(2)
-                .with_queue(parts_queue)
-                .with_lock_at(Some(parts_lock_at))
-                .with_lock_by(Some(parts_lock_by)),
-        )
-        .build()
-        .parts;
+        .max_attempts(2)
+        .queue(parts_queue.into())
+        .lock_at(Some(
+            u64::try_from(parts_lock_at).expect("a post-epoch lock_at"),
+        ))
+        .lock_by(Some(parts_lock_by))
+        .build();
 
     let mut ack = match setup.pgack_token {
         Some(t) => PgAck::with_lease_token(&pool, Arc::<str>::from(t)),

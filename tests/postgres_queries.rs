@@ -14,17 +14,17 @@ use std::{
 
 use apalis_core::{
     backend::{
-        Backend, FetchById, Filter, ListAllTasks, ListQueues, ListTasks, ListWorkers, Metrics,
+        FetchById, Filter, ListAllTasks, ListQueues, ListTasks, ListWorkers, Metrics,
         RegisterWorker, TaskSink, WaitForCompletion,
+        ext::poll_strategy::{BackoffConfig, IntervalStrategy, PollStrategy},
     },
     error::BoxDynError,
-    task::{Task, attempt::Attempt, builder::TaskBuilder, status::Status, task_id::TaskId},
+    task::{Task, builder::TaskBuilder, status::Status, task_id::TaskId},
     worker::{context::WorkerContext, ext::ack::Acknowledge},
 };
 use apalis_diesel_postgres::{
     Config, PgAck, PgPool, PgTask, PgTaskId, PostgresStorage, lock_task, lock_task_in_queue,
 };
-use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
 use diesel::{
     QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz},
@@ -32,6 +32,7 @@ use diesel::{
 use futures::StreamExt;
 use lets_expect::{AssertionResult, *};
 use serde_json::Value;
+use support::{DateTime, DateTimeExt};
 use ulid::Ulid;
 
 #[derive(Debug, QueryableByName)]
@@ -302,12 +303,12 @@ fn task(
     attempts: usize,
     max_attempts: i32,
     idempotency_key: Option<&'static str>,
-) -> Task<String, Ulid> {
+) -> Task<String> {
     let mut builder = TaskBuilder::new(payload.to_owned())
         .task_id(task_id())
         .run_at_timestamp(run_at)
         .attempt(attempts)
-        .with_ctx(SqlContext::new().with_max_attempts(max_attempts));
+        .max_attempts(usize::try_from(max_attempts).expect("a non-negative max_attempts"));
     if let Some(key) = idempotency_key {
         builder = builder.idempotency_key(key);
     }
@@ -322,6 +323,17 @@ struct PushFetchRun {
     second_args: String,
     delayed_args: Option<String>,
     delayed_pending: bool,
+}
+
+/// A payload as the default JSON codec stores it. apalis 1.0's admin
+/// traits return tasks with their stored (compact) payload.
+fn decoded(args: &[u8]) -> String {
+    serde_json::from_slice(args).expect("a JSON-encoded string payload")
+}
+
+/// The crate's default poll strategy, built fresh for each worker.
+fn default_poll_strategy() -> impl PollStrategy {
+    IntervalStrategy::new(Duration::from_millis(100)).with_backoff(BackoffConfig::default())
 }
 
 async fn run_push_fetch() -> Result<Outcome<PushFetchRun>, String> {
@@ -363,7 +375,7 @@ async fn run_push_fetch() -> Result<Outcome<PushFetchRun>, String> {
         delayed_pending: fetched_later
             .as_ref()
             .is_some_and(|t| t.status() == Status::Pending),
-        delayed_args: fetched_later.map(|t| t.args),
+        delayed_args: fetched_later.map(|t| decoded(&t.args)),
     }))
 }
 
@@ -449,7 +461,7 @@ async fn run_fetch_by_id_cross_queue() -> Result<Outcome<CrossQueueRun>, String>
     cleanup_queue(pool.clone(), source_queue).await?;
     cleanup_queue(pool, observer_queue).await?;
     Ok(Outcome::Completed(CrossQueueRun {
-        fetched_args: fetched.map(|t| t.args),
+        fetched_args: fetched.map(|t| decoded(&t.args)),
     }))
 }
 
@@ -640,17 +652,13 @@ async fn run_ack_boundary_with_error(
     )
     .await?;
     let parts = TaskBuilder::new(())
-        .task_id(id)
+        .task_id(id.clone())
         .attempt(attempts)
-        .with_ctx(
-            PgContext::new()
-                .with_max_attempts(2)
-                .with_queue(queue.clone())
-                .with_lock_at(Some(lock_at.to_unix_timestamp()))
-                .with_lock_by(Some(worker_name)),
-        )
-        .build()
-        .parts;
+        .max_attempts(2)
+        .queue(queue.clone().into())
+        .lock_at(Some(lock_at.to_unix_timestamp() as u64))
+        .lock_by(Some(worker_name))
+        .build();
 
     let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Err(std::io::Error::other(error_text).into());
@@ -781,22 +789,18 @@ async fn run_ack_stale() -> Result<Outcome<AckStaleRun>, String> {
     )
     .await?;
     let parts = TaskBuilder::new(())
-        .task_id(id)
+        .task_id(id.clone())
         .attempt(1)
-        .with_ctx(
-            PgContext::new()
-                .with_max_attempts(2)
-                .with_queue(queue.clone())
-                .with_lock_at(Some(lock_at.to_unix_timestamp()))
-                .with_lock_by(Some(format!("{worker_name}-stale"))),
-        )
-        .build()
-        .parts;
+        .max_attempts(2)
+        .queue(queue.clone().into())
+        .lock_at(Some(lock_at.to_unix_timestamp() as u64))
+        .lock_by(Some(format!("{worker_name}-stale")))
+        .build();
 
     let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Ok("processed".to_owned());
     let ack_result = ack.ack(&result, &parts).await;
-    let status = job_status(pool.clone(), id).await?;
+    let status = job_status(pool.clone(), id.clone()).await?;
     cleanup_queue(pool, queue).await?;
 
     Ok(Outcome::Completed(AckStaleRun {
@@ -950,18 +954,19 @@ async fn run_priority_ordering() -> Result<Outcome<PriorityOrderRun>, String> {
     // ASC must yield high → mid → low irrespective of insertion order.
     let now = now_unix();
     let low = task("low", now - 90, 0, 25, None);
-    let mut high_builder = TaskBuilder::new("high".to_owned())
+    let high = TaskBuilder::new("high".to_owned())
         .task_id(task_id())
         .run_at_timestamp(now - 30)
         .attempt(0)
-        .with_ctx(SqlContext::new().with_max_attempts(25).with_priority(9));
-    let _ = &mut high_builder;
-    let high = high_builder.build();
+        .max_attempts(25)
+        .priority(9)
+        .build();
     let mid = TaskBuilder::new("mid".to_owned())
         .task_id(task_id())
         .run_at_timestamp(now - 60)
         .attempt(0)
-        .with_ctx(SqlContext::new().with_max_attempts(25).with_priority(5))
+        .max_attempts(25)
+        .priority(5)
         .build();
 
     storage.push_task(low).await.map_err(|e| e.to_string())?;
@@ -1021,9 +1026,9 @@ async fn run_skip_locked_concurrency() -> Result<Outcome<SkipLockedRun>, String>
         .map_err(|e| e.to_string())?;
 
     let storage_a = PostgresStorage::<String>::new_with_config(&pool, &config)
-        .with_poll_strategy_factory(|| Config::default().poll_strategy().clone());
+        .with_poll_strategy_factory(default_poll_strategy);
     let storage_b = PostgresStorage::<String>::new_with_config(&pool, &config)
-        .with_poll_strategy_factory(|| Config::default().poll_strategy().clone());
+        .with_poll_strategy_factory(default_poll_strategy);
     let worker_a = WorkerContext::new(&format!("skip-locked-a-{queue}"));
     let worker_b = WorkerContext::new(&format!("skip-locked-b-{queue}"));
 
@@ -1492,12 +1497,13 @@ async fn run_listing_metrics() -> Result<Outcome<ListingMetricsRun>, String> {
         cleanup_queue(pool, other_queue.clone()).await?;
 
         let run = ListingMetricsRun {
-            listed_tasks_current_queue_only: listed.len() == 1 && listed[0].args == "pending",
+            listed_tasks_current_queue_only: listed.len() == 1
+                && decoded(&listed[0].args) == "pending",
             all_tasks_includes_both_queues: all
                 .iter()
                 .filter(|t| {
-                    t.queue().as_deref() == Some(queue.as_str())
-                        || t.queue().as_deref() == Some(other_queue.as_str())
+                    t.queue().map(AsRef::as_ref) == Some(queue.as_str())
+                        || t.queue().map(AsRef::as_ref) == Some(other_queue.as_str())
                 })
                 .count()
                 >= 2,
@@ -1627,7 +1633,7 @@ async fn completion_case(waiting: bool) -> Result<Outcome<CompletionRun>, String
     };
     let queue = format!("apalis-query-completion-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let id = insert_completed_task(
         pool.clone(),
         queue.clone(),
@@ -1641,17 +1647,19 @@ async fn completion_case(waiting: bool) -> Result<Outcome<CompletionRun>, String
 
     let result = if waiting {
         let mut stream =
-            <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id]);
+            <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&mut storage, [id]);
         tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .map_err(|_| "timed out waiting for completion".to_owned())?
             .ok_or_else(|| "completion stream ended".to_owned())?
             .map_err(|error| error.to_string())?
     } else {
-        let results =
-            <PostgresStorage<String> as WaitForCompletion<String>>::check_status(&storage, [id])
-                .await
-                .map_err(|e| e.to_string())?;
+        let results = <PostgresStorage<String> as WaitForCompletion<String>>::check_status(
+            &mut storage,
+            [id],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         results
             .into_iter()
             .next()
@@ -1681,7 +1689,8 @@ async fn completion_cross_queue(waiting: bool) -> Result<Outcome<CompletionRun>,
     cleanup_queue(pool.clone(), source_queue.clone()).await?;
     cleanup_queue(pool.clone(), observer_queue.clone()).await?;
 
-    let observer = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&observer_queue));
+    let mut observer =
+        PostgresStorage::<String>::new_with_config(&pool, &Config::new(&observer_queue));
     let id = insert_completed_task(
         pool.clone(),
         source_queue.clone(),
@@ -1695,17 +1704,19 @@ async fn completion_cross_queue(waiting: bool) -> Result<Outcome<CompletionRun>,
 
     let result = if waiting {
         let mut stream =
-            <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&observer, [id]);
+            <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&mut observer, [id]);
         tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .map_err(|_| "timed out waiting for cross-queue completion".to_owned())?
             .ok_or_else(|| "cross-queue completion stream ended".to_owned())?
             .map_err(|e| e.to_string())?
     } else {
-        let results =
-            <PostgresStorage<String> as WaitForCompletion<String>>::check_status(&observer, [id])
-                .await
-                .map_err(|e| e.to_string())?;
+        let results = <PostgresStorage<String> as WaitForCompletion<String>>::check_status(
+            &mut observer,
+            [id],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         results
             .into_iter()
             .next()
@@ -1747,11 +1758,12 @@ struct WaitEmptyRun {
 }
 
 async fn run_wait_empty() -> Result<Outcome<WaitEmptyRun>, String> {
-    let storage = PostgresStorage::<String>::new_with_config(
+    let mut storage = PostgresStorage::<String>::new_with_config(
         &unreachable_pool(),
         &Config::new("apalis-query-wait-empty"),
     );
-    let mut stream = <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, []);
+    let mut stream =
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&mut storage, []);
     let ended = stream.next().await.is_none();
     Ok(Outcome::Completed(WaitEmptyRun {
         stream_ended_immediately: ended,
@@ -1775,12 +1787,12 @@ struct WaitErrorRun {
 }
 
 async fn run_wait_error() -> Result<Outcome<WaitErrorRun>, String> {
-    let storage = PostgresStorage::<String>::new_with_config(
+    let mut storage = PostgresStorage::<String>::new_with_config(
         &unreachable_pool(),
         &Config::new("apalis-query-wait-error"),
     );
     let mut stream =
-        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [task_id()]);
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&mut storage, [task_id()]);
     let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
         .map_err(|_| "timed out waiting for wait_for error".to_owned())?
@@ -1812,7 +1824,7 @@ async fn run_wait_pending() -> Result<Outcome<WaitPendingRun>, String> {
     };
     let queue = format!("apalis-query-wait-pending-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let id = insert_pending_task(
         pool.clone(),
         queue.clone(),
@@ -1821,7 +1833,7 @@ async fn run_wait_pending() -> Result<Outcome<WaitPendingRun>, String> {
     .await?;
 
     let mut stream =
-        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id]);
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&mut storage, [id]);
     let timed_out = tokio::time::timeout(Duration::from_millis(100), stream.next())
         .await
         .is_err();
@@ -1854,12 +1866,12 @@ async fn run_wait_absent() -> Result<Outcome<WaitAbsentRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let storage = PostgresStorage::<String>::new_with_config(
+    let mut storage = PostgresStorage::<String>::new_with_config(
         &pool,
         &Config::new(&format!("apalis-query-wait-absent-{}", Ulid::generate())),
     );
     let mut stream =
-        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [task_id()]);
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&mut storage, [task_id()]);
     let first_item = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
         Err(_) => "pending",
         Ok(Some(Err(apalis_diesel_postgres::Error::TaskNotFound { .. }))) => "not_found",
@@ -1903,10 +1915,12 @@ async fn run_wait_late_enqueue() -> Result<Outcome<WaitLateRun>, String> {
     };
     let queue = format!("apalis-query-wait-late-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let id = task_id();
-    let mut stream =
-        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id]);
+    let mut stream = <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(
+        &mut storage,
+        [id.clone()],
+    );
     // Let the first poll observe the absence, then insert the completed row
     // before the second poll (the first backoff is 100 ms).
     let first_poll = tokio::time::timeout(Duration::from_millis(30), stream.next()).await;
@@ -1915,7 +1929,7 @@ async fn run_wait_late_enqueue() -> Result<Outcome<WaitLateRun>, String> {
             insert_completed_task_with_id(
                 pool.clone(),
                 queue.clone(),
-                id,
+                id.clone(),
                 "late",
                 "Done",
                 1,
@@ -1966,12 +1980,12 @@ async fn run_wait_duplicate_ids() -> Result<Outcome<WaitDuplicateRun>, String> {
     };
     let queue = format!("apalis-query-wait-twice-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let id = task_id();
     insert_completed_task_with_id(
         pool.clone(),
         queue.clone(),
-        id,
+        id.clone(),
         "twice",
         "Done",
         1,
@@ -1979,8 +1993,10 @@ async fn run_wait_duplicate_ids() -> Result<Outcome<WaitDuplicateRun>, String> {
         serde_json::json!({"Ok": "twice"}),
     )
     .await?;
-    let mut stream =
-        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id, id]);
+    let mut stream = <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(
+        &mut storage,
+        [id.clone(), id.clone()],
+    );
     let (mut results, mut other_items, mut ended) = (0, 0, false);
     for _ in 0..4 {
         match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
@@ -2030,13 +2046,13 @@ async fn run_wait_late_beside_a_completed_task() -> Result<Outcome<WaitBesideRun
     };
     let queue = format!("apalis-query-wait-beside-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let done = task_id();
     let late = task_id();
     insert_completed_task_with_id(
         pool.clone(),
         queue.clone(),
-        done,
+        done.clone(),
         "done",
         "Done",
         1,
@@ -2044,8 +2060,10 @@ async fn run_wait_late_beside_a_completed_task() -> Result<Outcome<WaitBesideRun
         serde_json::json!({"Ok": "done"}),
     )
     .await?;
-    let mut stream =
-        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [done, late]);
+    let mut stream = <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(
+        &mut storage,
+        [done.clone(), late.clone()],
+    );
     let first = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
         Ok(Some(Ok(result))) if result.task_id == done => "done_result",
         Ok(Some(Ok(_))) => "other_result",
@@ -2059,7 +2077,7 @@ async fn run_wait_late_beside_a_completed_task() -> Result<Outcome<WaitBesideRun
             insert_completed_task_with_id(
                 pool.clone(),
                 queue.clone(),
-                late,
+                late.clone(),
                 "late",
                 "Done",
                 1,
@@ -2110,7 +2128,7 @@ async fn run_wait_malformed_terminal() -> Result<Outcome<WaitMalformedRun>, Stri
     };
     let queue = format!("apalis-query-wait-malformed-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let id = insert_completed_task(
         pool.clone(),
         queue.clone(),
@@ -2123,7 +2141,7 @@ async fn run_wait_malformed_terminal() -> Result<Outcome<WaitMalformedRun>, Stri
     .await?;
 
     let mut stream =
-        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&storage, [id]);
+        <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(&mut storage, [id]);
     let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .map_err(|_| "timed out waiting for malformed completion".to_owned())?
@@ -2447,7 +2465,7 @@ async fn run_decode_release(
         notify,
     )
     .await?;
-    let first_row = job_status(pool.clone(), task_id).await?;
+    let first_row = job_status(pool.clone(), task_id.clone()).await?;
 
     let (second_error, second_row) = if second_poll {
         let error = decode_error_via_poll(
@@ -2724,22 +2742,18 @@ async fn run_ack_on_pending_row() -> Result<Outcome<AckOnPendingRun>, String> {
     .await?;
 
     let parts = TaskBuilder::new(())
-        .task_id(id)
+        .task_id(id.clone())
         .attempt(1)
-        .with_ctx(
-            PgContext::new()
-                .with_max_attempts(25)
-                .with_queue(queue.clone())
-                .with_lock_at(Some(now_unix() as i64))
-                .with_lock_by(Some(worker_name)),
-        )
-        .build()
-        .parts;
+        .max_attempts(25)
+        .queue(queue.clone().into())
+        .lock_at(Some(now_unix()))
+        .lock_by(Some(worker_name))
+        .build();
 
     let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Ok("processed".to_owned());
     let ack_result = ack.ack(&result, &parts).await;
-    let status = job_status(pool.clone(), id).await?;
+    let status = job_status(pool.clone(), id.clone()).await?;
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(AckOnPendingRun {
         ack_error: ack_result.err().map(|e| e.to_string()),
@@ -2819,7 +2833,7 @@ async fn run_wait_for_mixed() -> Result<Outcome<WaitMixedRun>, String> {
     };
     let queue = format!("apalis-query-wait-mixed-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let pending_id = insert_pending_task(
         pool.clone(),
         queue.clone(),
@@ -2838,7 +2852,7 @@ async fn run_wait_for_mixed() -> Result<Outcome<WaitMixedRun>, String> {
     .await?;
 
     let mut stream = <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(
-        &storage,
+        &mut storage,
         [pending_id, terminal_id],
     );
     let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
@@ -2977,28 +2991,25 @@ async fn run_ack_on_terminal_row() -> Result<Outcome<AckOnTerminalRun>, String> 
     let fixture_pool = pool.clone();
     let fixture_queue = queue.clone();
     let fixture_owner = worker_name.clone();
+    let fixture_id = id.to_string();
     with_conn(fixture_pool,move|conn| {
         sql_query("UPDATE apalis.jobs SET lock_by=$2,lock_at=to_timestamp($3::double precision) WHERE id=$1 AND job_type=$4")
-            .bind::<Text,_>(id.to_string()).bind::<Text,_>(fixture_owner).bind::<BigInt,_>(lock_at_secs).bind::<Text,_>(fixture_queue)
+            .bind::<Text,_>(fixture_id).bind::<Text,_>(fixture_owner).bind::<BigInt,_>(lock_at_secs).bind::<Text,_>(fixture_queue)
             .execute(conn).map_err(|e|e.to_string())?;Ok(())
     }).await?;
     let parts = TaskBuilder::new(())
-        .task_id(id)
+        .task_id(id.clone())
         .attempt(2)
-        .with_ctx(
-            PgContext::new()
-                .with_max_attempts(2)
-                .with_queue(queue.clone())
-                .with_lock_at(Some(lock_at_secs))
-                .with_lock_by(Some(worker_name)),
-        )
-        .build()
-        .parts;
+        .max_attempts(2)
+        .queue(queue.clone().into())
+        .lock_at(Some(lock_at_secs as u64))
+        .lock_by(Some(worker_name))
+        .build();
 
     let mut ack = PgAck::new(&pool);
     let result: Result<String, BoxDynError> = Ok("second-ack".to_owned());
     let ack_result = ack.ack(&result, &parts).await;
-    let status = job_status(pool.clone(), id).await?;
+    let status = job_status(pool.clone(), id.clone()).await?;
     cleanup_queue(pool, queue).await?;
 
     Ok(Outcome::Completed(AckOnTerminalRun {
@@ -3130,7 +3141,7 @@ async fn run_check_status_variants(
     };
     let queue = format!("apalis-query-check-{scenario}-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
-    let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
+    let mut storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let target_id = match scenario {
         "pending" => {
             insert_pending_task(
@@ -3189,10 +3200,12 @@ async fn run_check_status_variants(
         other => return Err(format!("unknown check_status scenario: {other}")),
     };
 
-    let results =
-        <PostgresStorage<String> as WaitForCompletion<String>>::check_status(&storage, [target_id])
-            .await
-            .map_err(|e| e.to_string())?;
+    let results = <PostgresStorage<String> as WaitForCompletion<String>>::check_status(
+        &mut storage,
+        [target_id],
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     cleanup_queue(pool, queue).await?;
     let first_status = results.first().map(|r| r.status.clone());
     Ok(Outcome::Completed(CheckStatusVariantRun {
