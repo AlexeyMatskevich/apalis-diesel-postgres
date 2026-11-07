@@ -31,8 +31,10 @@
 
 use std::time::Duration;
 
+use apalis_core::task::builder::TaskBuilder;
+
 use apalis_diesel_postgres::{
-    Config, Error as PgError, PgPool, PgTask, PostgresStorage, build_pool_with, setup,
+    Config, Error as PgError, PgPool, PostgresStorage, build_pool_with, setup,
 };
 use diesel::{Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
 use ulid::Ulid;
@@ -205,11 +207,12 @@ async fn scenario_idempotency_conflict(
         let order_id_for_seed = order_id.clone();
         tokio::task::spawn_blocking(move || -> Result<(), PgError> {
             let mut conn = backend_pool.get().map_err(PgError::Pool)?;
-            let mut task = PgTask::<SendConfirmationEmail>::new(SendConfirmationEmail {
+            let task = TaskBuilder::new(SendConfirmationEmail {
                 order_id: order_id_for_seed,
                 to: "carol@example.com".to_owned(),
-            });
-            task.idempotency_key() = Some(idempotency_key);
+            })
+            .idempotency_key(idempotency_key)
+            .build();
             conn.transaction(|c| storage.push_task_with_conn(c, task).map(|_| ()))
         })
         .await??;
@@ -229,11 +232,12 @@ async fn scenario_idempotency_conflict(
             let mut conn = backend_pool.get().map_err(PgError::Pool)?;
             conn.transaction(|c| {
                 insert_order(c, &order_id, "carol@example.com")?;
-                let mut task = PgTask::<SendConfirmationEmail>::new(SendConfirmationEmail {
+                let task = TaskBuilder::new(SendConfirmationEmail {
                     order_id: order_id.clone(),
                     to: "carol@example.com".to_owned(),
-                });
-                task.idempotency_key() = Some(idempotency_key);
+                })
+                .idempotency_key(idempotency_key)
+                .build();
                 match storage.push_task_with_conn(c, task) {
                     Ok(_) => Ok("no conflict observed"),
                     Err(PgError::IdempotencyConflict { .. }) => {
