@@ -210,6 +210,16 @@ pub enum Error {
         /// Worker whose local lease can no longer acquire tasks.
         worker_id: String,
     },
+    /// The storage was already handed to a worker, which took its fetcher.
+    /// Each worker needs its own storage: clone the storage before building
+    /// the worker, or create a fresh one.
+    #[error(
+        "storage for queue `{queue}` was already polled by a worker; give each worker its own storage"
+    )]
+    AlreadyPolled {
+        /// Queue of the storage.
+        queue: String,
+    },
 }
 
 // `diesel::Connection::transaction` requires the closure error type to be

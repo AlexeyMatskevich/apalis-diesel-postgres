@@ -108,7 +108,7 @@ async fn run_notify_delivery() -> Result<Outcome<DeliveryRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-notify-deliver-{}", Ulid::new());
+    let queue = format!("apalis-notify-deliver-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let config = notify_only_config(&queue);
@@ -133,7 +133,7 @@ async fn run_notify_isolation() -> Result<Outcome<IsolationRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-notify-iso-{}", Ulid::new());
+    let queue = format!("apalis-notify-iso-{}", Ulid::generate());
     let other_queue = format!("{queue}-other");
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
@@ -168,7 +168,7 @@ async fn run_shared_delivery_and_duplicate() -> Result<Outcome<SharedDuplicateRu
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-shared-deliver-{}", Ulid::new());
+    let queue = format!("apalis-shared-deliver-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let config = notify_only_config(&queue);
@@ -218,7 +218,7 @@ async fn run_shared_isolation() -> Result<Outcome<IsolationRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-shared-iso-{}", Ulid::new());
+    let queue = format!("apalis-shared-iso-{}", Ulid::generate());
     let other_queue = format!("{queue}-other");
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
@@ -306,7 +306,7 @@ async fn run_shared_malformed_payload_survival() -> Result<Outcome<MalformedPayl
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-shared-malformed-{}", Ulid::new());
+    let queue = format!("apalis-shared-malformed-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let config = notify_only_config(&queue);
@@ -502,7 +502,7 @@ async fn run_listener_recycles_a_clean_connection() -> Result<Outcome<UnlistenRu
     let pool = build_pool_with(url, |builder| builder.max_size(1).min_idle(Some(0)))
         .map_err(|e| e.to_string())?;
 
-    let queue = format!("apalis-shared-unlisten-{}", Ulid::new());
+    let queue = format!("apalis-shared-unlisten-{}", Ulid::generate());
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
         SharedPostgresStorage::new(&pool);
     let storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
@@ -652,7 +652,7 @@ async fn run_listener_disconnect(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("listener-disconnect-{}", Ulid::new());
+    let queue = format!("listener-disconnect-{}", Ulid::generate());
     let config = Config::new(&queue);
     let worker = WorkerContext::new::<()>(&queue);
     let mut publisher = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));

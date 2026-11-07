@@ -73,7 +73,7 @@ struct JobSeed<'a> {
 }
 
 fn seed_job(conn: &mut PgConnection, queue: &str, seed: &JobSeed<'_>) -> Result<String, String> {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     sql_query(
         "INSERT INTO apalis.jobs (id, job_type, job, status, attempts, max_attempts, run_at, done_at, lock_by, lock_at, last_result)
          VALUES ($1, $2, '\\x00'::bytea, $3, $4, $5,
@@ -216,9 +216,9 @@ async fn run_release(ownership: Ownership, claim: Claim) -> Result<Outcome<Relea
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-release-{}", Ulid::new());
+    let queue = format!("apalis-spec-release-{}", Ulid::generate());
     let other_queue = format!("{queue}-other");
-    let worker = format!("release-worker-{}", Ulid::new());
+    let worker = format!("release-worker-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
     let run = {
@@ -518,7 +518,7 @@ async fn run_purge(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-purge-{}", Ulid::new());
+    let queue = format!("apalis-spec-purge-{}", Ulid::generate());
     let other_queue = format!("{queue}-other");
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
@@ -533,7 +533,7 @@ async fn run_purge(
                 Age::Fresh => 0,
                 Age::Old => 3_600,
             };
-            let owner = format!("purge-owner-{}", Ulid::new());
+            let owner = format!("purge-owner-{}", Ulid::generate());
             let (status, attempts, max_attempts, owned, done) = match row {
                 Row::Pending => ("Pending", 0, 3, false, false),
                 Row::Queued => ("Queued", 0, 3, true, false),
@@ -610,7 +610,7 @@ async fn run_batched_purge() -> Result<Outcome<BatchedPurgeRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-purge-batch-{}", Ulid::new());
+    let queue = format!("apalis-spec-purge-batch-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let run = async {
         let seeded_queue = queue.clone();
@@ -682,7 +682,7 @@ async fn run_batch_under_a_rescanning_plan(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-rescan-{}", Ulid::new());
+    let queue = format!("apalis-spec-rescan-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let run = {
         let queue = queue.clone();
@@ -753,8 +753,8 @@ async fn recover_claim(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-recovery-{}", Ulid::new());
-    let worker = format!("recovery-worker-{}", Ulid::new());
+    let queue = format!("apalis-spec-recovery-{}", Ulid::generate());
+    let worker = format!("recovery-worker-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let run = {
         let queue = queue.clone();
@@ -837,8 +837,8 @@ async fn prune_beside_repeated_claims() -> Result<Outcome<(usize, usize)>, Strin
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-prune-race-{}", Ulid::new());
-    let worker = format!("prune-race-worker-{}", Ulid::new());
+    let queue = format!("apalis-spec-prune-race-{}", Ulid::generate());
+    let worker = format!("prune-race-worker-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let run = async {
         {
@@ -946,7 +946,7 @@ async fn delete_step_with_a_claimed_candidate() -> Result<Outcome<DeleteStep>, S
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-prune-delete-{}", Ulid::new());
+    let queue = format!("apalis-spec-prune-delete-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let run = {
         let queue = queue.clone();
@@ -1069,9 +1069,9 @@ async fn run_prune(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-prune-{}", Ulid::new());
+    let queue = format!("apalis-spec-prune-{}", Ulid::generate());
     let other_queue = format!("{queue}-other");
-    let worker = format!("prune-worker-{}", Ulid::new());
+    let worker = format!("prune-worker-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
     let run = {

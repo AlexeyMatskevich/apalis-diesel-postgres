@@ -1,5 +1,4 @@
 use apalis_core::backend::Filter;
-use apalis_sql::TaskRow;
 use diesel::PgConnection;
 
 use crate::{CompactType, Error, PgPool, PgTask, models::JobRow, runtime};
@@ -89,15 +88,13 @@ pub(super) fn filter_offset_i32(filter: &Filter) -> Result<i32, Error> {
 }
 
 pub(super) fn task_row(row: JobRow) -> Result<PgTask<CompactType>, Error> {
-    let row: TaskRow = row.into();
-    row.try_into_task_compact()
-        .map_err(|error| Error::Row(Box::new(error)))
+    row.into_task()
 }
 
 /// Record acknowledgement evidence only for rows returned by a successful claim.
 pub(super) fn claimed_task_row(row: JobRow) -> Result<PgTask<CompactType>, Error> {
     let mut task = task_row(row)?;
-    crate::ack::record_claim(&mut task.parts);
+    crate::ack::record_claim(&mut task);
     Ok(task)
 }
 
@@ -201,6 +198,7 @@ mod tests {
             id: id.map(str::to_owned),
             status: status.map(str::to_owned),
             result,
+            attempts: None,
         }
     }
 
@@ -563,7 +561,7 @@ mod tests {
                 if matches!(shape, Hints::Errors) || index == error_position {
                     Err(Error::InvalidArgument(format!("notification {index}")))
                 } else {
-                    Ok(crate::PgTaskId::new(Ulid::new()))
+                    Ok(crate::PgTaskId::new(Ulid::generate()))
                 }
             })
             .collect::<Vec<_>>();

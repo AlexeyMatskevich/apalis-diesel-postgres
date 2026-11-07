@@ -194,7 +194,7 @@ async fn run_worker_integration(
     let pool = build_pool(database_url).map_err(|e| e.to_string())?;
     setup(&pool).await.map_err(|e| e.to_string())?;
 
-    let suffix = Ulid::new();
+    let suffix = Ulid::generate();
     let emails_queue = format!("worker-int-emails-{suffix}");
     let activity_queue = format!("worker-int-activity-{suffix}");
     cleanup_queues(

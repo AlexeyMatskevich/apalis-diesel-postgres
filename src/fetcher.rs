@@ -12,11 +12,9 @@ use std::{
 
 use apalis_core::{
     backend::{
-        TaskStream,
         codec::Codec,
-        poll_strategy::{PollContext, PollStrategy, PollStrategyExt},
+        ext::poll_strategy::{BoxedPollStrategy, PollMetrics, PollStrategy},
     },
-    task::Task,
     timer::Delay,
     worker::context::WorkerContext,
 };
@@ -26,7 +24,11 @@ use futures::{
     stream,
 };
 
-use crate::{CompactType, Config, Error, PgContext, PgPool, PgTask, PgTaskId, queries};
+use crate::{CompactType, Config, Error, PgPool, PgTask, PgTaskId, queries};
+
+/// A stream of tasks in the shape apalis 1.0-rc used: `Ok(None)` marks the
+/// registration outcome or a poll that found nothing.
+pub(crate) type TaskStream<T, E> = stream::BoxStream<'static, Result<Option<T>, E>>;
 
 /// A fetcher that waits for PostgreSQL NOTIFY events.
 #[derive(Debug, Clone, Default)]
@@ -93,9 +95,10 @@ fn codec_panic(payload: Box<dyn std::any::Any + Send>) -> Error {
     Error::Decode(format!("the codec panicked: {message}").into())
 }
 
-/// Decode a compact task stream into an `Args`-typed task stream by mapping
-/// every yielded row through the configured codec. Shared between the polling
-/// and notify backends so the decode logic exists in exactly one place.
+/// Test-decode every row of a compact task stream with the configured codec,
+/// passing rows that decode through unchanged (apalis decodes them again for
+/// the handler). Shared between the polling and notify backends so the decode
+/// logic exists in exactly one place.
 ///
 /// Decode runs *after* the dequeue SQL has already claimed the row as
 /// `Queued`, so a decode failure must not just surface the error: it also
@@ -114,14 +117,15 @@ fn codec_panic(payload: Box<dyn std::any::Any + Send>) -> Error {
 /// become recoverable as orphans once the heartbeat stops.
 pub(crate) fn decode_task_stream<Args, Decode>(
     compact: TaskStream<PgTask<CompactType>, Error>,
+    codec: Decode,
     pool: PgPool,
     worker_id: Arc<str>,
     lease_token: Option<Arc<str>>,
     lease: Arc<crate::lease::WorkerLease>,
-) -> TaskStream<PgTask<Args>, Error>
+) -> TaskStream<PgTask<CompactType>, Error>
 where
     Args: Send + 'static,
-    Decode: Codec<Args, Compact = CompactType> + 'static,
+    Decode: Codec<Args, Compact = CompactType> + Clone + Send + Sync + 'static,
     Decode::Error: std::error::Error + Send + Sync + 'static,
 {
     struct ReleaseObligation {
@@ -140,6 +144,7 @@ where
             let worker_id = worker_id.clone();
             let lease_token = lease_token.clone();
             let lease = lease.clone();
+            let codec = codec.clone();
             async move {
                 loop {
                     if let Some(mut obligation) = release.take() {
@@ -148,7 +153,7 @@ where
                         }
                         match queries::fail_undecodable_task(
                             pool.clone(),
-                            obligation.task_id,
+                            obligation.task_id.clone(),
                             worker_id.to_string(),
                             obligation.lock_at,
                             obligation.attempts,
@@ -190,23 +195,23 @@ where
                     match row {
                         Ok(Some(task)) => {
                             let identity = (
-                                task.parts.task_id,
-                                *task.parts.ctx.lock_at(),
-                                i32::try_from(task.parts.attempt.current()),
+                                task.task_id().cloned(),
+                                task.lock_at().and_then(|at| i64::try_from(at).ok()),
+                                i32::try_from(task.attempt()),
                             );
                             // A codec that panics on a corrupt payload fails that
                             // row like a reported decode error: the claim is
                             // released through its budget and the batch goes
                             // on, instead of the panic taking the worker down.
                             let decoded =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                                    task.try_map(|t| {
-                                        Decode::decode(&t).map_err(|e| Error::Decode(e.into()))
-                                    })
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    <Decode as Codec<Args>>::decode(&codec, &task.args)
+                                        .map(drop)
+                                        .map_err(|e| Error::Decode(e.into()))
                                 }))
                                 .unwrap_or_else(|panic| Err(codec_panic(panic)));
                             match decoded {
-                                Ok(decoded) => return Some((Ok(Some(decoded)), (compact, None))),
+                                Ok(()) => return Some((Ok(Some(task)), (compact, None))),
                                 Err(decode_error) => match identity {
                                     (Some(task_id), Some(lock_at), Ok(attempts)) => {
                                         release = Some(ReleaseObligation {
@@ -369,17 +374,48 @@ where
 type Poller = Pin<Box<dyn Stream<Item = ()> + Send>>;
 
 #[derive(Clone)]
-pub(crate) struct PollStrategyFactory(Arc<dyn Fn(&PollContext) -> Poller + Send + Sync>);
+pub(crate) struct PollStrategyFactory(Arc<dyn Fn() -> BoxedPollStrategy + Send + Sync>);
 
 impl PollStrategyFactory {
     pub(crate) fn new<F, S>(factory: F) -> Self
     where
         F: Fn() -> S + Send + Sync + 'static,
-        S: PollStrategy + 'static,
-        S::Stream: Send + 'static,
+        S: PollStrategy + Send + Sync + 'static,
     {
-        Self(Arc::new(move |context| factory().build_stream(context)))
+        Self(Arc::new(move || Box::new(factory())))
     }
+}
+
+/// Turn a poll strategy into a stream of polling permits.
+///
+/// apalis 1.0 strategies are driven with a snapshot of recent poll outcomes.
+/// The fetcher feeds them its own outcome: before each permit, the size of the
+/// last fetch says whether that poll found work, so a backoff strategy
+/// stretches its delay while the queue stays empty and resets once work
+/// reappears.
+fn strategy_poller(
+    mut strategy: BoxedPollStrategy,
+    previous_task_count: Arc<AtomicUsize>,
+) -> Poller {
+    let mut metrics = PollMetrics::default();
+    let mut recorded = false;
+    Box::pin(stream::poll_fn(move |cx| {
+        if !recorded {
+            if previous_task_count.load(Ordering::Relaxed) > 0 {
+                metrics.on_ready();
+            } else {
+                metrics.on_pending();
+            }
+            strategy.on_poll(&metrics.snapshot());
+            recorded = true;
+        }
+        let snapshot = metrics.snapshot();
+        let permit = strategy.poll_drive(cx, &snapshot);
+        if permit.is_ready() {
+            recorded = false;
+        }
+        permit
+    }))
 }
 
 /// Checks a local lease before polling either SQL work or heartbeat work. The
@@ -580,7 +616,7 @@ impl<Compact> PgPollFetcher<Compact> {
 }
 
 impl Stream for PgPollFetcher<CompactType> {
-    type Item = Result<Option<Task<CompactType, PgContext, ulid::Ulid>>, Error>;
+    type Item = Result<Option<PgTask<CompactType>>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -657,15 +693,14 @@ fn build_poller(
     previous_task_count: Arc<AtomicUsize>,
     factory: Option<&PollStrategyFactory>,
 ) -> FusedPoller {
-    let context = PollContext::new(worker.clone(), previous_task_count);
-    // `build_stream` consumes the `MultiStrategy` — its `poll_strategy` drains
-    // the shared `Arc<Mutex<Vec<_>>>` — so this must run exactly once per
-    // fetcher. The resulting stream reads `previous_task_count` live through the
-    // `PollContext` Arc, so backoff keeps adapting without a rebuild.
-    match factory {
-        Some(factory) => (factory.0)(&context).fuse(),
-        None => config.poll_strategy().clone().build_stream(&context).fuse(),
-    }
+    let _ = worker;
+    // Built once per fetcher; the poller reads `previous_task_count` live, so
+    // backoff keeps adapting without a rebuild.
+    let strategy = match factory {
+        Some(factory) => (factory.0)(),
+        None => config.poll_strategy(),
+    };
+    strategy_poller(strategy, previous_task_count).fuse()
 }
 
 #[cfg(test)]

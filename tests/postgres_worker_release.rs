@@ -98,7 +98,7 @@ async fn push_with_id(
     args: &str,
     run_at: Option<u64>,
 ) -> Result<PgTaskId, String> {
-    let id = PgTaskId::new(ulid::Ulid::new());
+    let id = PgTaskId::new(ulid::Ulid::generate());
     let mut task = PgTask::<String>::new(args.to_owned());
     task.parts.task_id = Some(id);
     if let Some(run_at) = run_at {
@@ -158,7 +158,7 @@ async fn release_with_unfinished_claim(
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-claim-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-claim-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let worker = WorkerContext::new::<()>("rolling-worker");
@@ -411,7 +411,7 @@ async fn restart_under_the_same_name(
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-restart-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-restart-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let name = "deployed-worker";
@@ -529,7 +529,7 @@ async fn misconfigured_liveness() -> Result<Outcome<LivenessObservation>, String
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-liveness-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-liveness-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let config = Config::new(&queue)
@@ -610,7 +610,7 @@ async fn graceful_stop_with_buffered_tasks() -> Result<Outcome<BufferedStopObser
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-buffered-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-buffered-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let name = "buffered-worker";
@@ -620,7 +620,7 @@ async fn graceful_stop_with_buffered_tasks() -> Result<Outcome<BufferedStopObser
         let mut producer = storage.clone();
         let mut ids = Vec::new();
         for label in ["first", "second", "third"] {
-            let id = PgTaskId::new(ulid::Ulid::new());
+            let id = PgTaskId::new(ulid::Ulid::generate());
             let mut task = PgTask::<String>::new(label.to_owned());
             task.parts.task_id = Some(id);
             task.parts.ctx = PgContext::new().with_max_attempts(1);
@@ -752,7 +752,7 @@ async fn heartbeat_before_registration(
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-heartbeat-order-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-heartbeat-order-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let config = Config::new(&queue)
@@ -849,7 +849,7 @@ async fn retention_after_a_run() -> Result<Outcome<RetentionObservation>, String
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-retention-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-retention-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let handled = Arc::new(AtomicUsize::new(0));

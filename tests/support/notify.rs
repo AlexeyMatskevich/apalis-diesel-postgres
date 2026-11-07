@@ -24,7 +24,7 @@ pub async fn isolated_listener_pool() -> Result<Option<PgPool>, String> {
     };
     // Reuse the binary's once-only schema setup, then isolate session identity.
     super::support::shared_pool().await?;
-    let name = format!("notify-spec-{}", ulid::Ulid::new());
+    let name = format!("notify-spec-{}", ulid::Ulid::generate());
     let pool = build_pool_with(url, |builder| {
         builder
             .max_size(4)

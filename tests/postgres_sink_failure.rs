@@ -79,11 +79,11 @@ async fn failed_batch(
     let Some(pool) = support::shared_pool().await? else {
         return Ok(support::Outcome::Skipped);
     };
-    let queue = format!("sink-failure-{}", ulid::Ulid::new());
+    let queue = format!("sink-failure-{}", ulid::Ulid::generate());
     let config = Config::new(&queue).set_buffer_size(3);
     let mut storage = Storage::new_with_config(&pool, &config);
-    let first_id = PgTaskId::new(ulid::Ulid::new());
-    let second_id = PgTaskId::new(ulid::Ulid::new());
+    let first_id = PgTaskId::new(ulid::Ulid::generate());
+    let second_id = PgTaskId::new(ulid::Ulid::generate());
     let task = |id| {
         TaskBuilder::new(b"{}".to_vec())
             .with_task_id(id)
@@ -162,10 +162,10 @@ async fn completion_boundary(
     let proxy = commit_proxy::CommitProxy::new(&url)?;
     let pool = build_pool_with(proxy.url(), |builder| builder.max_size(1).min_idle(Some(0)))
         .map_err(|e| e.to_string())?;
-    let queue = format!("sink-boundary-{}", ulid::Ulid::new());
+    let queue = format!("sink-boundary-{}", ulid::Ulid::generate());
     let config = Config::new(&queue);
     let mut storage = Storage::new_with_config(&pool, &config);
-    let id = PgTaskId::new(ulid::Ulid::new());
+    let id = PgTaskId::new(ulid::Ulid::generate());
     // A keyed batch takes an explicit transaction, whose COMMIT the proxy observes.
     let task = TaskBuilder::new(b"{}".to_vec())
         .with_task_id(id)
@@ -254,10 +254,10 @@ async fn interleaved_submission() -> Result<support::Outcome<InterleavingObserva
     let url = support::database_url_or_skip()?.ok_or("database was required")?;
     let pool =
         build_pool_with(url, |b| b.max_size(1).min_idle(Some(0))).map_err(|e| e.to_string())?;
-    let queue = format!("sink-interleaving-{}", ulid::Ulid::new());
+    let queue = format!("sink-interleaving-{}", ulid::Ulid::generate());
     let config = Config::new(&queue).set_buffer_size(2);
-    let a = PgTaskId::new(ulid::Ulid::new());
-    let b = PgTaskId::new(ulid::Ulid::new());
+    let a = PgTaskId::new(ulid::Ulid::generate());
+    let b = PgTaskId::new(ulid::Ulid::generate());
     let task = |id| {
         TaskBuilder::new(b"{}".to_vec())
             .with_task_id(id)

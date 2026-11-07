@@ -2,7 +2,7 @@
 name = "apalis-diesel-postgres"
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "PostgreSQL storage backend for Apalis implemented with Diesel."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/AlexeyMatskevich/apalis-diesel-postgres"
@@ -36,9 +36,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 # would let a plain `cargo update` pull in `rc.10` — which may break public
 # trait shapes this crate implements (`Backend`, `Acknowledge`, …) without
 # any semver signal. Bump the pins deliberately, together with a release.
-apalis-codec = { version = "=0.1.0-rc.9", features = ["json"] }
-apalis-core = { version = "=1.0.0-rc.9", default-features = false, features = ["sleep"] }
-apalis-sql = { version = "=1.0.0-rc.9" }
+apalis-codec = { version = "1.0.0", features = ["json"] }
+apalis-core = { version = "1.0.0", default-features = false, features = ["sleep", "ulid"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2.3.13", features = ["postgres", "r2d2", "chrono", "serde_json"] }
 diesel_migrations = "2.3"
@@ -51,10 +50,10 @@ thiserror = "2"
 # the macros/multi-thread/time features tests and examples need live in
 # [dev-dependencies] below.
 tokio = { version = "1", features = ["rt"], optional = true }
-ulid = { version = "1", features = ["serde"] }
+ulid = { version = "3", features = ["serde"] }
 
 [dev-dependencies]
-apalis = "=1.0.0-rc.9"
+apalis = "1.0.0"
 lets_expect = { version = "0.5", features = ["tokio"] }
 ntex = { version = "3", default-features = false, features = ["neon-polling"] }
 scheduled-thread-pool = "0.2.7"

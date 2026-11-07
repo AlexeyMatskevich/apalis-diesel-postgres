@@ -62,7 +62,7 @@ fn now_unix() -> u64 {
 }
 
 fn task_id() -> PgTaskId {
-    TaskId::from_str(&Ulid::new().to_string()).expect("generated ULID parses as task id")
+    TaskId::from_str(&Ulid::generate().to_string()).expect("generated ULID parses as task id")
 }
 
 fn task(
@@ -101,7 +101,7 @@ async fn insert_failed_task(
     attempts: i32,
     max_attempts: i32,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let job = serde_json::to_vec("retry-me").map_err(|e| e.to_string())?;
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     with_conn(pool, move |conn| {
@@ -127,7 +127,7 @@ async fn run_failed_retry(retryable: bool) -> Result<Outcome<FailedRetryRun>, St
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-failed-retry-{}", Ulid::new());
+    let queue = format!("apalis-spec-failed-retry-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let (attempts, max_attempts) = if retryable { (1, 3) } else { (3, 3) };
     insert_failed_task(pool.clone(), queue.clone(), attempts, max_attempts).await?;
@@ -250,7 +250,7 @@ async fn run_concurrent_admin_register() -> Result<Outcome<ConcurrentRegisterRun
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-concurrent-register-{}", Ulid::new());
+    let queue = format!("apalis-spec-concurrent-register-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let worker_id = format!("spec-concurrent-worker-{queue}");
@@ -332,7 +332,7 @@ async fn run_two_worker_race() -> Result<Outcome<TwoWorkerRaceRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-race-{}", Ulid::new());
+    let queue = format!("apalis-spec-race-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let mut producer =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(8));
@@ -784,7 +784,7 @@ async fn run_unlisten_after_drop() -> Result<Outcome<UnlistenRun>, String> {
         .map_err(|e| e.to_string())?;
     setup(&pool).await.map_err(|e| e.to_string())?;
 
-    let queue = format!("apalis-spec-unlisten-{}", Ulid::new());
+    let queue = format!("apalis-spec-unlisten-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Wrap NotifyTaskIds creation in a scope so it drops before we check.
@@ -855,7 +855,7 @@ async fn run_locked_workers_excludes_terminal() -> Result<Outcome<LockedWorkersR
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-locked-workers-{}", Ulid::new());
+    let queue = format!("apalis-spec-locked-workers-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let active_worker = format!("active-{queue}");
@@ -887,7 +887,7 @@ async fn run_locked_workers_excludes_terminal() -> Result<Outcome<LockedWorkersR
             ("Failed", fw.as_str(), 3, "'{\"Err\":\"err\"}'::jsonb"),
             ("Killed", kw.as_str(), 3, "'{\"Err\":\"k\"}'::jsonb"),
         ] {
-            let id = Ulid::new().to_string();
+            let id = Ulid::generate().to_string();
             let sql = format!(
                 "INSERT INTO apalis.jobs (
                     id, job_type, job, status, attempts, max_attempts, run_at, lock_by, lock_at, last_result, done_at
@@ -970,7 +970,7 @@ async fn run_list_workers_beyond_100() -> Result<Outcome<ListWorkersBeyond100Run
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-list-workers-{}", Ulid::new());
+    let queue = format!("apalis-spec-list-workers-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let inserted = 110usize;
@@ -1038,7 +1038,7 @@ async fn run_registration_gate_blocks_fetcher() -> Result<Outcome<RegistrationGa
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-reggate-{}", Ulid::new());
+    let queue = format!("apalis-spec-reggate-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-reggate-worker-{queue}");
 
@@ -1052,7 +1052,7 @@ async fn run_registration_gate_blocks_fetcher() -> Result<Outcome<RegistrationGa
         )
         .bind::<Text, _>(&wid)
         .bind::<Text, _>(&q)
-        .bind::<Text, _>(format!("incumbent-{}", Ulid::new()))
+        .bind::<Text, _>(format!("incumbent-{}", Ulid::generate()))
         .execute(conn)
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -1190,7 +1190,7 @@ async fn verify_pending_branch_on_temp_db(
 ) -> Result<Result<(), String>, String> {
     let db_name = format!(
         "apalis_verify_pending_{}",
-        Ulid::new().to_string().to_lowercase()
+        Ulid::generate().to_string().to_lowercase()
     );
 
     let provisioned = {
@@ -1441,10 +1441,10 @@ async fn run_lease_token_roundtrip(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-schema-lease-{}", Ulid::new());
+    let queue = format!("apalis-spec-schema-lease-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-schema-lease-worker-{queue}");
-    let stored_token = with_token.then(|| format!("lease-{}", Ulid::new()));
+    let stored_token = with_token.then(|| format!("lease-{}", Ulid::generate()));
 
     let q = queue.clone();
     let wid = worker_id.clone();
@@ -1519,7 +1519,7 @@ async fn run_partial_batch_conflict() -> Result<Outcome<PartialBatchRun>, String
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-batch-conflict-{}", Ulid::new());
+    let queue = format!("apalis-spec-batch-conflict-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Seed the queue with one row that occupies the idempotency_key slot.
@@ -1647,7 +1647,7 @@ async fn run_mixed_batch_conflict() -> Result<Outcome<PartialBatchRun>, String> 
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-mixed-conflict-{}", Ulid::new());
+    let queue = format!("apalis-spec-mixed-conflict-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Seed the queue with one row occupying the "shared-key" slot.
@@ -1774,7 +1774,7 @@ async fn run_intrabatch_dup_with_nulls() -> Result<Outcome<PartialBatchRun>, Str
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-intrabatch-nulls-{}", Ulid::new());
+    let queue = format!("apalis-spec-intrabatch-nulls-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // No seed: the queue starts empty, so the only collision is intra-batch.
@@ -1890,7 +1890,7 @@ async fn run_metadata_cap(meta_payload_len: usize) -> Result<Outcome<MetadataCap
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-metadata-cap-{}", Ulid::new());
+    let queue = format!("apalis-spec-metadata-cap-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let mut meta = serde_json::Map::new();
@@ -1992,7 +1992,7 @@ async fn run_run_at_cap(run_at: u64) -> Result<Outcome<RunAtCapRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-run-at-cap-{}", Ulid::new());
+    let queue = format!("apalis-spec-run-at-cap-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let task = TaskBuilder::new("run-at-cap-target".to_owned())
@@ -2070,7 +2070,7 @@ async fn run_idempotency_cap(key_len: usize) -> Result<Outcome<IdempotencyCapRun
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-idem-cap-{}", Ulid::new());
+    let queue = format!("apalis-spec-idem-cap-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let ctx = PgContext::new().with_max_attempts(5);
@@ -2171,7 +2171,7 @@ async fn run_queue_name_cap(name_len: usize) -> Result<Outcome<QueueNameCapRun>,
     // Keep the Ulid prefix so concurrent test runs do not collide on the
     // unique `(job_type, idempotency_key)` index even when seeding the
     // happy-path scenarios.
-    let prefix = format!("q-{}-", Ulid::new());
+    let prefix = format!("q-{}-", Ulid::generate());
     let pad = name_len.saturating_sub(prefix.len());
     let queue = format!("{prefix}{}", "x".repeat(pad));
     cleanup_queue(pool.clone(), queue.clone()).await?;
@@ -2302,7 +2302,7 @@ async fn insert_running_row(
     max_attempts: i32,
     lock_at: DateTime,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec("ack-target").map_err(|e| e.to_string())?;
     with_conn(pool, move |conn| {
@@ -2401,7 +2401,7 @@ async fn run_ack_predicate(setup: AckSetup) -> Result<Outcome<AckPredicateRun>, 
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-ack-pred-{}", Ulid::new());
+    let queue = format!("apalis-spec-ack-pred-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let worker_id = format!("spec-ack-pred-worker-{queue}");
@@ -2439,7 +2439,7 @@ async fn run_ack_predicate(setup: AckSetup) -> Result<Outcome<AckPredicateRun>, 
         .unwrap_or_else(|| queue.clone());
 
     let parts_task_id = if setup.fabricate_unknown_task_id {
-        TaskId::from_str(&Ulid::new().to_string()).map_err(|e| e.to_string())?
+        TaskId::from_str(&Ulid::generate().to_string()).map_err(|e| e.to_string())?
     } else {
         id
     };

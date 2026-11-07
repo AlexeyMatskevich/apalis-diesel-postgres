@@ -208,10 +208,10 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
     } else {
         build_pool_with(proxy.url(), |b| b.max_size(3).min_idle(Some(0))).unwrap()
     };
-    let queue = format!("claim_commit_{}", ulid::Ulid::new());
+    let queue = format!("claim_commit_{}", ulid::Ulid::generate());
     let trigger = format!(
         "claim_reject_{}",
-        ulid::Ulid::new().to_string().to_lowercase()
+        ulid::Ulid::generate().to_string().to_lowercase()
     );
     let config = Config::new(&queue)
         .set_ack(automatic)
@@ -234,7 +234,7 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
         .expect("listener did not reach CommandComplete LISTEN");
     }
     let mut producer = PostgresStorage::<String>::new_with_config(&direct, &config);
-    let id = PgTaskId::new(ulid::Ulid::new());
+    let id = PgTaskId::new(ulid::Ulid::generate());
     let mut task = TaskBuilder::new("work".to_owned())
         .with_task_id(id)
         .with_attempt(Attempt::new_with_value(1))

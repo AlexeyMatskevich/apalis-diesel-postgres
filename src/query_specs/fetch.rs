@@ -44,7 +44,7 @@ async fn insert_worker(pool: PgPool, queue: String, worker_id: String) -> Result
         )
         .bind::<Text, _>(&worker_id)
         .bind::<Text, _>(&queue)
-        .bind::<Text, _>(format!("token-{}", Ulid::new()))
+        .bind::<Text, _>(format!("token-{}", Ulid::generate()))
         .execute(conn)
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -66,7 +66,7 @@ async fn insert_row(
     run_at_offset_secs: i64,
     priority: i32,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let owner = if matches!(status, "Queued" | "Running") {
@@ -168,7 +168,7 @@ async fn run_empty_queue() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-empty-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-empty-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-empty-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -193,7 +193,7 @@ async fn run_buffer_sizes(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-buffer-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-buffer-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-buffer-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -233,7 +233,7 @@ async fn run_cross_queue_isolation() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-iso-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-iso-{}", Ulid::generate());
     let foreign = format!("{queue}-foreign");
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), foreign.clone()).await?;
@@ -272,7 +272,7 @@ async fn run_run_at_boundary() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-runat-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-runat-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-runat-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -299,7 +299,7 @@ async fn run_equal_priority_tie_break() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-tie-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-tie-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-tie-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -355,7 +355,7 @@ async fn run_status_matrix(setup: StatusSetup) -> Result<Outcome<FetchRun>, Stri
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-status-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-status-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-status-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -636,7 +636,7 @@ async fn run_queue_by_id_eligibility(setup: StatusSetup) -> Result<Outcome<Fetch
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-status-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-status-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-status-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -674,7 +674,7 @@ async fn run_queue_by_id_skips_unlisted() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-unlisted-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-unlisted-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-unlisted-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -726,8 +726,8 @@ async fn run_queue_by_id_cross_queue() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-home-{}", Ulid::new());
-    let other_queue = format!("apalis-spec-qbi-other-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-home-{}", Ulid::generate());
+    let other_queue = format!("apalis-spec-qbi-other-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
     let worker_id = format!("spec-qbi-cross-{queue}");
@@ -768,7 +768,7 @@ async fn run_queue_by_id_ordering() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-order-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-order-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-order-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -820,7 +820,7 @@ async fn run_queue_by_id_partial_claim() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-partial-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-partial-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-partial-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -1024,7 +1024,7 @@ async fn insert_lock_state_row(
     lock_at_epoch: Option<i64>,
     last_result: Option<serde_json::Value>,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec("undecodable-probe").map_err(|e| e.to_string())?;
     with_conn(pool, move |conn| {
@@ -1106,7 +1106,7 @@ async fn run_fail_undecodable(setup: &'static str) -> Result<Outcome<FailUndecod
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fail-undecodable-{}", Ulid::new());
+    let queue = format!("apalis-spec-fail-undecodable-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_a = format!("fail-undecodable-a-{queue}");
     let worker_b = format!("fail-undecodable-b-{queue}");
@@ -1186,7 +1186,7 @@ async fn insert_live_claim_with_budget(
     max_attempts: i32,
     lock_at_epoch: i64,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec("undecodable-budget-probe").map_err(|e| e.to_string())?;
     with_conn(pool, move |conn| {
@@ -1226,7 +1226,7 @@ async fn run_fail_undecodable_budget(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fail-budget-{}", Ulid::new());
+    let queue = format!("apalis-spec-fail-budget-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker = format!("fail-budget-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker.clone()).await?;

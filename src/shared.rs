@@ -18,7 +18,7 @@ use std::{
 type RegistrySender = Sender<PgTaskId>;
 
 use apalis_codec::json::JsonCodec;
-use apalis_core::{backend::shared::MakeShared, worker::context::WorkerContext};
+use apalis_core::worker::context::WorkerContext;
 use diesel::RunQueryDsl;
 use futures::{
     Stream,
@@ -230,8 +230,8 @@ fn exit_listener(registry: &SharedRegistry, listener_alive: &AtomicBool, error: 
 /// thread (mirrors `broadcast_notify_error_locked`).
 fn deliver_to_queue(registry: &mut RegistryMap, queue: &str, ids: &[PgTaskId]) {
     if let Some(senders) = registry.get_mut(queue) {
-        for &id in ids {
-            senders.retain_mut(|(_, sender, _)| match sender.try_send(id) {
+        for id in ids {
+            senders.retain_mut(|(_, sender, _)| match sender.try_send(id.clone()) {
                 Ok(()) => true,
                 Err(error) if error.is_disconnected() => false,
                 // Channel full: drop this wakeup but keep the sender registered
@@ -306,22 +306,27 @@ pub enum SharedPostgresError {
     RegistryLocked,
 }
 
-impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
-    type Backend = PostgresStorage<Args, Codec, SharedFetcher>;
-    type Config = Config;
-    type MakeError = SharedPostgresError;
-
-    fn make_shared(&mut self) -> Result<Self::Backend, Self::MakeError>
-    where
-        Self::Config: Default,
-    {
+// apalis 1.0 removed the `MakeShared` trait these two methods implemented;
+// they keep its names and shapes as inherent methods.
+impl<Codec: Default> SharedPostgresStorage<Codec> {
+    /// Create a storage consuming the queue named after `Args`.
+    ///
+    /// # Errors
+    /// [`SharedPostgresError::RegistryLocked`] if the registry lock is poisoned.
+    pub fn make_shared<Args>(
+        &mut self,
+    ) -> Result<PostgresStorage<Args, Codec, SharedFetcher>, SharedPostgresError> {
         self.make_shared_with_config(Config::new(std::any::type_name::<Args>()))
     }
 
-    fn make_shared_with_config(
+    /// Create a storage consuming `config`'s queue through the shared listener.
+    ///
+    /// # Errors
+    /// [`SharedPostgresError::RegistryLocked`] if the registry lock is poisoned.
+    pub fn make_shared_with_config<Args>(
         &mut self,
-        config: Self::Config,
-    ) -> Result<Self::Backend, Self::MakeError> {
+        config: Config,
+    ) -> Result<PostgresStorage<Args, Codec, SharedFetcher>, SharedPostgresError> {
         let (sender, receiver) =
             mpsc::channel(crate::queries::clamp_notify_capacity(config.buffer_size()));
         let errors = Arc::new(crate::notify_event::NotificationErrors::default());
@@ -343,7 +348,7 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
         // `false` between our `swap(true)` and our push, leaving a non-empty
         // registry with no listener. By doing both under the lock we serialize
         // the two state transitions onto the mutex.
-        let registration_id = Ulid::new();
+        let registration_id = Ulid::generate();
         registry
             .entry(queue)
             .or_default()
@@ -366,14 +371,16 @@ impl<Args, Codec> MakeShared<Args> for SharedPostgresStorage<Codec> {
             sink: PgSink::new(&self.pool, &config),
             pool: self.pool.clone(),
             config,
-            fetcher: SharedFetcher {
+            fetcher: Some(SharedFetcher {
                 receiver,
                 errors,
                 _registration: registration,
-            },
+            }),
             lease_token: crate::queries::worker::mint_lease_token().into(),
             leases: Default::default(),
             poll_factory: None,
+            codec: Codec::default(),
+            active: Default::default(),
         })
     }
 }
@@ -458,7 +465,7 @@ impl crate::fetcher::PgFetcherSource for SharedFetcher {
         worker: WorkerContext,
         lease_token: std::sync::Arc<str>,
         factory: Option<crate::fetcher::PollStrategyFactory>,
-    ) -> apalis_core::backend::TaskStream<PgTask<CompactType>, Error> {
+    ) -> crate::fetcher::TaskStream<PgTask<CompactType>, Error> {
         crate::fetcher::notify_backed_compact_stream(
             Self::STORAGE_NAME,
             self,
@@ -494,7 +501,7 @@ pub(crate) mod test_support {
         }
         let errors = Arc::new(crate::notify_event::NotificationErrors::default());
         let registry = Arc::new(Mutex::new(HashMap::new()));
-        let id = Ulid::new();
+        let id = Ulid::generate();
         let queue = "bounded-hint-fixture".to_owned();
         registry
             .lock()
@@ -584,7 +591,7 @@ mod tests {
     fn registration_debug_and_drop() -> (String, bool) {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (sender, _receiver) = mpsc::channel(1);
-        let id = Ulid::new();
+        let id = Ulid::generate();
         registry
             .lock()
             .expect("fresh shared registry is not poisoned")
@@ -613,7 +620,7 @@ mod tests {
     /// triggers the best-effort NOTIFY wake-up), positive when siblings remain.
     fn drop_leaves_remaining(target_queue: &str, sibling_queues: &[&str]) -> usize {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let target_id = Ulid::new();
+        let target_id = Ulid::generate();
         {
             let mut reg = registry
                 .lock()
@@ -622,7 +629,7 @@ mod tests {
             reg.insert(target_queue.to_owned(), vec![entry(target_id, sender)]);
             for sibling in sibling_queues {
                 let (sender, _r) = mpsc::channel(1);
-                reg.insert((*sibling).to_owned(), vec![entry(Ulid::new(), sender)]);
+                reg.insert((*sibling).to_owned(), vec![entry(Ulid::generate(), sender)]);
             }
         }
 
@@ -659,7 +666,7 @@ mod tests {
     /// `broadcast_notify_error_observation`'s identity assertion.
     fn drop_siblings_keeps_their_identities() -> (usize, bool) {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let target_id = Ulid::new();
+        let target_id = Ulid::generate();
         {
             let mut reg = registry
                 .lock()
@@ -668,7 +675,7 @@ mod tests {
             reg.insert("shared-target".to_owned(), vec![entry(target_id, sender)]);
             for sibling in ["shared-other-a", "shared-other-b"] {
                 let (sender, _r) = mpsc::channel(1);
-                reg.insert(sibling.to_owned(), vec![entry(Ulid::new(), sender)]);
+                reg.insert(sibling.to_owned(), vec![entry(Ulid::generate(), sender)]);
             }
         }
 
@@ -694,8 +701,8 @@ mod tests {
     fn drop_one_of_two_keeps_sibling_sender() -> usize {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
         let queue = "shared-coexist".to_owned();
-        let first_id = Ulid::new();
-        let second_id = Ulid::new();
+        let first_id = Ulid::generate();
+        let second_id = Ulid::generate();
         let (first_sender, _first_rx) = mpsc::channel(1);
         let (second_sender, _second_rx) = mpsc::channel(1);
         registry
@@ -728,7 +735,7 @@ mod tests {
     fn drop_with_poisoned_registry() -> usize {
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
         let queue = "shared-poisoned-drop".to_owned();
-        let id = Ulid::new();
+        let id = Ulid::generate();
         let (sender, _receiver) = mpsc::channel(1);
         registry
             .lock()
@@ -790,8 +797,14 @@ mod tests {
         drop(dead_receiver);
         {
             let mut reg = registry.lock().expect("fresh registry is not poisoned");
-            reg.insert("alive".to_owned(), vec![entry(Ulid::new(), alive_sender)]);
-            reg.insert("dead".to_owned(), vec![entry(Ulid::new(), dead_sender)]);
+            reg.insert(
+                "alive".to_owned(),
+                vec![entry(Ulid::generate(), alive_sender)],
+            );
+            reg.insert(
+                "dead".to_owned(),
+                vec![entry(Ulid::generate(), dead_sender)],
+            );
         }
 
         broadcast_notify_error(&registry, "synthetic listener failure".to_owned());
@@ -802,7 +815,7 @@ mod tests {
     }
 
     fn new_task_id() -> PgTaskId {
-        PgTaskId::new(Ulid::new())
+        PgTaskId::new(Ulid::generate())
     }
 
     /// `deliver_to_queue` must prune a sender whose receiver was dropped
@@ -815,7 +828,7 @@ mod tests {
         drop(dead_receiver);
         registry.insert(
             "shared-deliver-dead".to_owned(),
-            vec![entry(Ulid::new(), dead_sender)],
+            vec![entry(Ulid::generate(), dead_sender)],
         );
         deliver_to_queue(&mut registry, "shared-deliver-dead", &[new_task_id()]);
         registry.len()
@@ -832,7 +845,7 @@ mod tests {
         let (full_sender, _full_receiver) = mpsc::channel::<PgTaskId>(1);
         registry.insert(
             "shared-deliver-full".to_owned(),
-            vec![entry(Ulid::new(), full_sender)],
+            vec![entry(Ulid::generate(), full_sender)],
         );
         let ids = [new_task_id(), new_task_id(), new_task_id(), new_task_id()];
         deliver_to_queue(&mut registry, "shared-deliver-full", &ids);
@@ -856,8 +869,8 @@ mod tests {
         registry.insert(
             "shared-deliver-fanout".to_owned(),
             vec![
-                entry(Ulid::new(), first_sender),
-                entry(Ulid::new(), second_sender),
+                entry(Ulid::generate(), first_sender),
+                entry(Ulid::generate(), second_sender),
             ],
         );
         let id = new_task_id();
@@ -877,7 +890,10 @@ mod tests {
     fn deliver_to_absent_queue_leaves_others_intact() -> (usize, bool) {
         let mut registry: RegistryMap = HashMap::new();
         let (sender, _receiver) = mpsc::channel::<PgTaskId>(1);
-        registry.insert("shared-other".to_owned(), vec![entry(Ulid::new(), sender)]);
+        registry.insert(
+            "shared-other".to_owned(),
+            vec![entry(Ulid::generate(), sender)],
+        );
         deliver_to_queue(&mut registry, "shared-absent", &[new_task_id()]);
         let unrelated_len = registry.get("shared-other").map(Vec::len).unwrap_or(0);
         let absent_created = registry.contains_key("shared-absent");
@@ -902,7 +918,7 @@ mod tests {
             .expect("fresh registry is not poisoned")
             .insert(
                 "shared-error-full".to_owned(),
-                vec![entry(Ulid::new(), full_sender)],
+                vec![entry(Ulid::generate(), full_sender)],
             );
         broadcast_notify_error(&registry, "synthetic listener failure".to_owned());
         let reg = registry.lock().expect("registry is not poisoned");
@@ -918,7 +934,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel::<PgTaskId>(1);
         registry.insert(
             "shared-still-active".to_owned(),
-            vec![entry(Ulid::new(), sender)],
+            vec![entry(Ulid::generate(), sender)],
         );
         registry
     }
@@ -928,7 +944,7 @@ mod tests {
         let (sender, receiver, expected) = hint_channel(full);
         let errors = Arc::new(crate::notify_event::NotificationErrors::default());
         let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let id = Ulid::new();
+        let id = Ulid::generate();
         registry
             .lock()
             .unwrap()
@@ -986,7 +1002,7 @@ mod tests {
             .expect("fresh registry is not poisoned")
             .insert(
                 "shared-exit".to_owned(),
-                vec![(Ulid::new(), sender, errors.clone())],
+                vec![(Ulid::generate(), sender, errors.clone())],
             );
         let listener_alive = AtomicBool::new(true);
         exit_listener(
@@ -998,7 +1014,7 @@ mod tests {
             receiver,
             errors,
             _registration: Arc::new(SharedRegistration {
-                id: Ulid::new(),
+                id: Ulid::generate(),
                 queue: "shared-exit".into(),
                 registry: registry.clone(),
             }),
@@ -1028,7 +1044,7 @@ mod tests {
             .expect("fresh registry is not poisoned")
             .insert(
                 "shared-exit-poisoned".to_owned(),
-                vec![entry(Ulid::new(), sender)],
+                vec![entry(Ulid::generate(), sender)],
             );
 
         let poison_target = registry.clone();

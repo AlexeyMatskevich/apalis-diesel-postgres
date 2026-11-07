@@ -34,7 +34,7 @@ async fn commit_rejection(rejection: Rejection) -> Result<Outcome<Value>, String
         crate::setup(&pool).await.map_err(|e|e.to_string())?;
         let mut storage=PostgresStorage::<String>::new_with_config(&pool,&Config::new("rejected-commit"))
             .with_poll_strategy_factory(||IntervalStrategy::new(Duration::from_millis(1)));
-        let id=PgTaskId::new(ulid::Ulid::new());
+        let id=PgTaskId::new(ulid::Ulid::generate());
         storage.push_task(TaskBuilder::new("payload".to_owned()).with_task_id(id).build()).await.map_err(|e|e.to_string())?;
         with_conn(pool.clone(),move |conn| {
             let code=match rejection {Rejection::Serialization=>"40001",Rejection::Constraint=>"23514"};

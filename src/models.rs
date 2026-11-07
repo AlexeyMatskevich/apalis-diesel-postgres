@@ -1,17 +1,19 @@
 use std::str::FromStr;
 
 use apalis_core::{
-    backend::{QueueInfo, RunningWorker, Statistic, TaskResult},
-    task::{status::Status, task_id::TaskId},
+    backend::{QueueInfo, RunningWorker, StatType, Statistic, TaskResult},
+    task::{builder::TaskBuilder, metadata::MetadataStore, status::Status, task_id::TaskId},
 };
-use apalis_sql::{DateTime, DateTimeExt, TaskRow};
 use diesel::deserialize::QueryableByName;
 use diesel::sql_types::{Binary, Int4, Jsonb, Nullable, Text, Timestamptz};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use ulid::Ulid;
 
-use crate::Error;
+use crate::{
+    CompactType, Error, PgTask,
+    config::{DateTime, DateTimeExt},
+};
 
 #[derive(Debug, QueryableByName)]
 pub(crate) struct JobRow {
@@ -29,6 +31,9 @@ pub(crate) struct JobRow {
     pub(crate) max_attempts: i32,
     #[diesel(sql_type = Timestamptz)]
     pub(crate) run_at: DateTime,
+    /// Read with the row but not carried: an apalis 1.0 task has no place
+    /// for it. `WaitForCompletion` reads results through its own queries.
+    #[allow(dead_code)]
     #[diesel(sql_type = Nullable<Jsonb>)]
     pub(crate) last_result: Option<Value>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
@@ -45,34 +50,69 @@ pub(crate) struct JobRow {
     pub(crate) idempotency_key: Option<String>,
 }
 
-impl From<JobRow> for TaskRow {
-    fn from(row: JobRow) -> Self {
-        Self {
-            job: row.job,
-            id: row.id,
-            job_type: row.job_type,
-            status: row.status,
-            attempts: row.attempts.max(0) as usize,
-            max_attempts: Some(row.max_attempts.max(0) as usize),
-            run_at: Some(row.run_at),
-            last_result: row.last_result,
-            lock_at: row.lock_at,
-            lock_by: row.lock_by,
-            done_at: row.done_at,
-            priority: row.priority.map(|priority| priority.max(0) as usize),
-            // apalis-sql's `try_into_task_compact` does
-            // `metadata.as_object().cloned().unwrap()`, which panics on any
-            // non-object JSONB — and a third-party writer can store a bare
-            // number, string, array, bool, or null straight into
-            // `apalis.jobs`, bypassing this crate's push API. Coerce non-object
-            // metadata to `None` so the downstream conversion falls back to an
-            // empty object instead of panicking (and, on the polling path,
-            // stranding every co-claimed row). Mirrors apalis-sql's own
-            // defensive `try_into_task`, which already uses `unwrap_or_default`.
-            metadata: row.metadata.filter(Value::is_object),
-            idempotency_key: row.idempotency_key,
+/// The default `max_attempts` of a row that has none, as `apalis-sql` used.
+const DEFAULT_MAX_ATTEMPTS: usize = 25;
+
+impl JobRow {
+    /// Build the compact task this row stores.
+    ///
+    /// The task id must be a ULID, as every id this backend writes is.
+    /// `last_result` has no place on an apalis 1.0 task and is not carried.
+    pub(crate) fn into_task(self) -> Result<PgTask<CompactType>, Error> {
+        let task_id = ulid::Ulid::from_string(&self.id)
+            .map(TaskId::from_ulid)
+            .map_err(|error| Error::Row(Box::new(error)))?;
+        let status = Status::from_str(&self.status).map_err(|error| Error::Row(Box::new(error)))?;
+        let run_at = u64::try_from(self.run_at.to_unix_timestamp()).unwrap_or(0);
+        let unix = |time: DateTime| u64::try_from(time.to_unix_timestamp()).ok();
+        let mut task = TaskBuilder::new(self.job)
+            .task_id(task_id)
+            .queue(self.job_type.into())
+            .status(status)
+            .attempt(self.attempts.max(0) as usize)
+            .max_attempts(usize::try_from(self.max_attempts).unwrap_or(DEFAULT_MAX_ATTEMPTS))
+            .priority(self.priority.unwrap_or_default().max(0) as usize)
+            .run_at_timestamp(run_at)
+            .lock_at(self.lock_at.and_then(unix))
+            .lock_by(self.lock_by)
+            .done_at(self.done_at.and_then(unix))
+            .with_metadata(metadata_from_json(self.metadata));
+        if let Some(key) = self.idempotency_key {
+            task = task.idempotency_key(key);
         }
+        Ok(task.build())
     }
+}
+
+/// Read the `metadata` column into apalis's string store.
+///
+/// A string value is taken as-is; any other value is kept as its JSON text.
+/// Anything but a JSON object — a third-party writer can store a bare number,
+/// string, array, bool, or null straight into `apalis.jobs`, bypassing this
+/// crate's push API — reads as empty metadata instead of failing the row and,
+/// on the polling path, stranding every co-claimed row.
+pub(crate) fn metadata_from_json(value: Option<Value>) -> MetadataStore {
+    let Some(Value::Object(map)) = value else {
+        return MetadataStore::new();
+    };
+    MetadataStore::from_map(
+        map.into_iter()
+            .map(|(key, value)| match value {
+                Value::String(text) => (key, text),
+                other => (key, other.to_string()),
+            })
+            .collect(),
+    )
+}
+
+/// Write apalis's string store as the `metadata` JSON object.
+pub(crate) fn metadata_to_json(store: &MetadataStore) -> Value {
+    Value::Object(
+        store
+            .iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect(),
+    )
 }
 
 #[derive(Debug, QueryableByName)]
@@ -123,7 +163,8 @@ impl From<StatisticRow> for Statistic {
     fn from(row: StatisticRow) -> Self {
         Self {
             title: row.statistic.unwrap_or_default(),
-            stat_type: apalis_sql::stat_type_from_string(&row.r#type.unwrap_or_default()),
+            stat_type: StatType::from_str(&row.r#type.unwrap_or_default())
+                .unwrap_or(StatType::Number),
             value: row.value.unwrap_or_else(|| "0".to_owned()),
             priority: Some(row.priority.unwrap_or_default().max(0) as u64),
         }
@@ -172,6 +213,8 @@ pub(crate) struct TrackedTaskRow {
     pub(crate) status: String,
     #[diesel(sql_type = Nullable<Jsonb>)]
     pub(crate) result: Option<Value>,
+    #[diesel(sql_type = Int4)]
+    pub(crate) attempts: i32,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     pub(crate) terminal: bool,
 }
@@ -182,6 +225,7 @@ impl From<TrackedTaskRow> for TaskResultRow {
             id: Some(row.id),
             status: Some(row.status),
             result: row.result,
+            attempts: Some(row.attempts),
         }
     }
 }
@@ -194,20 +238,25 @@ pub(crate) struct TaskResultRow {
     pub(crate) status: Option<String>,
     #[diesel(sql_type = Nullable<Jsonb>)]
     pub(crate) result: Option<Value>,
+    #[diesel(sql_type = Nullable<Int4>)]
+    pub(crate) attempts: Option<i32>,
 }
 
-pub(crate) fn task_result_from_row<O>(row: TaskResultRow) -> Result<TaskResult<O, Ulid>, Error>
+pub(crate) fn task_result_from_row<O>(row: TaskResultRow) -> Result<TaskResult<O>, Error>
 where
     Result<O, String>: DeserializeOwned,
 {
     let id = row.id.ok_or(Error::MissingField("id"))?;
     let status = row.status.ok_or(Error::MissingField("status"))?;
     let result = row.result.ok_or(Error::MissingField("last_result"))?;
-    Ok(TaskResult::new(
-        TaskId::from_str(&id).map_err(|error| Error::Row(Box::new(error)))?,
-        Status::from_str(&status).map_err(|error| Error::Row(Box::new(error)))?,
-        serde_json::from_value(result)?,
-    ))
+    Ok(TaskResult {
+        task_id: Ulid::from_string(&id)
+            .map(TaskId::from_ulid)
+            .map_err(|error| Error::Row(Box::new(error)))?,
+        attempt: row.attempts.map_or(0, |attempts| attempts.max(0) as usize),
+        status: Status::from_str(&status).map_err(|error| Error::Row(Box::new(error)))?,
+        result: serde_json::from_value(result)?,
+    })
 }
 
 #[cfg(test)]
@@ -385,7 +434,7 @@ mod tests {
         // `try_into_task_compact` parses `id` and `status`; the shared `job_row`
         // helper stores placeholders that only the (non-parsing) `From`
         // conversion tolerates, so give it a real ULID and a parseable status.
-        row.id = Ulid::new().to_string();
+        row.id = Ulid::generate().to_string();
         row.status = "Pending".to_owned();
         let task = TaskRow::from(row)
             .try_into_task_compact::<Ulid, crate::PgPool>()

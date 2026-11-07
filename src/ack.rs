@@ -1,7 +1,7 @@
 use apalis_core::{
     error::{AbortError, BoxDynError},
     layers::{Layer, Service},
-    task::{Parts, status::Status},
+    task::{ExecutionContext, status::Status},
     worker::{
         context::WorkerContext,
         ext::ack::{Acknowledge, AcknowledgeLayer},
@@ -19,7 +19,22 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::{Error, PgContext, PgPool, PgTask, PgTaskId, queries};
+use crate::{Error, PgPool, PgTask, PgTaskId, queries};
+
+/// `max_attempts` of a task that carries none, as `apalis-sql`'s context used.
+const DEFAULT_MAX_ATTEMPTS: i32 = 5;
+
+/// The claim timestamp of a task, in the seconds `apalis.jobs.lock_at` holds.
+fn lock_at_of(ctx: &ExecutionContext) -> Option<i64> {
+    ctx.lock_at().and_then(|at| i64::try_from(at).ok())
+}
+
+/// The task's `max_attempts` as the database column stores it.
+fn max_attempts_of(ctx: &ExecutionContext) -> i32 {
+    ctx.max_attempts().map_or(DEFAULT_MAX_ATTEMPTS, |max| {
+        i32::try_from(max).unwrap_or(i32::MAX)
+    })
+}
 
 /// Acknowledges task completion by updating `apalis.jobs`.
 ///
@@ -31,11 +46,11 @@ use crate::{Error, PgContext, PgPool, PgTask, PgTaskId, queries};
 /// cannot forge an ack without also possessing the token.
 ///
 /// Tasks returned by a storage claim carry an in-memory snapshot of their
-/// persisted attempt count. Keep their `Parts` (including `data`) when
-/// acknowledging manually: the snapshot accounts for one completed execution
-/// even without an Apalis Tracker. It survives `Parts::clone` and ack retries,
-/// but is not serialized. For manually assembled Parts without that snapshot,
-/// the caller supplies an `Attempt` including the completed execution, as in
+/// persisted attempt count. Keep their execution context (including `data`)
+/// when acknowledging manually: the snapshot accounts for one completed
+/// execution. It survives clones of the context and ack retries, but is not
+/// serialized. For a manually assembled context without that snapshot, the
+/// caller supplies an attempt count including the completed execution, as in
 /// the low-level acknowledgement contract.
 ///
 /// Acknowledging a claim whose start was refused, by the backend middleware or
@@ -51,7 +66,7 @@ pub struct PgAck {
 }
 
 /// The persisted history returned by one SQL claim, independent of Apalis's
-/// mutable execution counter. Keep it across Parts clones and ack retries:
+/// mutable execution counter. Keep it across context clones and ack retries:
 /// consuming it would lose the original predicate after a cancelled ack.
 #[derive(Clone)]
 struct ClaimAttempt {
@@ -142,42 +157,35 @@ impl Drop for ClaimObligation {
     }
 }
 
-pub(crate) fn record_claim(parts: &mut Parts<PgContext, Ulid>) {
-    parts.data.insert(ClaimAttempt {
-        task_id: parts.task_id,
-        lock_at: *parts.ctx.lock_at(),
-        completed: parts.attempt.current(),
+pub(crate) fn record_claim<Args>(task: &mut PgTask<Args>) {
+    let claim = ClaimAttempt {
+        task_id: task.task_id().cloned(),
+        lock_at: lock_at_of(task),
+        completed: task.attempt(),
         acknowledgement: Arc::new(ClaimAcknowledgement {
             serial: futures::lock::Mutex::new(()),
             done: AtomicBool::new(false),
             started: AtomicBool::new(false),
             start_attempted: AtomicBool::new(false),
         }),
-    });
+    };
+    task.inject_data(claim);
 }
 
-fn acknowledgement_attempt(parts: &Parts<PgContext, Ulid>) -> Result<usize, Error> {
-    let Some(claim) = parts.data.get::<ClaimAttempt>() else {
+fn acknowledgement_attempt(ctx: &ExecutionContext) -> Result<usize, Error> {
+    let Some(claim) = ctx.data().get::<ClaimAttempt>() else {
         // Manually assembled acknowledgements retain the existing contract:
         // their caller supplies the count including the completed execution.
-        return Ok(parts.attempt.current());
+        return Ok(ctx.attempt());
     };
-    let task_id = parts.task_id.ok_or(Error::MissingField("task_id"))?;
-    let worker_id = parts
-        .ctx
-        .lock_by()
-        .as_deref()
-        .ok_or(Error::MissingField("lock_by"))?;
-    let queue = parts
-        .ctx
-        .queue()
-        .as_deref()
-        .ok_or(Error::MissingField("queue"))?;
-    let lock_at = parts.ctx.lock_at().ok_or(Error::MissingField("lock_at"))?;
-    if claim.task_id != Some(task_id) || claim.lock_at != Some(lock_at) {
+    let task_id = ctx.task_id().ok_or(Error::MissingField("task_id"))?;
+    let worker_id = ctx.lock_by().ok_or(Error::MissingField("lock_by"))?;
+    let queue = ctx.queue().ok_or(Error::MissingField("queue"))?;
+    let lock_at = lock_at_of(ctx).ok_or(Error::MissingField("lock_at"))?;
+    if claim.task_id.as_ref() != Some(task_id) || claim.lock_at != Some(lock_at) {
         return Err(Error::stale_acknowledgement(
             task_id.to_string(),
-            queue,
+            queue.to_string(),
             worker_id,
         ));
     }
@@ -407,7 +415,7 @@ mod tests {
     }
 
     fn task_id() -> TaskId<Ulid> {
-        TaskId::new(Ulid::new())
+        TaskId::new(Ulid::generate())
     }
 
     fn parts_for_ack(attempts: usize, max_attempts: i32) -> Parts<PgContext, Ulid> {
@@ -1515,7 +1523,7 @@ mod tests {
                 #[diesel(sql_type = BigInt)]
                 lock_at: i64,
             }
-            let id = Ulid::new();
+            let id = Ulid::generate();
             crate::test_support::with_conn(pool, move |conn| {
                 sql_query(
                     "INSERT INTO apalis.workers (id, worker_type, storage_name, layers, last_seen, started_at, lease_token)
@@ -1646,8 +1654,8 @@ mod tests {
             let Some(pool) = crate::test_support::shared_pool().await? else {
                 return Ok(crate::test_support::Outcome::Skipped);
             };
-            let queue = format!("start-claim-{}", Ulid::new());
-            let worker = format!("start-worker-{}", Ulid::new());
+            let queue = format!("start-claim-{}", Ulid::generate());
+            let worker = format!("start-worker-{}", Ulid::generate());
             let registered_token = match holder {
                 Holder::Current | Holder::RetiredLocally => START_TOKEN,
                 Holder::Replaced | Holder::ReplacedUnbound => "successor-token",
@@ -1754,8 +1762,8 @@ mod tests {
             let Some(pool) = crate::test_support::shared_pool().await? else {
                 return Ok(crate::test_support::Outcome::Skipped);
             };
-            let queue = format!("ack-start-{}", Ulid::new());
-            let worker = format!("ack-start-worker-{}", Ulid::new());
+            let queue = format!("ack-start-{}", Ulid::generate());
+            let worker = format!("ack-start-worker-{}", Ulid::generate());
             let registered_token = match holder {
                 Holder::Current | Holder::RetiredLocally => START_TOKEN,
                 Holder::Replaced | Holder::ReplacedUnbound => "successor-token",
@@ -1996,8 +2004,8 @@ mod tests {
             let Some(pool) = crate::test_support::shared_pool().await? else {
                 return Ok(crate::test_support::Outcome::Skipped);
             };
-            let queue = format!("outer-ack-{}", Ulid::new());
-            let worker = format!("outer-ack-worker-{}", Ulid::new());
+            let queue = format!("outer-ack-{}", Ulid::generate());
+            let worker = format!("outer-ack-worker-{}", Ulid::generate());
             let observation = async {
                 let (id, lock_at) = seed_claim(
                     pool.clone(),
@@ -2109,8 +2117,8 @@ mod tests {
             let Some(pool) = crate::test_support::shared_pool().await? else {
                 return Ok(crate::test_support::Outcome::Skipped);
             };
-            let queue = format!("start-reserved-{}", Ulid::new());
-            let worker = format!("start-reserved-worker-{}", Ulid::new());
+            let queue = format!("start-reserved-{}", Ulid::generate());
+            let worker = format!("start-reserved-worker-{}", Ulid::generate());
             let result = async {
                 let (id, lock_at) = seed_claim(
                     pool.clone(),
@@ -2598,11 +2606,11 @@ impl PgAck {
     /// charges the claims it was running and a claim lost in the meantime is
     /// refused before it runs.
     ///
-    /// Keep the task's `Parts` from the claim, including `data`, as for an
-    /// acknowledgement. Starting a claim this process already started is
-    /// accepted, unless its acknowledgement already committed. `Parts` without
-    /// the claim record are matched by owner and claim timestamp only,
-    /// whatever their attempt counter says.
+    /// Keep the task's execution context from the claim, including `data`, as
+    /// for an acknowledgement. Starting a claim this process already started
+    /// is accepted, unless its acknowledgement already committed. A context
+    /// without the claim record is matched by owner and claim timestamp only,
+    /// whatever its attempt counter says.
     ///
     /// # Errors
     /// - [`Error::ClaimLost`] if the claim was recovered, released or taken
@@ -2626,8 +2634,8 @@ impl PgAck {
     ///
     /// [`PostgresStorage::acknowledger`]: crate::PostgresStorage::acknowledger
     /// [`PostgresStorage::release_worker`]: crate::PostgresStorage::release_worker
-    pub fn start(&self, parts: &Parts<PgContext, Ulid>) -> BoxFuture<'static, Result<(), Error>> {
-        let Some(worker_id) = parts.ctx.lock_by().clone() else {
+    pub fn start(&self, ctx: &ExecutionContext) -> BoxFuture<'static, Result<(), Error>> {
+        let Some(worker_id) = ctx.lock_by().map(str::to_owned) else {
             return futures::future::ready(Err(Error::MissingField("lock_by"))).boxed();
         };
         let lease = self
@@ -2640,7 +2648,7 @@ impl PgAck {
             self.lease_token.clone(),
             lease,
             worker_id,
-            parts,
+            ctx,
         );
         async move {
             let outcome = start.await;
@@ -2737,20 +2745,16 @@ pub(crate) fn build_ack_response<Res: Serialize>(
     .map(Some)
 }
 
-impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
+impl<Res: Serialize> Acknowledge<Res> for PgAck {
     type Error = Error;
     type Future = BoxFuture<'static, Result<(), Self::Error>>;
 
-    fn ack(
-        &mut self,
-        res: &Result<Res, BoxDynError>,
-        parts: &Parts<PgContext, Ulid>,
-    ) -> Self::Future {
-        let task_id = parts.task_id;
-        let worker_id = parts.ctx.lock_by().clone();
-        let queue = parts.ctx.queue().clone();
-        let lock_at = *parts.ctx.lock_at();
-        let claim = parts.data.get::<ClaimAttempt>().cloned();
+    fn ack(&mut self, res: &Result<Res, BoxDynError>, ctx: &ExecutionContext) -> Self::Future {
+        let task_id = ctx.task_id().cloned();
+        let worker_id = ctx.lock_by().map(str::to_owned);
+        let queue = ctx.queue().map(ToString::to_string);
+        let lock_at = lock_at_of(ctx);
+        let claim = ctx.data().get::<ClaimAttempt>().cloned();
         let mut completion_guard = ClaimObligation {
             guard: self
                 .leases
@@ -2762,10 +2766,10 @@ impl<Res: Serialize> Acknowledge<Res, PgContext, Ulid> for PgAck {
         // SQL stores completed history; Tracker increments a shared Attempt
         // only when it is present. Use the claim snapshot for both the retry
         // decision and the write so direct middleware calls behave identically.
-        let attempt_and_status = acknowledgement_attempt(parts).map(|attempts| {
+        let attempt_and_status = acknowledgement_attempt(ctx).map(|attempts| {
             (
                 attempts,
-                calculate_status(parts.ctx.max_attempts(), attempts, res),
+                calculate_status(max_attempts_of(ctx), attempts, res),
             )
         });
         // Silent saturation would corrupt the ack's lock-check predicate:
@@ -2894,9 +2898,18 @@ pub(crate) fn calculate_status<Res>(
 ///   resolve the claim or allow orphan recovery before restarting. Retrying
 ///   this call alone does not establish that the previous claim rolled back.
 pub async fn lock_task(pool: &PgPool, task_id: &PgTaskId, worker_id: &str) -> Result<(), Error> {
-    queries::lock_task(pool.clone(), *task_id.inner(), worker_id.to_owned(), None)
+    queries::lock_task(pool.clone(), ulid_of(task_id)?, worker_id.to_owned(), None)
         .await
         .map(|_| ())
+}
+
+/// The ULID of a task id of this backend.
+fn ulid_of(task_id: &PgTaskId) -> Result<Ulid, Error> {
+    task_id.as_ulid().ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "task id `{task_id}` is not a ULID; this backend stores ULID task ids"
+        ))
+    })
 }
 
 /// Lock a due task scoped to a specific queue.
@@ -2918,7 +2931,7 @@ pub async fn lock_task_in_queue(
 ) -> Result<(), Error> {
     queries::lock_task(
         pool.clone(),
-        *task_id.inner(),
+        ulid_of(task_id)?,
         worker_id.to_owned(),
         Some(queue.to_owned()),
     )
@@ -3170,12 +3183,12 @@ fn start_claim(
     lease_token: Option<Arc<str>>,
     lease: Option<Arc<crate::lease::WorkerLease>>,
     worker_id: String,
-    parts: &Parts<PgContext, Ulid>,
+    ctx: &ExecutionContext,
 ) -> BoxFuture<'static, Result<(), StartRefusal>> {
-    let task_id = parts.task_id;
-    let queue = parts.ctx.queue().clone();
-    let status = parts.status.clone();
-    let claim = parts.data.get::<ClaimAttempt>().cloned();
+    let task_id = ctx.task_id().cloned();
+    let queue = ctx.queue().map(ToString::to_string);
+    let status = ctx.raw_status().clone();
+    let claim = ctx.data().get::<ClaimAttempt>().cloned();
     // A manually assembled task has no claim identity to tell a repeated start
     // from a second claim, and its attempt counter has no fixed meaning: the
     // worker's Tracker and the manual acknowledgement contract count it
@@ -3183,7 +3196,7 @@ fn start_claim(
     // either way.
     let (lock_at, attempts, restart) = match claim.as_ref() {
         Some(claim) => (claim.lock_at, Some(claim.completed), claim.has_started()),
-        None => (*parts.ctx.lock_at(), None, true),
+        None => (lock_at_of(ctx), None, true),
     };
     async move {
         if let Some(claim) = &claim {
@@ -3193,7 +3206,10 @@ fn start_claim(
                 // owed, so this is not a refused start either.
                 return Err(StartRefusal {
                     error: Error::already_acknowledged(
-                        task_id.map(|id| id.to_string()).unwrap_or_default(),
+                        task_id
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
                         queue.clone().unwrap_or_default(),
                         worker_id,
                     ),
@@ -3227,7 +3243,7 @@ fn start_claim(
         let started = queries::start_task(
             pool,
             queries::StartClaim {
-                task_id,
+                task_id: task_id.clone(),
                 queue: queue.clone(),
                 worker_id: worker_id.clone(),
                 lock_at,
@@ -3271,28 +3287,25 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, mut req: PgTask<Args>) -> Self::Future {
+    fn call(&mut self, req: PgTask<Args>) -> Self::Future {
         let pool = self.pool.clone();
         let lease_token = self.lease_token.as_ref().map(|token| token.0.clone());
-        let worker = req.parts.data.get::<WorkerContext>().cloned();
+        let worker = req.data().get::<WorkerContext>().cloned();
         let worker_id = worker.as_ref().map(|worker| worker.name().to_owned());
         let local_lease = self
             .leases
             .as_ref()
             .and_then(|leases| worker_id.as_deref().map(|id| leases.for_worker(id)));
-        let queue = req.parts.ctx.queue().clone();
-        let task_id = req.parts.task_id.map(|id| *id.inner());
+        let queue = req.queue().map(ToString::to_string);
+        let task_id = req.task_id().map(ulid_of);
         // A task the fetcher already claimed for this worker (`fetch_next`
         // and `queue_by_id` set both `lock_by` and `lock_at` and leave the
         // row `Queued`) only needs to be started under its claim epoch.
         // Tasks that arrive without `lock_by`/`lock_at` in the context go
         // through `lock_task`, which claims and starts in one statement.
-        let preclaimed = is_preclaimed(
-            req.parts.ctx.lock_by().as_deref(),
-            worker_id.as_deref(),
-            req.parts.ctx.lock_at().is_some(),
-        );
-        let claim = req.parts.data.get::<ClaimAttempt>().cloned();
+        let preclaimed =
+            is_preclaimed(req.lock_by(), worker_id.as_deref(), req.lock_at().is_some());
+        let claim = req.data().get::<ClaimAttempt>().cloned();
         let acknowledged_at_call =
             preclaimed && claim.as_ref().is_some_and(ClaimAttempt::is_acknowledged);
         // A preclaimed task carries a completion obligation from this call
@@ -3315,18 +3328,18 @@ where
         let clone = self.inner.clone();
         let mut ready_inner = std::mem::replace(&mut self.inner, clone);
 
+        // apalis 1.0 installs this middleware outside the user's layers, so a
+        // retry layer re-runs the handler inside one dispatch and can no
+        // longer re-dispatch a refusal from here; refusals are not counted on
+        // the task's attempt counter, which apalis no longer lets a backend
+        // increment.
         let dispatch = async move {
-            // Every refusal below happens before the handler, where the
-            // worker's Tracker would have counted the dispatch. Count it here,
-            // in one place, so a counter-based retry layer outside this
-            // middleware stops after its budget instead of re-dispatching the
-            // refusal.
-            let attempt = req.parts.attempt.clone();
             let admitted: Result<PgTask<Args>, BoxDynError> = async {
                 let worker_id = worker_id
                     .ok_or_else(|| AbortError::new(Error::MissingField("worker_context")))?;
-                let task_id =
-                    task_id.ok_or_else(|| AbortError::new(Error::MissingField("task_id")))?;
+                let task_id = task_id
+                    .ok_or_else(|| AbortError::new(Error::MissingField("task_id")))?
+                    .map_err(AbortError::new)?;
                 // Read the marker when the dispatch runs: an acknowledgement in
                 // flight when this future was created may have committed since.
                 if preclaimed && claim.as_ref().is_some_and(ClaimAttempt::is_acknowledged) {
@@ -3347,7 +3360,7 @@ where
                         lease_token.clone(),
                         local_lease.clone(),
                         worker_id.clone(),
-                        &req.parts,
+                        &req,
                     )
                     .await
                     {
@@ -3386,40 +3399,36 @@ where
                             return Err(AbortError::new(error).into());
                         }
                     };
-                    req.parts.ctx = claimed.parts.ctx;
-                    req.parts.attempt = claimed.parts.attempt;
-                    req.parts.status.store(Status::Running);
-                    record_claim(&mut req.parts);
+                    // Take the claim's context (owner, epoch, attempts) and
+                    // keep this dispatch's data, such as the worker context.
+                    let (args, dispatched) = req.take();
+                    let mut claimed_task = PgTask::new_with_ctx(args, Arc::clone(claimed.ctx()))
+                        .into_builder()
+                        .with_data(dispatched.data().clone())
+                        .status(Status::Running)
+                        .build();
+                    record_claim(&mut claimed_task);
                     // `lock_task` claims and starts in one statement.
-                    let recorded = req.parts.data.get::<ClaimAttempt>().cloned();
+                    let recorded = claimed_task.data().get::<ClaimAttempt>().cloned();
                     if let Some(recorded) = recorded.as_ref() {
                         recorded.mark_started();
                     }
                     completion_guard.claim = recorded;
+                    return Ok(claimed_task);
                 }
                 Ok(req)
             }
             .await;
-            let req = match admitted {
-                Ok(req) => req,
-                Err(refusal) => {
-                    let _ = attempt.increment();
-                    return Err(refusal);
-                }
-            };
+            let req = admitted?;
             let result = ready_inner.call(req).await.map_err(Into::into);
             // A completed handler error is a valid acknowledged outcome. PgAck
             // retires on acknowledgement failure; this guard covers cancellation.
             completion_guard.disarm();
             result
         };
-        // A graceful stop waits for its worker's tasks. Counting the dispatch
-        // from its creation, not from the handler, keeps a stop from dropping
-        // a start whose transaction may still commit `Running`, which a release
-        // would then charge although no handler ran.
-        match worker {
-            Some(worker) => worker.track(dispatch).boxed(),
-            None => dispatch.boxed(),
-        }
+        // apalis 1.0 drains every in-flight service future, this dispatch
+        // included, before it closes the backend, so a graceful stop cannot
+        // drop a start whose transaction may still commit `Running`.
+        dispatch.boxed()
     }
 }

@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use apalis_sql::DateTime;
 use diesel::{
     Connection, PgConnection, RunQueryDsl, sql_query,
     sql_types::{Array, Binary, Integer, Nullable, Text, Timestamptz},
 };
 use ulid::Ulid;
 
-use crate::{CompactType, Config, Error, PgPool, PgTask};
+use crate::{CompactType, Config, Error, PgPool, PgTask, config::DateTime};
+
+/// `max_attempts` of a task that sets none, as `apalis-sql`'s context used.
+const DEFAULT_MAX_ATTEMPTS: i32 = 5;
 
 /// Cap on serialized task `metadata` JSON. Matches the `last_result` cap
 /// (`MAX_ERROR_PAYLOAD_LEN` in `src/ack.rs`): unbounded JSONB on `apalis.jobs`
@@ -275,22 +277,31 @@ fn validate_columns(task: &PgTask<CompactType>) -> Result<ValidatedTask, Error> 
             task.args.len(),
         )));
     }
-    let run_at_secs = i64::try_from(task.parts.run_at).map_err(|_| {
+    if let Some(task_id) = task.task_id()
+        && task_id.as_ulid().is_none()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "task id `{task_id}` is not a ULID; this backend stores ULID task ids"
+        )));
+    }
+    // A task without a schedule runs now, as apalis 1.0-rc defaulted.
+    let run_at_raw = task
+        .run_at()
+        .unwrap_or_else(|| u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0));
+    let run_at_secs = i64::try_from(run_at_raw).map_err(|_| {
         Error::InvalidArgument(format!(
-            "run_at {} exceeds i64::MAX seconds and cannot be stored",
-            task.parts.run_at
+            "run_at {run_at_raw} exceeds i64::MAX seconds and cannot be stored"
         ))
     })?;
     let run_at = DateTime::from_timestamp(run_at_secs, 0).ok_or_else(|| {
         Error::InvalidArgument(format!(
-            "run_at {} exceeds the supported timestamp range",
-            task.parts.run_at
+            "run_at {run_at_raw} exceeds the supported timestamp range"
         ))
     })?;
     // Serialize metadata once into the text representation handed to
     // Postgres (cast to jsonb in the SELECT below), so the byte-length check
     // and the bind share one pass.
-    let meta_json = serde_json::to_string(task.parts.ctx.meta())
+    let meta_json = serde_json::to_string(&crate::models::metadata_to_json(task.metadata()))
         .map_err(|err| Error::InvalidArgument(format!("serializing task metadata: {err}")))?;
     if meta_json.len() > MAX_METADATA_PAYLOAD_LEN {
         return Err(Error::InvalidArgument(format!(
@@ -298,7 +309,7 @@ fn validate_columns(task: &PgTask<CompactType>) -> Result<ValidatedTask, Error> 
             meta_json.len(),
         )));
     }
-    if let Some(key) = task.parts.idempotency_key.as_deref()
+    if let Some(key) = task.idempotency_key()
         && key.len() > MAX_IDEMPOTENCY_KEY_LEN
     {
         return Err(Error::InvalidArgument(format!(
@@ -341,17 +352,21 @@ fn prepare_batch(
     for task in tasks {
         let ValidatedTask { run_at, meta_json } = validate_columns(&task)?;
         ids.push(
-            task.parts
-                .task_id
-                .map(|task_id| task_id.to_string())
-                .unwrap_or_else(|| Ulid::new().to_string()),
+            task.task_id()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| Ulid::generate().to_string()),
         );
+        max_attempts.push(task.max_attempts().map_or(DEFAULT_MAX_ATTEMPTS, |max| {
+            i32::try_from(max).unwrap_or(i32::MAX)
+        }));
+        priorities.push(
+            task.priority()
+                .map_or(0, |priority| i32::try_from(priority).unwrap_or(i32::MAX)),
+        );
+        idempotency_keys.push(task.idempotency_key().map(str::to_owned));
         jobs.push(task.args);
-        max_attempts.push(task.parts.ctx.max_attempts());
         run_ats.push(run_at);
-        priorities.push(task.parts.ctx.priority());
         metadata.push(meta_json);
-        idempotency_keys.push(task.parts.idempotency_key);
     }
 
     let task_count = ids.len();

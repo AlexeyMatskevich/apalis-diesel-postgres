@@ -133,7 +133,7 @@ impl<Args, Codec> PgSink<Args, Codec> {
     /// flush that could not obtain a connection hands the batch back to the
     /// buffer, and one refused by validation drops it; both leave the
     /// pipeline usable because nothing was written.
-    fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    pub(crate) fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         if self.failed {
             return Poll::Ready(Err(Error::SinkFailed));
         }

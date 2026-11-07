@@ -124,7 +124,7 @@ async fn run_lifecycle() -> Result<LifecycleOutcome, String> {
     let pool = build_pool(database_url).map_err(|error| error.to_string())?;
     setup(&pool).await.map_err(|error| error.to_string())?;
 
-    let queue = format!("apalis-diesel-postgres-test-{}", Ulid::new());
+    let queue = format!("apalis-diesel-postgres-test-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let config = Config::new(&queue).set_buffer_size(1);
@@ -169,7 +169,7 @@ async fn run_lifecycle() -> Result<LifecycleOutcome, String> {
     // `fetch_by_id` for a fresh id that was never inserted must return `None`:
     // this exercises the `WHERE id = $1` filter rejecting a non-match, which the
     // matching-id lookup above cannot (any returned row necessarily has that id).
-    let absent_id = PgTaskId::new(Ulid::new());
+    let absent_id = PgTaskId::new(Ulid::generate());
     let fetched_by_absent_id = decoded
         .fetch_by_id(&absent_id)
         .await

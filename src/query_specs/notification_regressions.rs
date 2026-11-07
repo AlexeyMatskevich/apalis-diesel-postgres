@@ -59,9 +59,9 @@ impl Fixture {
         };
         Ok(Some(Self {
             pool,
-            queue: format!("notification-regression-{}", ulid::Ulid::new()),
+            queue: format!("notification-regression-{}", ulid::Ulid::generate()),
             ids: (0..count)
-                .map(|_| PgTaskId::new(ulid::Ulid::new()))
+                .map(|_| PgTaskId::new(ulid::Ulid::generate()))
                 .collect(),
         }))
     }

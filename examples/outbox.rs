@@ -80,7 +80,7 @@ async fn main() -> Result<(), BoxError> {
 
     setup(&apalis_pool).await?;
 
-    let queue = format!("outbox-example-{}", Ulid::new());
+    let queue = format!("outbox-example-{}", Ulid::generate());
     let storage = PostgresStorage::<SendConfirmationEmail>::new_with_config(
         &apalis_pool,
         &Config::new(&queue),
@@ -109,7 +109,7 @@ async fn scenario_commit(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 1: commit");
-    let order_id = format!("{queue}:{}", Ulid::new());
+    let order_id = format!("{queue}:{}", Ulid::generate());
 
     let task_id = tokio::task::spawn_blocking({
         let storage = storage.clone();
@@ -145,7 +145,7 @@ async fn scenario_rollback(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 2: rollback");
-    let order_id = format!("{queue}:{}", Ulid::new());
+    let order_id = format!("{queue}:{}", Ulid::generate());
 
     // The closure simulates a downstream check that fails AFTER the apalis
     // enqueue — e.g. a domain validation. Returning `Err` from the closure
@@ -194,7 +194,7 @@ async fn scenario_idempotency_conflict(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 3: idempotency conflict");
-    let order_id = format!("{queue}:{}", Ulid::new());
+    let order_id = format!("{queue}:{}", Ulid::generate());
     let idempotency_key = format!("order:{order_id}");
 
     // Seed: first push with the idempotency_key, in its own transaction.

@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 use ulid::Ulid;
 
 pub(crate) fn mint_lease_token() -> String {
-    Ulid::new().to_string()
+    Ulid::generate().to_string()
 }
 /// Per-statement cap on the periodic orphan-recovery sweep. Without a bound,
 /// a mass worker death would rewrite every orphaned row in one statement

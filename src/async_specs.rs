@@ -43,7 +43,7 @@ impl apalis_core::backend::codec::Codec<String> for PanickingCodec {
     type Error = serde_json::Error;
     type Compact = CompactType;
 
-    fn encode(value: &String) -> Result<CompactType, Self::Error> {
+    fn encode(&self, value: &String) -> Result<CompactType, Self::Error> {
         serde_json::to_vec(value)
     }
 
@@ -93,7 +93,7 @@ async fn decode_cleanup(
     crate::setup(&pool)
         .await
         .map_err(|error| error.to_string())?;
-    let name = format!("decode-obligation-{}", ulid::Ulid::new());
+    let name = format!("decode-obligation-{}", ulid::Ulid::generate());
     let config = Config::new(&name);
     let worker = WorkerContext::new::<()>(&name);
     let token: Arc<str> = format!("token-{name}").into();
@@ -106,8 +106,8 @@ async fn decode_cleanup(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let bad_id = PgTaskId::new(ulid::Ulid::new());
-    let expected_sibling_id = PgTaskId::new(ulid::Ulid::new());
+    let bad_id = PgTaskId::new(ulid::Ulid::generate());
+    let expected_sibling_id = PgTaskId::new(ulid::Ulid::generate());
     let mut invalid = PgTask::new(b"{bad-json".to_vec());
     invalid.parts.task_id = Some(bad_id);
     invalid.parts.ctx = crate::PgContext::new().with_max_attempts(max_attempts);

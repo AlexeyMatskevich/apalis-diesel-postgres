@@ -229,12 +229,12 @@ async fn run_single_row_insert() -> Result<Outcome<TriggerRun>, String> {
     let Some(pool) = test_pool_multi().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-notify-single-{}", Ulid::new());
+    let queue = format!("apalis-spec-notify-single-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Mint the row id up front so the captured payload's lone `ids` element
     // can be pinned to exactly the row the writer inserted.
-    let row_id = Ulid::new().to_string();
+    let row_id = Ulid::generate().to_string();
     let queue_for_writer = queue.clone();
     let row_id_for_writer = row_id.clone();
     let observed = capture_trigger_notifies(
@@ -266,7 +266,7 @@ async fn run_future_dated_insert() -> Result<Outcome<TriggerRun>, String> {
     let Some(pool) = test_pool_multi().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-notify-future-{}", Ulid::new());
+    let queue = format!("apalis-spec-notify-future-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let queue_for_writer = queue.clone();
@@ -277,7 +277,7 @@ async fn run_future_dated_insert() -> Result<Outcome<TriggerRun>, String> {
                 "INSERT INTO apalis.jobs (id, job_type, job, status, attempts, max_attempts, run_at)
                  VALUES ($1, $2, $3, 'Pending', 0, 3, now() + INTERVAL '1 hour')",
             )
-            .bind::<Text, _>(Ulid::new().to_string())
+            .bind::<Text, _>(Ulid::generate().to_string())
             .bind::<Text, _>(&queue_for_writer)
             .bind::<diesel::sql_types::Binary, _>(serde_json::to_vec("x").unwrap())
             .execute(conn)
@@ -300,7 +300,7 @@ async fn run_batch_insert_chunks() -> Result<Outcome<TriggerRun>, String> {
     let Some(pool) = test_pool_multi().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-notify-batch-{}", Ulid::new());
+    let queue = format!("apalis-spec-notify-batch-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let queue_for_writer = queue.clone();
@@ -342,14 +342,14 @@ async fn run_on_conflict_no_notify() -> Result<Outcome<TriggerRun>, String> {
     let Some(pool) = test_pool_multi().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-notify-conflict-{}", Ulid::new());
+    let queue = format!("apalis-spec-notify-conflict-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Pre-seed a row, drain its NOTIFY, then issue an INSERT ... ON CONFLICT
     // DO NOTHING with the *same id*. The transition table for the conflict
     // case is empty, so the trigger's `COUNT(*) = 0` early-return path
     // fires and no NOTIFY is emitted.
-    let existing_id = Ulid::new().to_string();
+    let existing_id = Ulid::generate().to_string();
     let queue_seed = queue.clone();
     let seed_id = existing_id.clone();
     with_conn(pool.clone(), move |conn| {
@@ -412,7 +412,7 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
     let Some(pool) = test_pool_multi().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-notify-legacy-{}", Ulid::new());
+    let queue = format!("apalis-spec-notify-legacy-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Insert a row that exists in apalis.jobs but is NOT yet eligible for
@@ -420,7 +420,7 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
     // We then update run_at into the past *without* triggering NOTIFY (UPDATE
     // is not covered by the `notify_new_jobs` AFTER INSERT trigger), and
     // finally publish a legacy `{job_type, id}` payload by hand.
-    let row_id = Ulid::new().to_string();
+    let row_id = Ulid::generate().to_string();
     let queue_for_seed = queue.clone();
     let row_id_for_seed = row_id.clone();
     with_conn(pool.clone(), move |conn| {

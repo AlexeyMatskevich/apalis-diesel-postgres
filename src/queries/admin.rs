@@ -7,7 +7,7 @@
 use std::{sync::OnceLock, time::Duration};
 
 use apalis_core::{
-    backend::{Filter, QueueInfo, RunningWorker, Statistic, TaskResult, codec::Codec},
+    backend::{Filter, QueueInfo, RunningWorker, Statistic, TaskResult},
     task::{status::Status, task_id::TaskId},
 };
 use diesel::{
@@ -16,7 +16,6 @@ use diesel::{
 };
 use futures::{StreamExt, stream};
 use serde::de::DeserializeOwned;
-use ulid::Ulid;
 
 use crate::{
     CompactType, Error, PgPool, PgTask,
@@ -27,34 +26,22 @@ use crate::{
     queries::{filter_offset_i32, i32_from_u32, task_row, with_conn},
 };
 
-pub(crate) async fn fetch_by_id<Args, D>(
+pub(crate) async fn fetch_by_id(
     pool: PgPool,
     task_id: String,
     queue: String,
-) -> Result<Option<PgTask<Args>>, Error>
-where
-    D: Codec<Args, Compact = CompactType>,
-    D::Error: std::error::Error + Send + Sync + 'static,
-    Args: 'static,
-{
+) -> Result<Option<PgTask<CompactType>>, Error> {
     fetch_by_id_row(pool, task_id, queue)
         .await?
         .map(task_row)
-        .transpose()?
-        .map(|task| task.try_map(|args| D::decode(&args).map_err(|e| Error::Decode(e.into()))))
         .transpose()
 }
 
-pub(crate) fn list_tasks<Args, D>(
+pub(crate) fn list_tasks(
     pool: PgPool,
     queue: String,
     filter: &Filter,
-) -> impl Future<Output = Result<Vec<PgTask<Args>>, Error>> + Send
-where
-    D: Codec<Args, Compact = CompactType>,
-    D::Error: std::error::Error + Send + Sync + 'static,
-    Args: 'static,
-{
+) -> impl Future<Output = Result<Vec<PgTask<CompactType>>, Error>> + Send {
     let status = filter
         .status
         .as_ref()
@@ -67,9 +54,6 @@ where
             .await?
             .into_iter()
             .map(task_row)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|task| task.try_map(|args| D::decode(&args).map_err(|e| Error::Decode(e.into()))))
             .collect()
     }
 }
@@ -156,7 +140,7 @@ fn db_errors_exhausted(error_streak: u32, max_consecutive: u32) -> bool {
 struct PollTriage<O> {
     /// Terminal results and, for ids absent on two consecutive polls, the
     /// `TaskNotFound` that ends their wait.
-    items: Vec<Result<TaskResult<O, Ulid>, Error>>,
+    items: Vec<Result<TaskResult<O>, Error>>,
     /// Ids still waited for.
     remaining: Vec<String>,
 }
@@ -227,8 +211,8 @@ fn distinct_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
 
 pub(crate) fn wait_for_completion<O>(
     pool: PgPool,
-    task_ids: impl IntoIterator<Item = TaskId<Ulid>>,
-) -> futures::stream::BoxStream<'static, Result<TaskResult<O, Ulid>, Error>>
+    task_ids: impl IntoIterator<Item = TaskId>,
+) -> futures::stream::BoxStream<'static, Result<TaskResult<O>, Error>>
 where
     O: 'static + Send,
     Result<O, String>: DeserializeOwned,
@@ -321,6 +305,7 @@ fn tracked_task_rows(
         sql_query(format!(
             "SELECT id, status,
                     CASE WHEN {terminal} THEN last_result END AS result,
+                    attempts,
                     {terminal} AS terminal
              FROM apalis.jobs
              WHERE id = ANY($1)",
@@ -334,8 +319,8 @@ fn tracked_task_rows(
 
 pub(crate) fn check_status<O>(
     pool: PgPool,
-    task_ids: impl IntoIterator<Item = TaskId<Ulid>>,
-) -> impl Future<Output = Result<Vec<TaskResult<O, Ulid>>, Error>> + Send
+    task_ids: impl IntoIterator<Item = TaskId>,
+) -> impl Future<Output = Result<Vec<TaskResult<O>>, Error>> + Send
 where
     O: 'static + Send,
     Result<O, String>: DeserializeOwned,
@@ -773,7 +758,7 @@ pub(crate) fn completed_task_rows(
 ) -> impl Future<Output = Result<Vec<TaskResultRow>, Error>> + Send {
     with_conn(pool, move |conn| {
         sql_query(format!(
-            "SELECT id, status, last_result AS result
+            "SELECT id, status, last_result AS result, attempts
              FROM apalis.jobs
              WHERE id = ANY($1) AND {}",
             crate::queries::TERMINAL_PREDICATE
@@ -806,12 +791,14 @@ mod tests {
                 id: id.to_owned(),
                 status: "Done".to_owned(),
                 result: Some(serde_json::json!({"Ok": "done"})),
+                attempts: 1,
                 terminal: true,
             }),
             Presence::Active => Some(TrackedTaskRow {
                 id: id.to_owned(),
                 status: "Running".to_owned(),
                 result: None,
+                attempts: 0,
                 terminal: false,
             }),
         }

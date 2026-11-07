@@ -107,7 +107,7 @@ mod claims {
     }
     async fn orphan_takeover() -> (i64, i64) {
         let p = pool().await;
-        let q = format!("lifecycle_restart_{}", ulid::Ulid::new());
+        let q = format!("lifecycle_restart_{}", ulid::Ulid::generate());
         let config = Config::new(&q)
             .set_reenqueue_orphaned_after(Duration::from_secs(60))
             .set_keep_alive(Duration::from_millis(10));
@@ -145,7 +145,7 @@ mod claims {
     }
     async fn stale_stream_claim() -> bool {
         let p = pool().await;
-        let q = format!("lifecycle_stale_{}", ulid::Ulid::new());
+        let q = format!("lifecycle_stale_{}", ulid::Ulid::generate());
         let config = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_secs(60));
         let worker = WorkerContext::new::<()>("same-worker");
         let old = PostgresStorage::<String>::new_with_config(&p, &config);
@@ -155,7 +155,7 @@ mod claims {
         let new = PostgresStorage::<String>::new_with_config(&p, &config);
         let mut new_stream = new.poll_compact(&worker);
         assert!(new_stream.next().await.unwrap().is_ok());
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         sql(&p,format!("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at) VALUES('{id}','{q}',''::bytea,'Pending',0,25,now())")).await;
         let got = matches!(
             tokio::time::timeout(Duration::from_secs(3), old_stream.next()).await,
@@ -172,13 +172,13 @@ mod claims {
     }
     async fn malformed_batch() -> (bool, i64) {
         let p = pool().await;
-        let q = format!("lifecycle_malformed_id_{}", ulid::Ulid::new());
+        let q = format!("lifecycle_malformed_id_{}", ulid::Ulid::generate());
         let config = Config::new(&q).set_buffer_size(2);
         let worker = WorkerContext::new::<()>("batch-worker");
         let storage = PostgresStorage::<String>::new_with_config(&p, &config);
         let mut stream = storage.poll_compact(&worker);
         assert!(stream.next().await.unwrap().is_ok());
-        let good = ulid::Ulid::new().to_string();
+        let good = ulid::Ulid::generate().to_string();
         let ids = vec!["not-a-ulid".to_owned(), good.clone()];
         let pp = p.clone();
         let qq = q.clone();
@@ -209,13 +209,13 @@ mod claims {
     }
     async fn exhausted_pending() -> bool {
         let p = pool().await;
-        let q = format!("lifecycle_exhausted_{}", ulid::Ulid::new());
+        let q = format!("lifecycle_exhausted_{}", ulid::Ulid::generate());
         let config = Config::new(&q);
         let worker = WorkerContext::new::<()>("budget-worker");
         let storage = PostgresStorage::<String>::new_with_config(&p, &config);
         let mut stream = storage.poll_compact(&worker);
         assert!(stream.next().await.unwrap().is_ok());
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         sql(&p,format!("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at) VALUES('{id}','{q}',''::bytea,'Pending',1,1,now())")).await;
         let got = matches!(
             tokio::time::timeout(Duration::from_secs(3), stream.next()).await,
@@ -290,14 +290,14 @@ mod middleware {
     async fn direct_middleware() -> crate::MiddlewareRun {
         let p = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
         setup(&p).await.unwrap();
-        let q = format!("lifecycle_middleware_{}", ulid::Ulid::new());
+        let q = format!("lifecycle_middleware_{}", ulid::Ulid::generate());
         let config = Config::new(&q);
         let mut storage = PostgresStorage::<String>::new_with_config(&p, &config);
         storage
             .register_worker("middleware-worker".to_owned())
             .await
             .unwrap();
-        let id = apalis_diesel_postgres::PgTaskId::new(ulid::Ulid::new());
+        let id = apalis_diesel_postgres::PgTaskId::new(ulid::Ulid::generate());
         let mut task = TaskBuilder::new("work".to_owned())
             .with_task_id(id)
             .with_ctx(PgContext::new().with_queue(q.clone()))
@@ -389,7 +389,7 @@ mod races {
     }
     async fn immediate_takeover() -> bool {
         let p = pool().await;
-        let q = format!("lifecycle_fractional_timeout_{}", ulid::Ulid::new());
+        let q = format!("lifecycle_fractional_timeout_{}", ulid::Ulid::generate());
         let c = Config::new(&q)
             .set_keep_alive(Duration::from_millis(100))
             .set_reenqueue_orphaned_after(Duration::from_millis(500));
@@ -427,12 +427,12 @@ mod races {
         crate::support::with_isolated_database(|url| async move {
             let p = build_pool(url).unwrap();
             setup(&p).await.unwrap();
-            let q = format!("lifecycle_deadlock_{}", ulid::Ulid::new());
+            let q = format!("lifecycle_deadlock_{}", ulid::Ulid::generate());
             let c = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_secs(60));
             let w = WorkerContext::new::<()>("deadlock-worker");
             let mut old = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
             assert!(old.next().await.unwrap().is_ok());
-            let id = ulid::Ulid::new();
+            let id = ulid::Ulid::generate();
             sql(&p,format!("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at) VALUES('{id}','{q}',''::bytea,'Pending',0,25,now())")).await;
             let mut task = old.next().await.unwrap().unwrap().unwrap();
             task.parts.attempt = Attempt::new_with_value(1);
@@ -568,14 +568,14 @@ mod retirement {
         .await
         .unwrap();
         setup(&pool).await.unwrap();
-        let queue = format!("lifecycle_completion_{}", ulid::Ulid::new());
+        let queue = format!("lifecycle_completion_{}", ulid::Ulid::generate());
         let config = Config::new(&queue)
             .set_buffer_size(1)
             .set_keep_alive(Duration::from_millis(10))
             .set_reenqueue_orphaned_after(Duration::from_secs(1));
         let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
         let worker = WorkerContext::new::<()>("completion-worker");
-        let id = PgTaskId::new(ulid::Ulid::new());
+        let id = PgTaskId::new(ulid::Ulid::generate());
         storage
             .push_task(
                 TaskBuilder::new("effect".to_owned())
@@ -796,7 +796,7 @@ mod registered_middleware {
     async fn fallback(registration: Registration, auto_ack: bool) -> FallbackRun {
         let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
         setup(&pool).await.unwrap();
-        let queue = format!("lifecycle_fallback_{}", ulid::Ulid::new());
+        let queue = format!("lifecycle_fallback_{}", ulid::Ulid::generate());
         let config = Config::new(&queue)
             .set_ack(auto_ack)
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
@@ -822,7 +822,7 @@ mod registered_middleware {
         if matches!(registration, Registration::Retired) {
             drop(old_stream.take());
         }
-        let id = PgTaskId::new(ulid::Ulid::new());
+        let id = PgTaskId::new(ulid::Ulid::generate());
         let mut task = TaskBuilder::new("work".to_owned())
             .with_task_id(id)
             .with_ctx(PgContext::new().with_queue(queue.clone()))
@@ -1017,7 +1017,7 @@ mod unpolled_stream {
     async fn discard_unpolled_sibling(mode: Mode, decoded: bool) -> Observation {
         let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
         setup(&pool).await.unwrap();
-        let queue = format!("lifecycle_unpolled_{}", ulid::Ulid::new());
+        let queue = format!("lifecycle_unpolled_{}", ulid::Ulid::generate());
         let config = Config::new(&queue).set_keep_alive(Duration::from_millis(5));
         let worker = WorkerContext::new::<()>("active-worker");
         let Streams {
@@ -1029,7 +1029,7 @@ mod unpolled_stream {
         // Drop without first poll: no registration/claim SQL was dispatched by this stream.
         discard();
         let mut producer = PostgresStorage::<String>::new_with_config(&pool, &config);
-        let id = PgTaskId::new(ulid::Ulid::new());
+        let id = PgTaskId::new(ulid::Ulid::generate());
         let mut task = Task::new("work".to_owned());
         task.parts.task_id = Some(id);
         producer.push_task(task).await.unwrap();
@@ -1149,7 +1149,7 @@ mod dropped_stream {
     async fn dispose_after_first_item(registration: Registration) -> Observation {
         let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
         setup(&pool).await.unwrap();
-        let queue = format!("lifecycle_dropped_{}", ulid::Ulid::new());
+        let queue = format!("lifecycle_dropped_{}", ulid::Ulid::generate());
         let config = Config::new(&queue)
             .set_keep_alive(Duration::from_millis(5))
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
@@ -1284,7 +1284,7 @@ mod redispatched_claim {
     async fn failing_handler_under(retries: Retries) -> Observation {
         let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
         setup(&pool).await.unwrap();
-        let queue = format!("lifecycle_redispatch_{}", ulid::Ulid::new());
+        let queue = format!("lifecycle_redispatch_{}", ulid::Ulid::generate());
         let config = Config::new(&queue)
             .set_keep_alive(Duration::from_millis(10))
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
@@ -1292,7 +1292,7 @@ mod redispatched_claim {
             .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
         // One attempt makes the first failure terminal, so the fetcher cannot
         // legitimately claim the row a second time during the run.
-        let id = PgTaskId::new(ulid::Ulid::new());
+        let id = PgTaskId::new(ulid::Ulid::generate());
         storage
             .push_task(
                 TaskBuilder::new("work".to_owned())
@@ -1442,7 +1442,7 @@ mod redispatched_claim {
     async fn lost_claim_under_a_retry_layer() -> LostClaimObservation {
         let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
         setup(&pool).await.unwrap();
-        let queue = format!("lifecycle_lost_claim_{}", ulid::Ulid::new());
+        let queue = format!("lifecycle_lost_claim_{}", ulid::Ulid::generate());
         let config = Config::new(&queue)
             .set_keep_alive(Duration::from_millis(10))
             .set_reenqueue_orphaned_after(Duration::from_secs(60))
@@ -1451,7 +1451,7 @@ mod redispatched_claim {
             .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
         let mut ids = Vec::new();
         for label in ["first", "second"] {
-            let id = PgTaskId::new(ulid::Ulid::new());
+            let id = PgTaskId::new(ulid::Ulid::generate());
             storage
                 .push_task(TaskBuilder::new(label.to_owned()).with_task_id(id).build())
                 .await
@@ -1635,7 +1635,7 @@ mod token_free_registration {
     async fn native_registration_over(liveness: Liveness) -> Observation {
         let pool = build_pool(std::env::var("DATABASE_URL").unwrap()).unwrap();
         setup(&pool).await.unwrap();
-        let queue = format!("lifecycle_token_free_{}", ulid::Ulid::new());
+        let queue = format!("lifecycle_token_free_{}", ulid::Ulid::generate());
         let config = Config::new(&queue)
             .set_keep_alive(Duration::from_millis(10))
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
@@ -1644,7 +1644,7 @@ mod token_free_registration {
             .register_worker("shared-name".to_owned())
             .await
             .unwrap();
-        let id = PgTaskId::new(ulid::Ulid::new());
+        let id = PgTaskId::new(ulid::Ulid::generate());
         admin
             .push_task(
                 TaskBuilder::new("work".to_owned())
