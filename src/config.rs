@@ -11,10 +11,11 @@ type StrategyFactory = Arc<dyn Fn() -> BoxedPollStrategy + Send + Sync>;
 /// Configuration of a [`PostgresStorage`](crate::PostgresStorage) queue.
 ///
 /// Until apalis 1.0 this type came from `apalis-sql`, which apalis 1.0 no
-/// longer ships; it keeps the same builder methods. The one change is the poll
-/// strategy: a config now holds a *factory*, so every fetcher built from it, or
-/// from any clone of it, gets an independent strategy instead of sharing one
-/// single-use strategy.
+/// longer ships; it keeps the same builder methods except for the poll
+/// strategy: [`Config::with_poll_strategy`] replaces `with_poll_interval` and
+/// takes a *factory*, so every fetcher built from the config, or from any clone
+/// of it, gets an independent strategy instead of sharing one single-use
+/// strategy.
 #[derive(Clone)]
 pub struct Config {
     keep_alive: Duration,

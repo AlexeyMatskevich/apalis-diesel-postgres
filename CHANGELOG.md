@@ -7,6 +7,45 @@ the crate is pre-1.0, a minor version bump may carry breaking changes.
 
 ## [Unreleased]
 
+Runs on apalis 1.0.0. No schema change; see the
+[upgrade notes](docs/upgrading.md#upgrading-from-060-to-apalis-10).
+
+### Changed
+
+- **Breaking:** depends on `apalis-core` and `apalis-codec` 1.0.0 and no longer
+  on `apalis-sql`. `Config` is now this crate's own type, with the same
+  builder methods.
+- **Breaking:** the MSRV is Rust 1.89, required by the `ulid` 3 / `uuid`
+  versions apalis-core 1.0 uses.
+- **Breaking:** `PgContext` and the `TaskRow` re-export are removed;
+  `PgTask<Args>` is `Task<Args>` and `PgTaskId` is `TaskId`. Task options are
+  set through `TaskBuilder`.
+- **Breaking:** task metadata is apalis 1.0's string store. A JSONB string
+  value reads as-is and any other value as its JSON text; values are written
+  as JSON strings.
+- **Breaking:** `Config::with_poll_interval` is replaced by
+  `Config::with_poll_strategy`, which takes a factory, so every worker built
+  from a config, or a clone of it, gets its own strategy.
+- **Breaking:** `MakeShared` is gone from apalis;
+  `SharedPostgresStorage::make_shared` and `make_shared_with_config` are
+  ordinary methods. `PostgresStorage::get_queue` is an inherent method.
+- **Breaking:** the admin traits take apalis 1.0's signatures: listings and
+  `fetch_by_id` return the encoded payload, and `WaitForCompletion` takes
+  `&mut self`. `vacuum_before` is implemented.
+- A claim refused before the handler marks the dispatch `Killed` rather than
+  advancing the attempt counter, which apalis 1.0 reserves for its lifecycle
+  layer. apalis's `RetryPolicy` stops on `Killed`, so a retry layer outside
+  the middleware no longer re-dispatches a refusal.
+- A row's negative `max_attempts` still reads as zero and a NULL `priority`
+  as no priority, as with `apalis-sql`.
+
+### Fixed
+
+- Notification payload ids are parsed as ULIDs. Read as apalis 1.0's untagged
+  `TaskId`, they became `TaskId::String` and never matched a fetched task.
+- A retry layer around the backend middleware no longer re-dispatches a
+  refused claim forever.
+
 ## [0.6.0]
 
 ### Added

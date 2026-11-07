@@ -17,13 +17,16 @@ table.
 The crate accepts any `diesel::r2d2::Pool<ConnectionManager<PgConnection>>` —
 you keep using the pool you already wire up — and ships everything else apalis
 needs: migrations, polling/notify-driven dequeue, locking, ack, retries,
-orphan re-enqueue, admin queries, and `MakeShared` for many-queue setups.
+orphan re-enqueue, admin queries, and a shared listener for many-queue setups.
 
 ## Status
 
-Targets the Apalis 1.0 release candidate: `apalis-core 1.0.0-rc.9`,
-`apalis-sql 1.0.0-rc.9`, `apalis-codec 0.1.0-rc.9`, `diesel >=2.3.13`.
-Uses the Apalis SQL tables (`apalis.jobs`, `apalis.workers`). The
+Targets Apalis 1.0: `apalis-core 1.0.0`, `apalis-codec 1.0.0`,
+`diesel >=2.3.13`. Uses the Apalis SQL tables (`apalis.jobs`,
+`apalis.workers`). Moving from the 1.0 release candidate is an API change
+only, with no schema migration; the
+[apalis 1.0 upgrade notes](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/master/docs/upgrading.md#upgrading-from-060-to-apalis-10)
+list what changed. The
 [0.5.0 to 0.6.0 upgrade guide](https://github.com/AlexeyMatskevich/apalis-diesel-postgres/blob/v0.6.0/docs/upgrading.md#upgrading-from-050-to-060)
 covers the schema migration, configuration validation and task state changes; the
 same guide keeps the 0.4.1 to 0.5.0 path.
@@ -329,7 +332,8 @@ custom `metadata`, or a pre-allocated `task_id`, build a [`PgTask<Args>`]
 and call `push_task_with_conn`:
 
 ```rust,no_run
-# use apalis_diesel_postgres::{PgTask, PgTaskId, PostgresStorage};
+# use apalis_core::task::builder::TaskBuilder;
+# use apalis_diesel_postgres::{PgTaskId, PostgresStorage};
 # use diesel::PgConnection;
 # use std::time::{SystemTime, UNIX_EPOCH};
 # #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -339,13 +343,15 @@ and call `push_task_with_conn`:
 #     storage: &PostgresStorage<Reminder>,
 #     order_id: i64,
 # ) -> Result<PgTaskId, apalis_diesel_postgres::Error> {
-let mut task = PgTask::<Reminder>::new(Reminder { order_id });
-task.parts.idempotency_key = Some(format!("reminder:{order_id}"));
-task.parts.run_at = SystemTime::now()
+let tomorrow = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .unwrap_or_default() // now() predates UNIX_EPOCH only on a broken clock
     .as_secs()
-    + 24 * 3600; // tomorrow
+    + 24 * 3600;
+let task = TaskBuilder::new(Reminder { order_id })
+    .idempotency_key(format!("reminder:{order_id}"))
+    .run_at_timestamp(tomorrow)
+    .build();
 
 storage.push_task_with_conn(conn, task)
 # }
@@ -431,11 +437,10 @@ fn build(pool: PgPool) {
     let _polling = PostgresStorage::<EmailJob>::new_with_config(&pool, &config);
 
     // Polling + LISTEN/NOTIFY wakeups (lower latency, dedicated connection).
-    // A `Config` carries a single-use polling strategy, so each worker's
-    // storage gets its own `Config` (or a poll strategy factory, see below).
+    // Each worker stream builds its own polling strategy from the `Config`.
     let _notify = PostgresStorage::<EmailJob>::new_with_notify(&pool, &Config::new("emails"));
 
-    // One listener shared across many queues, registered via apalis `MakeShared`.
+    // One listener shared across many queues; `make_shared` registers each queue.
     let _shared: SharedPostgresStorage = SharedPostgresStorage::new(&pool);
 }
 ```
@@ -448,27 +453,27 @@ subscribers. Size the apalis pool for these connections.
 
 ## Polling strategies and worker recovery
 
-`PostgresStorage::new(pool)` recreates the default polling strategy for every
-consumer. The upstream `Config` stores one-shot strategy streams: cloning an
-arbitrary config does not clone those streams. When reusing custom configuration
-across workers, supply a factory so each consumer gets its own strategy:
+A `Config` holds a polling strategy *factory*: every consumer built from it, or
+from a clone of it, gets its own strategy. The default is a 100 ms interval with
+backoff. Set another with `Config::with_poll_strategy`, or override it for one
+storage with `with_poll_strategy_factory`:
 
 ```rust
 use std::time::Duration;
-use apalis_core::backend::poll_strategy::IntervalStrategy;
+use apalis_core::backend::ext::poll_strategy::IntervalStrategy;
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 
 fn storage(pool: &PgPool) -> PostgresStorage<String> {
-    PostgresStorage::new_with_config(pool, &Config::new("emails"))
-        .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(100)))
+    let config = Config::new("emails")
+        .with_poll_strategy(|| IntervalStrategy::new(Duration::from_millis(100)));
+    PostgresStorage::new_with_config(pool, &config)
 }
 ```
 
 This also applies to notification and shared storage built from a `Config`.
 An exhausted strategy produces `PollStrategyExhausted` and ends its polling
 branch. It cannot authorize further polling. A finite custom strategy must
-explicitly define how polling continues; creating fresh configuration or using
-the factory is the upgrade path for previously shared one-shot strategies.
+explicitly define how polling continues.
 
 A claimed row whose payload fails to decode is released through the retry
 budget before the batch continues; a release that keeps failing after a few
@@ -479,9 +484,10 @@ already acknowledged claim, for example by a retry layer placed outside the
 backend middleware, is refused with `AlreadyAcknowledged` before the handler
 runs again; the persisted retry budget schedules the next attempt, and the
 worker registration stays active. Every refusal before the handler, such as a
-lost claim or a retired worker, counts as a dispatch on the task's attempt
-counter, so a retry layer outside the middleware stops after its budget
-instead of retrying the refusal.
+lost claim or a retired worker, marks that dispatch `Killed`, so apalis's
+`RetryPolicy` in a retry layer outside the middleware stops instead of
+retrying the refusal. The attempt counter does not move: apalis 1.0 advances
+it only when the handler runs.
 If automatic acknowledgement loses its result through a database or
 serialization error, the affected worker registration is retired locally.
 A claim whose transaction produced tasks but whose commit cannot be confirmed
@@ -704,17 +710,16 @@ worker logs point at the failed lifecycle step:
 
 ```rust
 use apalis_diesel_postgres::{
-    CompactType, Config, JsonCodec, MIGRATIONS, PgContext, PgPool, PgTask,
-    PgTaskId, PostgresStorage, SharedPostgresStorage, TaskRow, build_pool, setup,
+    CompactType, Config, JsonCodec, MIGRATIONS, PgPool, PgTask, PgTaskId,
+    PostgresStorage, SharedPostgresStorage, build_pool, setup,
 };
 ```
 
 Type aliases:
 
 - `PgPool = Pool<ConnectionManager<PgConnection>>`
-- `PgContext = SqlContext<PgPool>`
-- `PgTask<Args> = Task<Args, PgContext, Ulid>`
-- `PgTaskId = TaskId<Ulid>`
+- `PgTask<Args> = Task<Args>`
+- `PgTaskId = TaskId` (always a `TaskId::Ulid`)
 - `CompactType = Vec<u8>`
 
 ## Local development

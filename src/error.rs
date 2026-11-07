@@ -193,7 +193,7 @@ pub enum Error {
     #[error("sink buffer is full; call poll_ready before start_send (capacity: {0})")]
     SinkBufferFull(usize),
 
-    /// A custom polling strategy ended or its single-use Config was reused.
+    /// A custom polling strategy ended.
     #[error(
         "polling strategy for queue `{queue}` ended; use with_poll_strategy_factory for independent workers or provide a fresh Config; no automatic polling is started"
     )]

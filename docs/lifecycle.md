@@ -140,8 +140,8 @@ row to still carry exactly that epoch:
   the handler runs: the claim was recovered, released, taken over, or
   started by the other claim of its epoch. The worker keeps running because
   it owes nothing for that claim. Like every refusal before the handler, it
-  counts as a dispatch on the task's attempt counter, so a retry layer
-  outside the middleware stops after its budget. A start through the storage's middleware or acknowledger
+  marks the dispatch `Killed`, so apalis's `RetryPolicy` in a retry layer
+  outside the middleware stops instead of retrying it. A start through the storage's middleware or acknowledger
   also requires the storage's token to own the registration, and a locally
   retired name starts nothing.
 - An acknowledgement whose epoch no longer matches reports
