@@ -253,7 +253,7 @@ mod tests {
             identity: Identity,
         ) -> Result<(usize, usize), Error> {
             let mut parts = parts_for_ack(completed, 3);
-            parts.task_id = Some(PgTaskId::new(Ulid::from(0u128)));
+            parts.task_id = Some(PgTaskId::from_ulid(Ulid::from(0u128)));
             parts.ctx = parts
                 .ctx
                 .with_queue("claim-queue".to_owned())
@@ -278,7 +278,7 @@ mod tests {
                 }
                 Identity::MissingTimestamp => parts.ctx = parts.ctx.with_lock_at(None),
                 Identity::DifferentId => {
-                    parts.task_id = Some(PgTaskId::new(Ulid::from(1u128)));
+                    parts.task_id = Some(PgTaskId::from_ulid(Ulid::from(1u128)));
                 }
                 Identity::DifferentTimestamp => {
                     parts.ctx = parts.ctx.with_lock_at(Some(1_700_000_001));
@@ -415,13 +415,13 @@ mod tests {
     }
 
     fn task_id() -> TaskId<Ulid> {
-        TaskId::new(Ulid::generate())
+        PgTaskId::from_ulid(Ulid::generate())
     }
 
     fn parts_for_ack(attempts: usize, max_attempts: i32) -> Parts<PgContext, Ulid> {
         TaskBuilder::new(())
-            .with_task_id(task_id())
-            .with_attempt(Attempt::new_with_value(attempts))
+            .task_id(task_id())
+            .attempt(attempts)
             .with_ctx(PgContext::new().with_max_attempts(max_attempts))
             .build()
             .parts
@@ -509,12 +509,10 @@ mod tests {
             .with_ctx(PgContext::new().with_queue("lock-service-unit".to_owned()))
             .build();
         if has_worker {
-            task.parts
-                .data
-                .insert(WorkerContext::new::<()>("lock-service-worker"));
+            task.inject_data(WorkerContext::new("lock-service-worker"));
         }
         if has_task_id {
-            task.parts.task_id = Some(task_id());
+            task.edit(|t| t.task_id(task_id()));
         }
 
         let mut service = LockTaskService {
@@ -1006,8 +1004,8 @@ mod tests {
 
         async fn ack_with_unserializable_result() -> Result<(), crate::Error> {
             let mut parts: Parts<PgContext, Ulid> = TaskBuilder::new(())
-                .with_task_id(task_id())
-                .with_attempt(Attempt::new_with_value(1))
+                .task_id(task_id())
+                .attempt(1)
                 .with_ctx(
                     PgContext::new()
                         .with_max_attempts(3)
@@ -1040,7 +1038,7 @@ mod tests {
         /// pool that cannot connect.
         async fn lock_service_call_preclaimed() -> Result<(), BoxDynError> {
             let mut task = TaskBuilder::new(())
-                .with_task_id(task_id())
+                .task_id(task_id())
                 .with_ctx(
                     PgContext::new()
                         .with_queue("lock-service-unit".to_owned())
@@ -1048,9 +1046,7 @@ mod tests {
                         .with_lock_at(Some(1_700_000_000)),
                 )
                 .build();
-            task.parts
-                .data
-                .insert(WorkerContext::new::<()>("lock-service-worker"));
+            task.inject_data(WorkerContext::new("lock-service-worker"));
 
             let mut service = LockTaskService {
                 inner: ReadyService {
@@ -1129,17 +1125,16 @@ mod tests {
                     .with_lock_at(Some(1_700_000_000));
             }
             let mut task = TaskBuilder::new(())
-                .with_task_id(task_id())
+                .task_id(task_id())
                 .with_ctx(context)
                 .build();
             if !has_id {
                 // Model identity lost after claim as well as malformed input
                 // before claim; only the former has a completion obligation.
-                task.parts.task_id = None;
+                // apalis 1.0 has no setter that clears a task id; `map_id_type` does.
+                task = task.map_id_type();
             }
-            task.parts
-                .data
-                .insert(WorkerContext::new::<()>("validation-owner"));
+            task.inject_data(WorkerContext::new("validation-owner"));
             let mut service = LockTaskService {
                 inner: RecordingHandler(handler_calls.clone()),
                 pool: unreachable_pool(),
@@ -1208,7 +1203,7 @@ mod tests {
             let owner = registry.for_worker("redispatch-owner");
             let handler_calls = Arc::new(AtomicUsize::new(0));
             let mut task = TaskBuilder::new(())
-                .with_task_id(task_id())
+                .task_id(task_id())
                 .with_ctx(
                     PgContext::new()
                         .with_queue("redispatch-queue".to_owned())
@@ -1216,9 +1211,7 @@ mod tests {
                         .with_lock_at(Some(1_700_000_000)),
                 )
                 .build();
-            task.parts
-                .data
-                .insert(WorkerContext::new::<()>("redispatch-owner"));
+            task.inject_data(WorkerContext::new("redispatch-owner"));
             record_claim(&mut task.parts);
             let claim = task
                 .parts
@@ -1253,7 +1246,7 @@ mod tests {
             RedispatchObservation {
                 result,
                 handler_calls: handler_calls.load(Ordering::SeqCst),
-                attempt: task.parts.attempt.current(),
+                attempt: task.attempt(),
                 owner_retired: owner.is_retired(),
             }
         }
@@ -1487,7 +1480,7 @@ mod tests {
                 self.0
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(req.parts.status.load());
+                    .push(req.status());
                 ready(Ok(()))
             }
         }
@@ -1609,8 +1602,8 @@ mod tests {
             history: ClaimHistory,
         ) -> PgTask<()> {
             let mut task = TaskBuilder::new(())
-                .with_task_id(TaskId::new(id))
-                .with_attempt(Attempt::new_with_value(1))
+                .task_id(PgTaskId::from_ulid(id))
+                .attempt(1)
                 .with_ctx(
                     PgContext::new()
                         .with_queue(queue.to_owned())
@@ -1618,10 +1611,10 @@ mod tests {
                         .with_lock_at(Some(lock_at)),
                 )
                 .build();
-            task.parts.data.insert(WorkerContext::new::<()>(worker));
+            task.inject_data(WorkerContext::new(worker));
             task.parts.status.store(Status::Queued);
             if matches!(history, ClaimHistory::UnrecordedCounterAhead) {
-                task.parts.attempt = Attempt::new_with_value(2);
+                task.edit(|t| t.attempt(2));
             }
             if !matches!(
                 history,
@@ -1791,7 +1784,7 @@ mod tests {
                     leases: Some(registry.clone()),
                 };
                 let task = claimed_task(id, &queue, &worker, lock_at, history);
-                let outcome = match acknowledger.start(&task.parts).await {
+                let outcome = match acknowledger.start(&task).await {
                     Ok(()) => "started".to_owned(),
                     Err(crate::Error::ClaimLost { .. }) => "claim_lost".to_owned(),
                     Err(crate::Error::WorkerRetired { .. }) => "retired".to_owned(),
@@ -1802,7 +1795,7 @@ mod tests {
                 };
                 Ok::<_, String>(AcknowledgerStartObservation {
                     outcome,
-                    status: task.parts.status.load(),
+                    status: task.status(),
                     row_status: row_status(pool.clone(), id).await?,
                     owner_retired: owner.is_retired(),
                 })
@@ -1857,7 +1850,7 @@ mod tests {
                 context = context.with_lock_by(Some("unreachable-owner".to_owned()));
             }
             let mut task = TaskBuilder::new(())
-                .with_task_id(task_id())
+                .task_id(task_id())
                 .with_ctx(context)
                 .build();
             record_claim(&mut task.parts);
@@ -1866,7 +1859,7 @@ mod tests {
                 lease_token: Some(Arc::from("unreachable-token")),
                 leases: Some(registry.clone()),
             };
-            let result = acknowledger.start(&task.parts).await;
+            let result = acknowledger.start(&task).await;
             AcknowledgerStartFailure {
                 result,
                 owner_retired: owner.is_retired(),
@@ -1886,9 +1879,9 @@ mod tests {
         /// polled. Returns the worker's task count while the dispatch exists
         /// and after it is dropped.
         fn dispatch_tracking() -> (usize, usize) {
-            let worker = WorkerContext::new::<()>("tracked-worker");
+            let worker = WorkerContext::new("tracked-worker");
             let mut task = TaskBuilder::new(())
-                .with_task_id(task_id())
+                .task_id(task_id())
                 .with_ctx(
                     PgContext::new()
                         .with_queue("tracked-queue".to_owned())
@@ -1896,7 +1889,7 @@ mod tests {
                         .with_lock_at(Some(1_700_000_000)),
                 )
                 .build();
-            task.parts.data.insert(worker.clone());
+            task.inject_data(worker.clone());
             record_claim(&mut task.parts);
             let mut service = LockTaskService {
                 inner: RecordingHandler(Arc::new(AtomicUsize::new(0))),
@@ -3328,11 +3321,14 @@ where
         let clone = self.inner.clone();
         let mut ready_inner = std::mem::replace(&mut self.inner, clone);
 
-        // apalis 1.0 installs this middleware outside the user's layers, so a
-        // retry layer re-runs the handler inside one dispatch and can no
-        // longer re-dispatch a refusal from here; refusals are not counted on
-        // the task's attempt counter, which apalis no longer lets a backend
-        // increment.
+        // A refusal before the handler marks this dispatch `Killed`, so a
+        // retry layer wrapped around this middleware stops instead of
+        // re-dispatching the refusal forever. Before apalis 1.0 the refusal
+        // was counted on the task's attempt counter, which a backend can no
+        // longer increment; apalis's `RetryPolicy` stops on `Killed` as well.
+        // (`WorkerBuilder::retry` installs its layer inside this middleware,
+        // where refusals never reach it.)
+        let status = req.raw_status().clone();
         let dispatch = async move {
             let admitted: Result<PgTask<Args>, BoxDynError> = async {
                 let worker_id = worker_id
@@ -3419,7 +3415,13 @@ where
                 Ok(req)
             }
             .await;
-            let req = admitted?;
+            let req = match admitted {
+                Ok(req) => req,
+                Err(refusal) => {
+                    status.store(Status::Killed);
+                    return Err(refusal);
+                }
+            };
             let result = ready_inner.call(req).await.map_err(Into::into);
             // A completed handler error is a valid acknowledged outcome. PgAck
             // retires on acknowledgement failure; this guard covers cancellation.

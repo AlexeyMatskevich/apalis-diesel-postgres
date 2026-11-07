@@ -561,7 +561,7 @@ mod tests {
                 if matches!(shape, Hints::Errors) || index == error_position {
                     Err(Error::InvalidArgument(format!("notification {index}")))
                 } else {
-                    Ok(crate::PgTaskId::new(Ulid::generate()))
+                    Ok(crate::PgTaskId::from_ulid(Ulid::generate()))
                 }
             })
             .collect::<Vec<_>>();

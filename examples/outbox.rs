@@ -209,7 +209,7 @@ async fn scenario_idempotency_conflict(
                 order_id: order_id_for_seed,
                 to: "carol@example.com".to_owned(),
             });
-            task.parts.idempotency_key = Some(idempotency_key);
+            task.idempotency_key() = Some(idempotency_key);
             conn.transaction(|c| storage.push_task_with_conn(c, task).map(|_| ()))
         })
         .await??;
@@ -233,7 +233,7 @@ async fn scenario_idempotency_conflict(
                     order_id: order_id.clone(),
                     to: "carol@example.com".to_owned(),
                 });
-                task.parts.idempotency_key = Some(idempotency_key);
+                task.idempotency_key() = Some(idempotency_key);
                 match storage.push_task_with_conn(c, task) {
                     Ok(_) => Ok("no conflict observed"),
                     Err(PgError::IdempotencyConflict { .. }) => {

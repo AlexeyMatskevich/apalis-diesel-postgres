@@ -95,7 +95,7 @@ async fn decode_cleanup(
         .map_err(|error| error.to_string())?;
     let name = format!("decode-obligation-{}", ulid::Ulid::generate());
     let config = Config::new(&name);
-    let worker = WorkerContext::new::<()>(&name);
+    let worker = WorkerContext::new(&name);
     let token: Arc<str> = format!("token-{name}").into();
     queries::initial_heartbeat(
         pool.clone(),
@@ -106,13 +106,13 @@ async fn decode_cleanup(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let bad_id = PgTaskId::new(ulid::Ulid::generate());
-    let expected_sibling_id = PgTaskId::new(ulid::Ulid::generate());
+    let bad_id = PgTaskId::from_ulid(ulid::Ulid::generate());
+    let expected_sibling_id = PgTaskId::from_ulid(ulid::Ulid::generate());
     let mut invalid = PgTask::new(b"{bad-json".to_vec());
-    invalid.parts.task_id = Some(bad_id);
+    invalid.edit(|t| t.task_id(bad_id.clone()));
     invalid.parts.ctx = crate::PgContext::new().with_max_attempts(max_attempts);
     let mut sibling = PgTask::new(serde_json::to_vec("healthy-sibling").unwrap());
-    sibling.parts.task_id = Some(expected_sibling_id);
+    sibling.edit(|t| t.task_id(expected_sibling_id.clone()));
     queries::flush_tasks(pool.clone(), config.clone(), vec![invalid, sibling])
         .await
         .map_err(|failure| failure.into_error().to_string())?;
@@ -251,11 +251,11 @@ fn recovered(
         };
         let sibling_delivered = outcome.sibling.as_ref().is_some_and(|sibling| {
             sibling.args == "healthy-sibling"
-                && sibling.parts.task_id == Some(outcome.expected_sibling_id)
-                && sibling.parts.status.load() == Status::Queued
-                && sibling.parts.ctx.lock_by().as_deref() == Some(outcome.expected_worker.as_str())
-                && sibling.parts.ctx.lock_at().is_some()
-                && sibling.parts.attempt.current() == 0
+                && sibling.task_id().cloned() == Some(outcome.expected_sibling_id)
+                && sibling.status() == Status::Queued
+                && sibling.lock_by().as_deref() == Some(outcome.expected_worker.as_str())
+                && sibling.lock_at().is_some()
+                && sibling.attempt() == 0
         });
         if outcome.errors == ["decode", "task"]
             && outcome.corrupt_state.status == expected_status

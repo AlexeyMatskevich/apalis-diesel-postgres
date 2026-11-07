@@ -6,9 +6,7 @@ mod support;
 mod commit_proxy;
 
 use apalis_core::{backend::FetchById, task::builder::TaskBuilder};
-use apalis_diesel_postgres::{
-    Config, Error, PgContext, PgPool, PgTaskId, PostgresStorage, build_pool_with,
-};
+use apalis_diesel_postgres::{Config, Error, PgPool, PgTaskId, PostgresStorage, build_pool_with};
 use diesel::{
     RunQueryDsl, sql_query,
     sql_types::{Bool, Integer, Text},
@@ -82,13 +80,13 @@ async fn failed_batch(
     let queue = format!("sink-failure-{}", ulid::Ulid::generate());
     let config = Config::new(&queue).set_buffer_size(3);
     let mut storage = Storage::new_with_config(&pool, &config);
-    let first_id = PgTaskId::new(ulid::Ulid::generate());
-    let second_id = PgTaskId::new(ulid::Ulid::generate());
+    let first_id = PgTaskId::from_ulid(ulid::Ulid::generate());
+    let second_id = PgTaskId::from_ulid(ulid::Ulid::generate());
     let task = |id| {
         TaskBuilder::new(b"{}".to_vec())
-            .with_task_id(id)
-            .with_idempotency_key("same-key")
-            .with_ctx(PgContext::new().with_queue(queue.clone()))
+            .task_id(id)
+            .idempotency_key("same-key")
+            .queue(queue.clone().into())
             .build()
     };
     storage
@@ -165,12 +163,12 @@ async fn completion_boundary(
     let queue = format!("sink-boundary-{}", ulid::Ulid::generate());
     let config = Config::new(&queue);
     let mut storage = Storage::new_with_config(&pool, &config);
-    let id = PgTaskId::new(ulid::Ulid::generate());
+    let id = PgTaskId::from_ulid(ulid::Ulid::generate());
     // A keyed batch takes an explicit transaction, whose COMMIT the proxy observes.
     let task = TaskBuilder::new(b"{}".to_vec())
-        .with_task_id(id)
-        .with_idempotency_key("boundary")
-        .with_ctx(PgContext::new().with_queue(queue))
+        .task_id(id)
+        .idempotency_key("boundary")
+        .queue(queue.into())
         .build();
     storage.feed(task).await.map_err(|e| e.to_string())?;
     let first_observed;
@@ -193,9 +191,7 @@ async fn completion_boundary(
         .fetch_by_id(&id)
         .await
         .map_err(|e| e.to_string())?
-        .is_some_and(|task| {
-            task.parts.attempt.current() == 0 && task.parts.status.load().to_string() == "Pending"
-        });
+        .is_some_and(|task| task.attempt() == 0 && task.status().to_string() == "Pending");
     sql_query("DELETE FROM apalis.jobs WHERE id=$1")
         .bind::<Text, _>(id.to_string())
         .execute(&mut direct.get().map_err(|e| e.to_string())?)
@@ -256,12 +252,12 @@ async fn interleaved_submission() -> Result<support::Outcome<InterleavingObserva
         build_pool_with(url, |b| b.max_size(1).min_idle(Some(0))).map_err(|e| e.to_string())?;
     let queue = format!("sink-interleaving-{}", ulid::Ulid::generate());
     let config = Config::new(&queue).set_buffer_size(2);
-    let a = PgTaskId::new(ulid::Ulid::generate());
-    let b = PgTaskId::new(ulid::Ulid::generate());
+    let a = PgTaskId::from_ulid(ulid::Ulid::generate());
+    let b = PgTaskId::from_ulid(ulid::Ulid::generate());
     let task = |id| {
         TaskBuilder::new(b"{}".to_vec())
-            .with_task_id(id)
-            .with_ctx(PgContext::new().with_queue(queue.clone()))
+            .task_id(id)
+            .queue(queue.clone().into())
             .build()
     };
     let mut storage = Storage::new_with_config(&pool, &config);

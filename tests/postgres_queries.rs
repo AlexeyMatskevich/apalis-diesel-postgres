@@ -22,8 +22,7 @@ use apalis_core::{
     worker::{context::WorkerContext, ext::ack::Acknowledge},
 };
 use apalis_diesel_postgres::{
-    Config, PgAck, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage, lock_task,
-    lock_task_in_queue,
+    Config, PgAck, PgPool, PgTask, PgTaskId, PostgresStorage, lock_task, lock_task_in_queue,
 };
 use apalis_sql::{DateTime, DateTimeExt, context::SqlContext};
 use diesel::{
@@ -303,14 +302,14 @@ fn task(
     attempts: usize,
     max_attempts: i32,
     idempotency_key: Option<&'static str>,
-) -> Task<String, PgContext, Ulid> {
+) -> Task<String, Ulid> {
     let mut builder = TaskBuilder::new(payload.to_owned())
-        .with_task_id(task_id())
+        .task_id(task_id())
         .run_at_timestamp(run_at)
-        .with_attempt(Attempt::new_with_value(attempts))
+        .attempt(attempts)
         .with_ctx(SqlContext::new().with_max_attempts(max_attempts));
     if let Some(key) = idempotency_key {
-        builder = builder.with_idempotency_key(key);
+        builder = builder.idempotency_key(key);
     }
     builder.build()
 }
@@ -339,15 +338,15 @@ async fn run_push_fetch() -> Result<Outcome<PushFetchRun>, String> {
     let newer = task("newer", now - 30, 0, 25, None);
     let later = task("later", now + 3600, 0, 25, None);
     let later_id = later
-        .parts
-        .task_id
+        .task_id()
+        .cloned()
         .ok_or_else(|| "later task had no id".to_owned())?;
 
     storage.push_task(oldest).await.map_err(|e| e.to_string())?;
     storage.push_task(newer).await.map_err(|e| e.to_string())?;
     storage.push_task(later).await.map_err(|e| e.to_string())?;
 
-    let worker = WorkerContext::new::<()>("query-push-fetch-worker");
+    let worker = WorkerContext::new("query-push-fetch-worker");
     let mut stream = storage.clone().poll(&worker);
     let first = next_task(&mut stream).await?;
     let second = next_task(&mut stream).await?;
@@ -363,7 +362,7 @@ async fn run_push_fetch() -> Result<Outcome<PushFetchRun>, String> {
         second_args: second.args,
         delayed_pending: fetched_later
             .as_ref()
-            .is_some_and(|t| t.parts.status.load() == Status::Pending),
+            .is_some_and(|t| t.status() == Status::Pending),
         delayed_args: fetched_later.map(|t| t.args),
     }))
 }
@@ -435,8 +434,8 @@ async fn run_fetch_by_id_cross_queue() -> Result<Outcome<CrossQueueRun>, String>
     let mut source = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&source_queue));
     let task = task("cross-queue", now_unix() - 1, 0, 25, None);
     let task_id = task
-        .parts
-        .task_id
+        .task_id()
+        .cloned()
         .ok_or_else(|| "cross-queue task had no id".to_owned())?;
     source.push_task(task).await.map_err(|e| e.to_string())?;
 
@@ -641,8 +640,8 @@ async fn run_ack_boundary_with_error(
     )
     .await?;
     let parts = TaskBuilder::new(())
-        .with_task_id(id)
-        .with_attempt(Attempt::new_with_value(attempts))
+        .task_id(id)
+        .attempt(attempts)
         .with_ctx(
             PgContext::new()
                 .with_max_attempts(2)
@@ -782,8 +781,8 @@ async fn run_ack_stale() -> Result<Outcome<AckStaleRun>, String> {
     )
     .await?;
     let parts = TaskBuilder::new(())
-        .with_task_id(id)
-        .with_attempt(Attempt::new_with_value(1))
+        .task_id(id)
+        .attempt(1)
         .with_ctx(
             PgContext::new()
                 .with_max_attempts(2)
@@ -885,8 +884,8 @@ async fn run_lock_boundary(lockable: bool) -> Result<Outcome<LockBoundaryRun>, S
     };
     let task = task("lock-boundary", run_at, 0, 25, None);
     let id = task
-        .parts
-        .task_id
+        .task_id()
+        .cloned()
         .ok_or_else(|| "constructed task had no id".to_owned())?;
     storage.push_task(task).await.map_err(|e| e.to_string())?;
 
@@ -952,16 +951,16 @@ async fn run_priority_ordering() -> Result<Outcome<PriorityOrderRun>, String> {
     let now = now_unix();
     let low = task("low", now - 90, 0, 25, None);
     let mut high_builder = TaskBuilder::new("high".to_owned())
-        .with_task_id(task_id())
+        .task_id(task_id())
         .run_at_timestamp(now - 30)
-        .with_attempt(Attempt::new_with_value(0))
+        .attempt(0)
         .with_ctx(SqlContext::new().with_max_attempts(25).with_priority(9));
     let _ = &mut high_builder;
     let high = high_builder.build();
     let mid = TaskBuilder::new("mid".to_owned())
-        .with_task_id(task_id())
+        .task_id(task_id())
         .run_at_timestamp(now - 60)
-        .with_attempt(Attempt::new_with_value(0))
+        .attempt(0)
         .with_ctx(SqlContext::new().with_max_attempts(25).with_priority(5))
         .build();
 
@@ -969,7 +968,7 @@ async fn run_priority_ordering() -> Result<Outcome<PriorityOrderRun>, String> {
     storage.push_task(high).await.map_err(|e| e.to_string())?;
     storage.push_task(mid).await.map_err(|e| e.to_string())?;
 
-    let worker = WorkerContext::new::<()>(&format!("priority-worker-{queue}"));
+    let worker = WorkerContext::new(&format!("priority-worker-{queue}"));
     let mut stream = storage.clone().poll(&worker);
     let first = next_task(&mut stream).await?;
     let second = next_task(&mut stream).await?;
@@ -1025,8 +1024,8 @@ async fn run_skip_locked_concurrency() -> Result<Outcome<SkipLockedRun>, String>
         .with_poll_strategy_factory(|| Config::default().poll_strategy().clone());
     let storage_b = PostgresStorage::<String>::new_with_config(&pool, &config)
         .with_poll_strategy_factory(|| Config::default().poll_strategy().clone());
-    let worker_a = WorkerContext::new::<()>(&format!("skip-locked-a-{queue}"));
-    let worker_b = WorkerContext::new::<()>(&format!("skip-locked-b-{queue}"));
+    let worker_a = WorkerContext::new(&format!("skip-locked-a-{queue}"));
+    let worker_b = WorkerContext::new(&format!("skip-locked-b-{queue}"));
 
     let mut stream_a = storage_a.poll(&worker_a);
     let mut stream_b = storage_b.poll(&worker_b);
@@ -1497,8 +1496,8 @@ async fn run_listing_metrics() -> Result<Outcome<ListingMetricsRun>, String> {
             all_tasks_includes_both_queues: all
                 .iter()
                 .filter(|t| {
-                    t.parts.ctx.queue().as_deref() == Some(queue.as_str())
-                        || t.parts.ctx.queue().as_deref() == Some(other_queue.as_str())
+                    t.queue().as_deref() == Some(queue.as_str())
+                        || t.queue().as_deref() == Some(other_queue.as_str())
                 })
                 .count()
                 >= 2,
@@ -2187,7 +2186,7 @@ async fn run_zero_buffer_fetch() -> Result<Outcome<ZeroBufferRun>, String> {
 
     let storage =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(0));
-    let worker = WorkerContext::new::<()>(&format!("query-zero-buffer-worker-{queue}"));
+    let worker = WorkerContext::new(&format!("query-zero-buffer-worker-{queue}"));
     let mut stream = storage.poll(&worker);
     let task = next_task(&mut stream).await?;
     cleanup_queue(pool, queue).await?;
@@ -2250,7 +2249,7 @@ async fn run_orphan_reenqueue(queued: bool, terminal: bool) -> Result<Outcome<Or
     .await?;
     mark_worker_stale(pool.clone(), queue.clone(), stale_worker).await?;
 
-    let new_worker = WorkerContext::new::<()>(&format!("query-orphan-new-worker-{queue}"));
+    let new_worker = WorkerContext::new(&format!("query-orphan-new-worker-{queue}"));
     let mut stream = storage.clone().poll(&new_worker);
     tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
@@ -2331,7 +2330,7 @@ async fn poll_decode(notify: bool) -> Result<Outcome<PollDecodeRun>, String> {
     cleanup_queue(pool.clone(), queue.clone()).await?;
     insert_pending_task(pool.clone(), queue.clone(), b"not-json".to_vec()).await?;
 
-    let worker = WorkerContext::new::<()>(&format!("query-decode-worker-{queue}"));
+    let worker = WorkerContext::new(&format!("query-decode-worker-{queue}"));
     let error = if notify {
         let storage = PostgresStorage::<String>::new_with_notify(&pool, &Config::new(&queue));
         let mut stream = storage.poll(&worker);
@@ -2417,7 +2416,7 @@ async fn decode_error_via_poll(
     worker_name: &str,
     notify: bool,
 ) -> Result<String, String> {
-    let worker = WorkerContext::new::<()>(worker_name);
+    let worker = WorkerContext::new(worker_name);
     if notify {
         let storage = PostgresStorage::<String>::new_with_notify(pool, &Config::new(queue));
         let mut stream = storage.poll(&worker);
@@ -2634,7 +2633,7 @@ async fn run_lock_already_held() -> Result<Outcome<LockAlreadyHeldRun>, String> 
         .await
         .map_err(|e| e.to_string())?;
     let task = task("already-locked", now_unix() - 1, 0, 25, None);
-    let id = task.parts.task_id.expect("task has id");
+    let id = task.task_id().cloned().expect("task has id");
     storage.push_task(task).await.map_err(|e| e.to_string())?;
 
     lock_task(&pool, &id, &first_worker)
@@ -2725,8 +2724,8 @@ async fn run_ack_on_pending_row() -> Result<Outcome<AckOnPendingRun>, String> {
     .await?;
 
     let parts = TaskBuilder::new(())
-        .with_task_id(id)
-        .with_attempt(Attempt::new_with_value(1))
+        .task_id(id)
+        .attempt(1)
         .with_ctx(
             PgContext::new()
                 .with_max_attempts(25)
@@ -2902,7 +2901,7 @@ async fn run_lock_missing_row() -> Result<Outcome<LockMissingRowRun>, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let phantom_id = PgTaskId::new(Ulid::generate());
+    let phantom_id = PgTaskId::from_ulid(Ulid::generate());
     let result = lock_task(&pool, &phantom_id, &worker_name).await;
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(LockMissingRowRun {
@@ -2984,8 +2983,8 @@ async fn run_ack_on_terminal_row() -> Result<Outcome<AckOnTerminalRun>, String> 
             .execute(conn).map_err(|e|e.to_string())?;Ok(())
     }).await?;
     let parts = TaskBuilder::new(())
-        .with_task_id(id)
-        .with_attempt(Attempt::new_with_value(2))
+        .task_id(id)
+        .attempt(2)
         .with_ctx(
             PgContext::new()
                 .with_max_attempts(2)

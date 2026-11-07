@@ -125,7 +125,7 @@ async fn fetch_next_sql(
     worker_id: String,
     buffer_size: i32,
 ) -> Result<Vec<FetchedRow>, String> {
-    let worker = apalis_core::worker::context::WorkerContext::new::<()>(&worker_id);
+    let worker = apalis_core::worker::context::WorkerContext::new(&worker_id);
     let config = crate::Config::new(&queue).set_buffer_size(buffer_size as usize);
     crate::queries::fetch_next(pool, config, worker, None)
         .await
@@ -134,12 +134,12 @@ async fn fetch_next_sql(
 }
 fn observe_fetched(task: crate::PgTask<crate::CompactType>) -> FetchedRow {
     FetchedRow {
-        id: task.parts.task_id.unwrap().to_string(),
-        status: task.parts.status.load().to_string(),
-        lock_by: task.parts.ctx.lock_by().clone(),
-        lock_at_present: task.parts.ctx.lock_at().is_some(),
+        id: task.task_id().cloned().unwrap().to_string(),
+        status: task.status().to_string(),
+        lock_by: task.lock_by().clone(),
+        lock_at_present: task.lock_at().is_some(),
         done_at_null: task.parts.ctx.done_at().is_none(),
-        priority: task.parts.ctx.priority(),
+        priority: task.priority(),
     }
 }
 
@@ -1001,7 +1001,7 @@ async fn fail_undecodable_sql(
 ) -> Result<usize, String> {
     crate::queries::fail_undecodable_task(
         pool,
-        PgTaskId::new(task_id.parse::<ulid::Ulid>().map_err(|e| e.to_string())?),
+        PgTaskId::from_ulid(task_id.parse::<ulid::Ulid>().map_err(|e| e.to_string())?),
         worker_id,
         lock_at_epoch,
         attempts,

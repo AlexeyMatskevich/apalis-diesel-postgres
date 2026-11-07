@@ -351,7 +351,7 @@ async fn run_status_filter(setup: StatusFilterSetup) -> Result<Outcome<StatusFil
     let listed = storage.list_tasks(&f).await.map_err(|e| e.to_string())?;
     let returned_ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
 
     cleanup_queue(pool, queue).await?;
@@ -422,7 +422,7 @@ async fn run_list_tasks_default_status() -> Result<Outcome<StatusFilterRun>, Str
     let listed = storage.list_tasks(&f).await.map_err(|e| e.to_string())?;
     let returned_ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
 
     cleanup_queue(pool, queue).await?;
@@ -537,7 +537,7 @@ async fn run_order_by_run_at() -> Result<Outcome<OrderRun>, String> {
 
     let ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
     if ids.len() < 2 {
         return Err(format!("expected at least 2 rows, got {ids:?}"));
@@ -598,7 +598,7 @@ async fn run_order_by_done_at() -> Result<Outcome<OrderRun>, String> {
 
     let ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
     if ids.len() < 2 {
         return Err(format!("expected at least 2 rows, got {ids:?}"));
@@ -685,7 +685,7 @@ async fn run_pagination(
         Ok(tasks) => PaginationOutcome::Ok {
             ids: tasks
                 .into_iter()
-                .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
                 .collect(),
         },
         Err(err) => {
@@ -763,7 +763,7 @@ async fn run_list_all_page_zero() -> Result<Outcome<PaginationOutcome>, String> 
         Ok(tasks) => PaginationOutcome::Ok {
             ids: tasks
                 .into_iter()
-                .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
                 .collect(),
         },
         Err(err) => {
@@ -897,7 +897,7 @@ async fn run_list_all_offset_slice() -> Result<Outcome<ListAllOffsetRun>, String
                     .map(|tasks| {
                         tasks
                             .into_iter()
-                            .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                            .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
                             .collect::<Vec<String>>()
                     })
             }

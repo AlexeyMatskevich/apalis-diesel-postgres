@@ -253,7 +253,7 @@ fn register_worker_sql_on(
     lease_token: &str,
     stale_after_secs: i32,
 ) -> Result<usize, crate::Error> {
-    let worker = apalis_core::worker::context::WorkerContext::new::<()>(worker_id);
+    let worker = apalis_core::worker::context::WorkerContext::new(worker_id);
     match crate::queries::worker::register_worker_blocking(
         conn,
         queue,
@@ -302,7 +302,7 @@ async fn keep_alive_sql(
     queue: String,
     lease_token: String,
 ) -> Result<usize, String> {
-    let worker = apalis_core::worker::context::WorkerContext::new::<()>(&worker_id);
+    let worker = apalis_core::worker::context::WorkerContext::new(&worker_id);
     match crate::queries::worker::keep_alive(
         pool,
         crate::Config::new(&queue),

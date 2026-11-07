@@ -439,7 +439,7 @@ mod tests {
         let task = TaskRow::from(row)
             .try_into_task_compact::<Ulid, crate::PgPool>()
             .map_err(|error| error.to_string())?;
-        serde_json::to_string(task.parts.ctx.meta()).map_err(|error| error.to_string())
+        serde_json::to_string(task.metadata()).map_err(|error| error.to_string())
     }
 
     fn forwarded_task_record(has_completion: bool) -> TaskRow {

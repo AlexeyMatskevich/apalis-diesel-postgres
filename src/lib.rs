@@ -27,7 +27,7 @@ pub use crate::{
     ack::{PgAck, PgMiddleware, lock_task, lock_task_in_queue},
     config::Config,
     error::Error,
-    fetcher::{PgFetcher, PgNotify},
+    fetcher::{PgFetcher, PgNotify, TaskStream},
     lifecycle::{refresh_queue_stats_snapshot, setup, verify_schema},
     pool::{build_pool, build_pool_with},
     queries::migrations::MIGRATIONS,
@@ -769,6 +769,82 @@ where
     Decode::Error: std::error::Error + Send + Sync + 'static,
     Fetcher: crate::fetcher::PgFetcherSource,
 {
+    /// The task stream for `worker` without apalis's worker: the
+    /// registration outcome first (`Ok(None)`), then claimed tasks, decoded.
+    ///
+    /// For consumers that run tasks themselves; a worker built with
+    /// `WorkerBuilder` polls the storage through [`Backend`] instead. Start
+    /// each task with [`PgAck::start`] (or run it through [`Self::middleware`])
+    /// and acknowledge it with [`Self::acknowledger`]; keep
+    /// [`Self::heartbeat`] running alongside. A row whose payload does not
+    /// decode is released and reported as [`Error::Decode`].
+    pub fn poll(mut self, worker: &WorkerContext) -> TaskStream<PgTask<Args>, Error> {
+        match self.task_stream(worker) {
+            Ok(tasks) => {
+                let codec = self.codec.clone();
+                tasks
+                    .map(move |item| {
+                        item.and_then(|task| {
+                            task.map(|task| {
+                                task.try_map_args(|args| codec.decode(&args))
+                                    .map_err(|error| Error::Decode(error.into()))
+                            })
+                            .transpose()
+                        })
+                    })
+                    .boxed()
+            }
+            Err(error) => futures::stream::once(futures::future::ready(Err(error))).boxed(),
+        }
+    }
+
+    /// [`Self::poll`] without decoding: the compact tasks as stored.
+    pub fn poll_compact(
+        mut self,
+        worker: &WorkerContext,
+    ) -> TaskStream<PgTask<CompactType>, Error> {
+        let Some(fetcher) = self.fetcher.take() else {
+            let error = Error::AlreadyPolled {
+                queue: self.config.queue().to_string(),
+            };
+            return futures::stream::once(futures::future::ready(Err(error))).boxed();
+        };
+        let lease = self.leases.for_worker(worker.name());
+        let compact = fetcher.into_compact_stream(
+            self.pool,
+            self.config,
+            worker.clone(),
+            self.lease_token,
+            self.poll_factory,
+        );
+        crate::fetcher::LeaseStream::new(compact, lease, true).boxed()
+    }
+
+    /// The keep-alive and orphan-sweep stream for `worker`, to run alongside
+    /// [`Self::poll`] when consuming tasks without apalis's worker. It yields
+    /// nothing until the task stream has yielded the registration outcome;
+    /// then it renews every `keep_alive`, reporting `WorkerNotRegistered` when
+    /// the registration was refused, and yields [`Error::WorkerRetired`] once
+    /// the name is retired.
+    pub fn heartbeat(
+        &self,
+        worker: &WorkerContext,
+    ) -> futures::stream::BoxStream<'static, Result<(), Error>> {
+        self.heartbeat_stream(worker)
+    }
+
+    /// The middleware a worker of this storage runs tasks through: it starts
+    /// each claim and, when the config enables it, acknowledges the result.
+    #[must_use]
+    pub fn middleware(&self) -> PgMiddleware {
+        PgMiddleware::with_lease_registry(
+            &self.pool,
+            self.config.ack(),
+            std::sync::Arc::clone(&self.lease_token),
+            self.leases.clone(),
+        )
+    }
+
     /// The task stream for `worker`: registration first, then claimed tasks.
     /// Every payload is test-decoded first; a row that does not decode is
     /// released by the decode stage (see `queries::fail_undecodable_task`)
@@ -953,10 +1029,7 @@ impl<Args, Decode: Send + 'static, Fetcher> WireFormatBackend
 
 #[cfg(test)]
 mod tests {
-    use apalis_core::{
-        backend::{Backend, BackendExt},
-        task::status::Status,
-    };
+    use apalis_core::{backend::Backend, task::status::Status};
     use apalis_sql::{DateTime, DateTimeExt, from_row::FromRowError};
     use lets_expect::{AssertionError, AssertionResult, *};
 
@@ -993,11 +1066,11 @@ mod tests {
         match result {
             Ok(task)
                 if task.args == b"payload"
-                    && task.parts.attempt.current() == 2
-                    && task.parts.status.load() == Status::Pending
-                    && task.parts.ctx.priority() == 7
-                    && task.parts.ctx.lock_by() == &Some("worker-a".to_owned())
-                    && task.parts.idempotency_key == Some("same-key".to_owned()) =>
+                    && task.attempt() == 2
+                    && task.status() == Status::Pending
+                    && task.priority() == 7
+                    && task.lock_by() == &Some("worker-a".to_owned())
+                    && task.idempotency_key() == Some("same-key".to_owned()) =>
             {
                 Ok(())
             }
@@ -1014,10 +1087,10 @@ mod tests {
         result: &Result<PgTask<CompactType>, FromRowError>,
     ) -> AssertionResult {
         match result {
-            Ok(task) if task.parts.idempotency_key.is_none() => Ok(()),
+            Ok(task) if task.idempotency_key().is_none() => Ok(()),
             Ok(task) => Err(AssertionError::new(vec![format!(
                 "expected idempotency_key None, got {:?}",
-                task.parts.idempotency_key
+                task.idempotency_key()
             )])),
             Err(error) => Err(AssertionError::new(vec![format!(
                 "expected successful conversion, got {error:?}"
@@ -1168,7 +1241,7 @@ mod tests {
     }
 
     fn backend_trait_surfaces(notify: bool) -> (String, String, String) {
-        let worker = WorkerContext::new::<()>("backend-trait-worker");
+        let worker = WorkerContext::new("backend-trait-worker");
         if notify {
             let storage = notify_storage_for_config("notify-trait-api", 2);
             let middleware = std::any::type_name_of_val(&storage.middleware()).to_owned();

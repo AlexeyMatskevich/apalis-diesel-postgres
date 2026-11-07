@@ -482,7 +482,7 @@ mod tests {
     }
 
     fn heartbeat(updated_rows: usize) -> Result<(), Error> {
-        let worker = WorkerContext::new::<()>("heartbeat-worker");
+        let worker = WorkerContext::new("heartbeat-worker");
         heartbeat_outcome(updated_rows, &worker, "heartbeat-queue")
     }
 

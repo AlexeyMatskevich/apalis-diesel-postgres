@@ -5,17 +5,16 @@ mod commit_proxy;
 mod support;
 use apalis_core::{
     backend::{
-        Backend, BackendExt, FetchById, TaskSink, TaskStream,
-        poll_strategy::{IntervalStrategy, StreamStrategy},
-        shared::MakeShared,
+        FetchById, TaskSink,
+        ext::poll_strategy::{IntervalStrategy, StreamStrategy},
     },
     layers::{Layer, Service},
-    task::{attempt::Attempt, builder::TaskBuilder},
+    task::builder::TaskBuilder,
     worker::context::WorkerContext,
 };
 use apalis_diesel_postgres::{
-    CompactType, Config, Error, JsonCodec, PgContext, PgMiddleware, PgPool, PgTask, PgTaskId,
-    PostgresStorage, SharedPostgresStorage, build_pool_with, setup,
+    CompactType, Config, Error, JsonCodec, PgMiddleware, PgPool, PgTask, PgTaskId, PostgresStorage,
+    SharedPostgresStorage, TaskStream, build_pool_with, setup,
 };
 use commit_proxy::CommitProxy;
 use diesel::{
@@ -34,6 +33,7 @@ use std::{
     },
     time::Duration,
 };
+use support::EditTask;
 #[derive(Clone, Copy)]
 enum Path {
     Polling,
@@ -118,7 +118,9 @@ fn streams(pool: &PgPool, config: &Config, worker: &WorkerContext, path: Path) -
         Path::Shared => {
             let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
                 SharedPostgresStorage::new(pool);
-            let storage=<SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(&mut shared,config.clone()).unwrap();
+            let storage = shared
+                .make_shared_with_config::<String>(config.clone())
+                .unwrap();
             prepare!(
                 storage.with_poll_strategy_factory(|| StreamStrategy::new(stream::pending::<()>()))
             )
@@ -217,7 +219,7 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
         .set_ack(automatic)
         .set_keep_alive(Duration::from_millis(10))
         .set_reenqueue_orphaned_after(Duration::from_secs(30));
-    let worker = WorkerContext::new::<()>("commit-worker");
+    let worker = WorkerContext::new("commit-worker");
     let Streams {
         mut tasks,
         mut heartbeat,
@@ -234,11 +236,11 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
         .expect("listener did not reach CommandComplete LISTEN");
     }
     let mut producer = PostgresStorage::<String>::new_with_config(&direct, &config);
-    let id = PgTaskId::new(ulid::Ulid::generate());
+    let id = PgTaskId::from_ulid(ulid::Ulid::generate());
     let mut task = TaskBuilder::new("work".to_owned())
-        .with_task_id(id)
-        .with_attempt(Attempt::new_with_value(1))
-        .with_ctx(PgContext::new().with_queue(queue.clone()))
+        .task_id(id.clone())
+        .attempt(1)
+        .queue(queue.as_str().into())
         .build();
     producer.push_task(task.clone()).await.unwrap();
     let mut conn = direct.get().unwrap();
@@ -276,7 +278,7 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
         Fault::RejectedQuery => {}
     }
     let error: Box<dyn std::error::Error + Send + Sync> = if matches!(path, Path::Fallback) {
-        task.parts.data.insert(worker.clone());
+        task.inject_data(worker.clone());
         let mut service = middleware.clone().layer(Handler(effects.clone()));
         futures::future::poll_fn(|cx| service.poll_ready(cx))
             .await
@@ -329,7 +331,7 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
             alive &= matches!(heartbeat.next().await, Some(Ok(())));
         }
         if matches!(path, Path::Fallback) {
-            task.parts.data.insert(worker.clone());
+            task.inject_data(worker.clone());
             let mut service = middleware.layer(Handler(effects.clone()));
             futures::future::poll_fn(|cx| service.poll_ready(cx))
                 .await
@@ -340,8 +342,8 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
             let delivered = tokio::time::timeout(Duration::from_secs(3), tasks.next())
                 .await
                 .unwrap();
-            observation.worker_continues =
-                alive && matches!(delivered,Some(Ok(Some(task))) if task.parts.task_id==Some(id));
+            observation.worker_continues = alive
+                && matches!(delivered,Some(Ok(Some(task))) if task.task_id().cloned()==Some(id));
         }
     } else {
         let row: Stored = sql_query("SELECT status,attempts FROM apalis.jobs WHERE id=$1")
@@ -381,18 +383,16 @@ async fn scenario(path: Path, fault: Fault, automatic: bool, url: String) -> Obs
             .unwrap()
             .unwrap();
         // A takeover charges every claim of the incumbent, started or not.
-        observation.recovered =
-            recovered.parts.task_id == Some(id) && recovered.parts.attempt.current() == 1;
-        recovered.parts.attempt = Attempt::new_with_value(2);
-        recovered.parts.data.insert(worker.clone());
+        observation.recovered = recovered.task_id() == Some(&id) && recovered.attempt() == 1;
+        recovered.edit(|task| task.attempt(2));
+        recovered.inject_data(worker.clone());
         let mut service = replacement.middleware().layer(Handler(effects.clone()));
         futures::future::poll_fn(|cx| service.poll_ready(cx))
             .await
             .unwrap();
         service.call(recovered).await.unwrap();
         let done = replacement.fetch_by_id(&id).await.unwrap().unwrap();
-        observation.recovered &=
-            done.parts.status.load().to_string() == "Done" && done.parts.attempt.current() == 2;
+        observation.recovered &= done.status().to_string() == "Done" && done.attempt() == 2;
         drop(next);
         observation.effects = effects.load(Ordering::SeqCst);
     }

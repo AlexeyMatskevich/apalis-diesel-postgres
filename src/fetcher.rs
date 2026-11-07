@@ -26,9 +26,10 @@ use futures::{
 
 use crate::{CompactType, Config, Error, PgPool, PgTask, PgTaskId, queries};
 
-/// A stream of tasks in the shape apalis 1.0-rc used: `Ok(None)` marks the
-/// registration outcome or a poll that found nothing.
-pub(crate) type TaskStream<T, E> = stream::BoxStream<'static, Result<Option<T>, E>>;
+/// A stream of tasks as [`PostgresStorage::poll`](crate::PostgresStorage::poll)
+/// yields them: `Ok(None)` marks the registration outcome or a poll that
+/// found nothing.
+pub type TaskStream<T, E> = stream::BoxStream<'static, Result<Option<T>, E>>;
 
 /// A fetcher that waits for PostgreSQL NOTIFY events.
 #[derive(Debug, Clone, Default)]
@@ -740,7 +741,7 @@ mod tests {
         PgPollFetcher {
             pool: unreachable_pool(),
             config: Config::new("fetcher-test"),
-            worker: WorkerContext::new::<()>("fetcher-worker"),
+            worker: WorkerContext::new("fetcher-worker"),
             poller: pending_poller(),
             state: StreamState::Buffered(VecDeque::new()),
             previous_task_count: Arc::new(AtomicUsize::new(12)),
@@ -1007,7 +1008,7 @@ mod tests {
     fn state_after_one_empty_fetch_cycle() -> &'static str {
         let pool = unreachable_pool();
         let config = Config::new("poll-strategy-drain");
-        let worker = WorkerContext::new::<()>("poll-strategy-drain-worker");
+        let worker = WorkerContext::new("poll-strategy-drain-worker");
         let mut fetcher = PgPollFetcher::new(&pool, &config, &worker);
         // Inject a completed, empty fetch so the fetcher schedules its next
         // poll through the configured strategy.
@@ -1018,16 +1019,16 @@ mod tests {
     }
 
     fn independent_pollers(factory_enabled: bool) -> (&'static str, &'static str) {
-        use apalis_core::backend::poll_strategy::{StrategyBuilder, StreamStrategy};
+        use apalis_core::backend::ext::poll_strategy::{Strategy, StreamStrategy};
         let config = Config::new("independent-strategies").with_poll_interval(
-            StrategyBuilder::new()
+            Strategy::new()
                 .apply(StreamStrategy::new(stream::pending::<()>()))
                 .build(),
         );
         let factory = factory_enabled
             .then(|| PollStrategyFactory::new(|| StreamStrategy::new(stream::pending::<()>())));
         let pool = unreachable_pool();
-        let worker = WorkerContext::new::<()>("factory-worker");
+        let worker = WorkerContext::new("factory-worker");
         let mut first = PgPollFetcher::with_factory(&pool, &config, &worker, factory.clone(), None);
         let mut second = PgPollFetcher::with_factory(&pool, &config, &worker, factory, None);
         (

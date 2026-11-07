@@ -524,7 +524,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use apalis_core::backend::{Backend, BackendExt, shared::MakeShared};
+    use apalis_core::backend::Backend;
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
@@ -553,7 +553,7 @@ mod tests {
 
     fn make_default_shared() -> Result<SharedObservation, SharedPostgresError> {
         let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
-        let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared(&mut shared)?;
+        let storage = shared.make_shared::<String>()?;
         Ok(SharedObservation {
             queue: storage.config.queue().to_string(),
             buffer_size: storage.config.buffer_size(),
@@ -564,10 +564,7 @@ mod tests {
     fn make_configured_shared() -> Result<SharedObservation, SharedPostgresError> {
         let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let config = Config::new("shared-unit").set_buffer_size(3);
-        let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
-            &mut shared,
-            config,
-        )?;
+        let storage = shared.make_shared_with_config::<String>(config)?;
         Ok(SharedObservation {
             queue: storage.get_queue().to_string(),
             buffer_size: storage.config.buffer_size(),
@@ -578,11 +575,8 @@ mod tests {
     fn shared_trait_surfaces() -> Result<(String, String), SharedPostgresError> {
         let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let config = Config::new("shared-traits");
-        let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
-            &mut shared,
-            config,
-        )?;
-        let worker = WorkerContext::new::<()>("shared-trait-worker");
+        let storage = shared.make_shared_with_config::<String>(config)?;
+        let worker = WorkerContext::new("shared-trait-worker");
         let middleware_name = std::any::type_name_of_val(&storage.middleware()).to_owned();
         let stream_name = std::any::type_name_of_val(&storage.poll_compact(&worker)).to_owned();
         Ok((middleware_name, stream_name))
@@ -772,14 +766,8 @@ mod tests {
     fn double_make_shared_same_queue() -> Result<(), SharedPostgresError> {
         let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&unreachable_pool());
         let config = Config::new("double-make-shared");
-        let _first = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
-            &mut shared,
-            config.clone(),
-        )?;
-        let _second = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
-            &mut shared,
-            config,
-        )?;
+        let _first = shared.make_shared_with_config::<String>(config.clone())?;
+        let _second = shared.make_shared_with_config::<String>(config)?;
         Ok(())
     }
 
@@ -815,7 +803,7 @@ mod tests {
     }
 
     fn new_task_id() -> PgTaskId {
-        PgTaskId::new(Ulid::generate())
+        PgTaskId::from_ulid(Ulid::generate())
     }
 
     /// `deliver_to_queue` must prune a sender whose receiver was dropped
@@ -1157,8 +1145,7 @@ mod tests {
         // mutex in PoisonError state for the next caller.
         let _ = join.join();
         let config = Config::new("poisoned-registry");
-        <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(&mut shared, config)
-            .map(|_| ())
+        shared.make_shared_with_config::<String>(config).map(|_| ())
     }
 
     fn is_registry_locked(error: &SharedPostgresError) -> AssertionResult {

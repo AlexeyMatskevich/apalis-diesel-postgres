@@ -4,10 +4,7 @@ use crate::{
     test_support as support,
 };
 use apalis_core::{
-    backend::{
-        poll_strategy::{StrategyBuilder, StreamStrategy},
-        shared::MakeShared,
-    },
+    backend::ext::poll_strategy::{Strategy, StreamStrategy},
     worker::context::WorkerContext,
 };
 use diesel::{
@@ -61,7 +58,7 @@ impl Fixture {
             pool,
             queue: format!("notification-regression-{}", ulid::Ulid::generate()),
             ids: (0..count)
-                .map(|_| PgTaskId::new(ulid::Ulid::generate()))
+                .map(|_| PgTaskId::from_ulid(ulid::Ulid::generate()))
                 .collect(),
         }))
     }
@@ -142,7 +139,7 @@ async fn batch(
         let output=queries::batch_ids_into_tasks(fixture.pool.clone(),fixture.queue.clone(),fixture.queue.clone(),capacity,input,Some(Arc::from(TOKEN))).collect::<Vec<_>>().await;
         let mut delivered=Vec::new(); let mut errors=Vec::new();
         for item in output {match item {
-            Ok(Some(task))=>delivered.push(task.parts.task_id.map(|id|id.to_string()).unwrap_or_default()),
+            Ok(Some(task))=>delivered.push(task.task_id().cloned().map(|id|id.to_string()).unwrap_or_default()),
             Ok(None)=>return Err("batch yielded an empty task".into()),
             Err(Error::NotifyListener(message))=>errors.push(message),
             Err(error)=>return Err(error.to_string()),
@@ -267,7 +264,7 @@ async fn wait_idle(pool: &PgPool) -> Result<(), String> {
 
 fn config(queue: &str) -> Config {
     Config::new(queue).set_buffer_size(3).with_poll_interval(
-        StrategyBuilder::new()
+        Strategy::new()
             .apply(StreamStrategy::new(stream::pending::<()>()))
             .build(),
     )
@@ -283,7 +280,7 @@ async fn consume(
         source,
         fixture.pool.clone(),
         config(&fixture.queue),
-        WorkerContext::new::<()>(&fixture.queue),
+        WorkerContext::new(&fixture.queue),
         Arc::from(TOKEN),
         None,
     );
@@ -322,7 +319,7 @@ async fn live(shared: bool, terminate: bool) -> Result<(), String> {
     let result=async {
         let mut factory:SharedPostgresStorage=SharedPostgresStorage::new(&fixture.pool);
         let source=if shared {
-            let storage=<SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(&mut factory,config(&fixture.queue)).map_err(|e|e.to_string())?;
+            let storage=factory.make_shared_with_config::<String>(config(&fixture.queue)).map_err(|e|e.to_string())?;
             Source::Shared(storage.fetcher)
         } else { Source::Single(queries::notify_task_ids(fixture.pool.clone(),fixture.queue.clone(),3)) };
         let pid=listener_pid(fixture.pool.clone()).await?;
@@ -385,10 +382,10 @@ async fn overflow(shared: bool) -> Result<(), String> {
         if accepted.len()!=2 {return Err(format!("expected two accepted hints, got {accepted:?}"));}
         let (delivered,errors)=consume(&fixture,source,0).await?;
         let before=fixture.rows().await?;
-        let recovered=queries::fetch_next(fixture.pool.clone(),Config::new(&fixture.queue).set_buffer_size(8),WorkerContext::new::<()>(&fixture.queue),Some(Arc::from(TOKEN)))
+        let recovered=queries::fetch_next(fixture.pool.clone(),Config::new(&fixture.queue).set_buffer_size(8),WorkerContext::new(&fixture.queue),Some(Arc::from(TOKEN)))
             .await.map_err(|e|e.to_string())?;
         let mut all=delivered.clone();
-        all.extend(recovered.into_iter().map(|task|task.parts.task_id.map(|id|id.to_string()).unwrap_or_default())); all.sort();
+        all.extend(recovered.into_iter().map(|task|task.task_id().cloned().map(|id|id.to_string()).unwrap_or_default())); all.sort();
         let after=fixture.rows().await?;
         let mut pending=before.iter().filter(|row|row.status=="Pending"&&!row.owned&&row.attempts==0).map(|row|row.id.clone()).collect::<Vec<_>>(); pending.sort();
         let rejected=sorted_ids(&fixture.ids.iter().copied().filter(|id|!accepted.contains(id)).collect::<Vec<_>>());

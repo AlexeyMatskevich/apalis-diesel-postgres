@@ -3,6 +3,7 @@
 #[path = "support/one_at_a_time.rs"]
 mod one_at_a_time;
 mod support;
+use support::EditTask;
 #[path = "support/unreachable.rs"]
 mod unreachable;
 async fn database_case<T, F: Future<Output = T>>(
@@ -63,10 +64,7 @@ fn completion_recovered()
 }
 
 mod claims {
-    use apalis_core::{
-        backend::{Backend, BackendExt},
-        worker::context::WorkerContext,
-    };
+    use apalis_core::{backend::Backend, worker::context::WorkerContext};
     use apalis_diesel_postgres::{Config, PgPool, PostgresStorage, build_pool, setup};
     use diesel::{
         QueryableByName, RunQueryDsl, sql_query,
@@ -111,7 +109,7 @@ mod claims {
         let config = Config::new(&q)
             .set_reenqueue_orphaned_after(Duration::from_secs(60))
             .set_keep_alive(Duration::from_millis(10));
-        let worker = WorkerContext::new::<()>("same-worker");
+        let worker = WorkerContext::new("same-worker");
         let old = PostgresStorage::<String>::new_with_config(&p, &config);
         let mut old_stream = old.poll_compact(&worker);
         assert!(old_stream.next().await.unwrap().is_ok());
@@ -147,7 +145,7 @@ mod claims {
         let p = pool().await;
         let q = format!("lifecycle_stale_{}", ulid::Ulid::generate());
         let config = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_secs(60));
-        let worker = WorkerContext::new::<()>("same-worker");
+        let worker = WorkerContext::new("same-worker");
         let old = PostgresStorage::<String>::new_with_config(&p, &config);
         let mut old_stream = old.poll_compact(&worker);
         assert!(old_stream.next().await.unwrap().is_ok());
@@ -174,7 +172,7 @@ mod claims {
         let p = pool().await;
         let q = format!("lifecycle_malformed_id_{}", ulid::Ulid::generate());
         let config = Config::new(&q).set_buffer_size(2);
-        let worker = WorkerContext::new::<()>("batch-worker");
+        let worker = WorkerContext::new("batch-worker");
         let storage = PostgresStorage::<String>::new_with_config(&p, &config);
         let mut stream = storage.poll_compact(&worker);
         assert!(stream.next().await.unwrap().is_ok());
@@ -191,7 +189,7 @@ mod claims {
             .unwrap()
             .unwrap();
         eprintln!("mixed batch stream result={result:?}");
-        let delivered = matches!(result, Ok(Some(ref task)) if task.parts.task_id.map(|id|id.to_string())==Some(good.clone()));
+        let delivered = matches!(result, Ok(Some(ref task)) if task.task_id().cloned().map(|id|id.to_string())==Some(good.clone()));
         let bad_terminal=count(&p,format!("SELECT count(*)n FROM apalis.jobs WHERE job_type='{q}' AND id='not-a-ulid' AND status='Killed' AND lock_by IS NULL")).await;
         let running = count(
             &p,
@@ -211,7 +209,7 @@ mod claims {
         let p = pool().await;
         let q = format!("lifecycle_exhausted_{}", ulid::Ulid::generate());
         let config = Config::new(&q);
-        let worker = WorkerContext::new::<()>("budget-worker");
+        let worker = WorkerContext::new("budget-worker");
         let storage = PostgresStorage::<String>::new_with_config(&p, &config);
         let mut stream = storage.poll_compact(&worker);
         assert!(stream.next().await.unwrap().is_ok());
@@ -262,7 +260,7 @@ mod middleware {
         worker::context::WorkerContext,
     };
     use apalis_diesel_postgres::{
-        Config, PgContext, PgMiddleware, PgTask, PostgresStorage, build_pool, setup,
+        Config, PgMiddleware, PgTask, PostgresStorage, build_pool, setup,
     };
     use lets_expect::*;
     use std::{
@@ -297,15 +295,13 @@ mod middleware {
             .register_worker("middleware-worker".to_owned())
             .await
             .unwrap();
-        let id = apalis_diesel_postgres::PgTaskId::new(ulid::Ulid::generate());
+        let id = apalis_diesel_postgres::PgTaskId::from_ulid(ulid::Ulid::generate());
         let mut task = TaskBuilder::new("work".to_owned())
-            .with_task_id(id)
-            .with_ctx(PgContext::new().with_queue(q.clone()))
+            .task_id(id.clone())
+            .queue(q.clone().into())
             .build();
         storage.push_task(task.clone()).await.unwrap();
-        task.parts
-            .data
-            .insert(WorkerContext::new::<()>("middleware-worker"));
+        task.inject_data(WorkerContext::new("middleware-worker"));
         let effects = Arc::new(AtomicUsize::new(0));
         let mut service = PgMiddleware::new(&p, true).layer(Handler(effects.clone()));
         futures::future::poll_fn(|cx| service.poll_ready(cx))
@@ -317,9 +313,7 @@ mod middleware {
             .await
             .unwrap()
             .unwrap()
-            .parts
-            .status
-            .load()
+            .status()
             .to_string();
         eprintln!(
             "middleware result={result:?}; effects={}; persisted status={status}",
@@ -341,8 +335,8 @@ mod middleware {
 }
 
 mod races {
+    use crate::support::EditTask;
     use apalis_core::{
-        backend::BackendExt,
         error::BoxDynError,
         task::attempt::Attempt,
         worker::{context::WorkerContext, ext::ack::Acknowledge},
@@ -393,7 +387,7 @@ mod races {
         let c = Config::new(&q)
             .set_keep_alive(Duration::from_millis(100))
             .set_reenqueue_orphaned_after(Duration::from_millis(500));
-        let w = WorkerContext::new::<()>("fraction-worker");
+        let w = WorkerContext::new("fraction-worker");
         let mut a = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
         assert!(a.next().await.unwrap().is_ok());
         let mut b = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
@@ -429,13 +423,13 @@ mod races {
             setup(&p).await.unwrap();
             let q = format!("lifecycle_deadlock_{}", ulid::Ulid::generate());
             let c = Config::new(&q).set_reenqueue_orphaned_after(Duration::from_secs(60));
-            let w = WorkerContext::new::<()>("deadlock-worker");
+            let w = WorkerContext::new("deadlock-worker");
             let mut old = PostgresStorage::<String>::new_with_config(&p, &c).poll_compact(&w);
             assert!(old.next().await.unwrap().is_ok());
             let id = ulid::Ulid::generate();
             sql(&p,format!("INSERT INTO apalis.jobs(id,job_type,job,status,attempts,max_attempts,run_at) VALUES('{id}','{q}',''::bytea,'Pending',0,25,now())")).await;
             let mut task = old.next().await.unwrap().unwrap().unwrap();
-            task.parts.attempt = Attempt::new_with_value(1);
+            task.edit(|t| t.attempt(1));
             let pp = p.clone();
             let qq = q.clone();
             let token = tokio::task::spawn_blocking(move || {
@@ -461,7 +455,7 @@ mod races {
             let mut ack = PgAck::with_lease_token(&p, Arc::from(token));
             let acknowledger = tokio::spawn(async move {
                 let result: Result<(), BoxDynError> = Ok(());
-                ack.ack(&result, &task.parts).await
+                ack.ack(&result, &task).await
             });
             wait_until_observed(
                 &p,
@@ -495,6 +489,7 @@ mod races {
 }
 
 mod retirement {
+    use crate::support::EditTask;
     use apalis_core::{
         backend::{Backend, FetchById, TaskSink},
         layers::{Layer, Service},
@@ -574,12 +569,12 @@ mod retirement {
             .set_keep_alive(Duration::from_millis(10))
             .set_reenqueue_orphaned_after(Duration::from_secs(1));
         let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
-        let worker = WorkerContext::new::<()>("completion-worker");
-        let id = PgTaskId::new(ulid::Ulid::generate());
+        let worker = WorkerContext::new("completion-worker");
+        let id = PgTaskId::from_ulid(ulid::Ulid::generate());
         storage
             .push_task(
                 TaskBuilder::new("effect".to_owned())
-                    .with_task_id(id)
+                    .task_id(id.clone())
                     .build(),
             )
             .await
@@ -587,8 +582,8 @@ mod retirement {
         let mut tasks = storage.clone().poll(&worker);
         assert!(tasks.next().await.unwrap().is_ok());
         let mut task = tasks.next().await.unwrap().unwrap().unwrap();
-        task.parts.attempt = Attempt::new_with_value(1);
-        task.parts.data.insert(worker.clone());
+        task.edit(|t| t.attempt(1));
+        task.inject_data(worker.clone());
         let effects = Arc::new(AtomicUsize::new(0));
         let held: Held = Arc::new(Mutex::new(None));
         let handler = Handler {
@@ -628,7 +623,7 @@ mod retirement {
         // Recovery itself must still reclaim the original job and retry it.
         let aging_pool = pool.clone();
         let aging_queue = queue.clone();
-        let aging_worker = worker.name().clone();
+        let aging_worker = worker.name().to_owned();
         let aged = tokio::task::spawn_blocking(move || {
             use diesel::{RunQueryDsl, sql_query, sql_types::Text};
             sql_query(
@@ -652,10 +647,10 @@ mod retirement {
         let mut next = replacement.clone().poll(&worker);
         assert!(next.next().await.unwrap().is_ok());
         let mut recovered = next.next().await.unwrap().unwrap().unwrap();
-        assert_eq!(recovered.parts.task_id, Some(id));
-        assert_eq!(recovered.parts.attempt.current(), 1);
-        recovered.parts.attempt = Attempt::new_with_value(2);
-        recovered.parts.data.insert(worker);
+        assert_eq!(recovered.task_id().cloned(), Some(id.clone()));
+        assert_eq!(recovered.attempt(), 1);
+        recovered.edit(|t| t.attempt(2));
+        recovered.inject_data(worker);
         let mut finishing = replacement.middleware().layer(Handler {
             effects: effects.clone(),
             pool: pool.clone(),
@@ -671,9 +666,7 @@ mod retirement {
             .await
             .unwrap()
             .unwrap()
-            .parts
-            .status
-            .load()
+            .status()
             .to_string();
         let cleanup = pool.clone();
         tokio::task::spawn_blocking(move || {
@@ -716,13 +709,13 @@ mod retirement {
 
 mod registered_middleware {
     use apalis_core::{
-        backend::{Backend, BackendExt, FetchById, TaskSink},
+        backend::{Backend, FetchById, TaskSink},
         layers::{Layer, Service},
         task::builder::TaskBuilder,
         worker::context::WorkerContext,
     };
     use apalis_diesel_postgres::{
-        Config, Error, PgContext, PgTask, PgTaskId, PostgresStorage, build_pool, setup,
+        Config, Error, PgTask, PgTaskId, PostgresStorage, build_pool, setup,
     };
     use diesel::{RunQueryDsl, sql_query, sql_types::Text};
     use futures::StreamExt;
@@ -765,8 +758,8 @@ mod registered_middleware {
         fn call(&mut self, task: PgTask<String>) -> Self::Future {
             self.effects.fetch_add(1, Ordering::SeqCst);
             self.context.store(
-                task.parts.ctx.lock_by().as_deref() == Some("fallback-worker")
-                    && task.parts.ctx.lock_at().is_some()
+                task.lock_by().as_deref() == Some("fallback-worker")
+                    && task.lock_at().is_some()
                     && task.args == "work",
                 Ordering::SeqCst,
             );
@@ -801,7 +794,7 @@ mod registered_middleware {
             .set_ack(auto_ack)
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
         let mut storage = PostgresStorage::<String>::new_with_config(&pool, &config);
-        let worker = WorkerContext::new::<()>("fallback-worker");
+        let worker = WorkerContext::new("fallback-worker");
         // An absent registration never polls: the name is unknown to the queue.
         let mut old_stream = (!matches!(registration, Registration::Absent))
             .then(|| storage.clone().poll_compact(&worker));
@@ -822,15 +815,13 @@ mod registered_middleware {
         if matches!(registration, Registration::Retired) {
             drop(old_stream.take());
         }
-        let id = PgTaskId::new(ulid::Ulid::generate());
+        let id = PgTaskId::from_ulid(ulid::Ulid::generate());
         let mut task = TaskBuilder::new("work".to_owned())
-            .with_task_id(id)
-            .with_ctx(PgContext::new().with_queue(queue.clone()))
+            .task_id(id.clone())
+            .queue(queue.clone().into())
             .build();
         storage.push_task(task.clone()).await.unwrap();
-        task.parts
-            .data
-            .insert(WorkerContext::new::<()>("fallback-worker"));
+        task.inject_data(WorkerContext::new("fallback-worker"));
         let effects = Arc::new(AtomicUsize::new(0));
         let context = Arc::new(AtomicBool::new(false));
         let mut service = storage.middleware().layer(Handler {
@@ -850,9 +841,7 @@ mod registered_middleware {
                 .await
                 .unwrap()
                 .unwrap()
-                .parts
-                .status
-                .load()
+                .status()
                 .to_string(),
         };
         eprintln!("fallback auto_ack={auto_ack}: {observed:?}; result={result:?}");
@@ -920,17 +909,15 @@ mod registered_middleware {
 }
 
 mod unpolled_stream {
+    use crate::support::EditTask;
     use apalis_core::{
-        backend::{
-            Backend, BackendExt, TaskSink, TaskStream, poll_strategy::IntervalStrategy,
-            shared::MakeShared,
-        },
+        backend::{Backend, TaskSink, ext::poll_strategy::IntervalStrategy},
         task::Task,
         worker::context::WorkerContext,
     };
     use apalis_diesel_postgres::{
         CompactType, Config, Error, JsonCodec, PgPool, PgTask, PgTaskId, PostgresStorage,
-        SharedPostgresStorage, build_pool, setup,
+        SharedPostgresStorage, TaskStream, build_pool, setup,
     };
     use diesel::{RunQueryDsl, sql_query, sql_types::Text};
     use futures::{StreamExt, stream::BoxStream};
@@ -995,21 +982,15 @@ mod unpolled_stream {
             Mode::Shared => {
                 let mut factory: SharedPostgresStorage<JsonCodec<CompactType>> =
                     SharedPostgresStorage::new(pool);
-                let storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<
-                    String,
-                >>::make_shared_with_config(
-                    &mut factory, config.clone()
-                )
-                .unwrap()
-                .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
+                let storage = factory
+                    .make_shared_with_config::<String>(config.clone())
+                    .unwrap()
+                    .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
                 // SharedFetcher is not Clone: a second subscription owns a distinct registration.
-                let disposable = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<
-                    String,
-                >>::make_shared_with_config(
-                    &mut factory, config.clone()
-                )
-                .unwrap()
-                .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
+                let disposable = factory
+                    .make_shared_with_config::<String>(config.clone())
+                    .unwrap()
+                    .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
                 prepared!(storage, disposable)
             }
         }
@@ -1019,7 +1000,7 @@ mod unpolled_stream {
         setup(&pool).await.unwrap();
         let queue = format!("lifecycle_unpolled_{}", ulid::Ulid::generate());
         let config = Config::new(&queue).set_keep_alive(Duration::from_millis(5));
-        let worker = WorkerContext::new::<()>("active-worker");
+        let worker = WorkerContext::new("active-worker");
         let Streams {
             mut active,
             mut heartbeat,
@@ -1029,9 +1010,9 @@ mod unpolled_stream {
         // Drop without first poll: no registration/claim SQL was dispatched by this stream.
         discard();
         let mut producer = PostgresStorage::<String>::new_with_config(&pool, &config);
-        let id = PgTaskId::new(ulid::Ulid::generate());
+        let id = PgTaskId::from_ulid(ulid::Ulid::generate());
         let mut task = Task::new("work".to_owned());
-        task.parts.task_id = Some(id);
+        task.edit(|t| t.task_id(id.clone()));
         producer.push_task(task).await.unwrap();
         let heartbeat_result = heartbeat.next().await;
         let delivered = tokio::time::timeout(Duration::from_secs(2), active.next()).await;
@@ -1040,7 +1021,7 @@ mod unpolled_stream {
         );
         let observation = Observation {
             heartbeat_succeeded: matches!(heartbeat_result, Some(Ok(()))),
-            exact_task_delivered: matches!(delivered,Ok(Some(Ok(Some(task)))) if task.parts.task_id==Some(id)),
+            exact_task_delivered: matches!(delivered,Ok(Some(Ok(Some(task)))) if task.task_id().cloned()==Some(id)),
         };
         drop(active);
         drop(heartbeat);
@@ -1088,7 +1069,7 @@ mod unpolled_stream {
 
 // Only a stream that held a registration can lose completion obligations.
 mod dropped_stream {
-    use apalis_core::{backend::BackendExt, worker::context::WorkerContext};
+    use apalis_core::worker::context::WorkerContext;
     use apalis_diesel_postgres::{
         CompactType, Config, Error, PgPool, PgTask, PostgresStorage, build_pool, setup,
     };
@@ -1153,7 +1134,7 @@ mod dropped_stream {
         let config = Config::new(&queue)
             .set_keep_alive(Duration::from_millis(5))
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
-        let worker = WorkerContext::new::<()>("rolling-worker");
+        let worker = WorkerContext::new("rolling-worker");
         // Another process keeps the name registered while the subject starts.
         let mut holder = None;
         if matches!(registration, Registration::Refused) {
@@ -1233,17 +1214,16 @@ mod dropped_stream {
 // The persisted retry budget schedules attempts; an in-process re-dispatch of
 // an acknowledged claim is refused instead of running and reporting stale.
 mod redispatched_claim {
-    use crate::one_at_a_time::OneAtATimeLayer;
     use apalis::layers::{WorkerBuilderExt, retry::RetryPolicy};
     use apalis_core::{
-        backend::{FetchById, TaskSink, poll_strategy::IntervalStrategy},
+        backend::{FetchById, TaskSink, ext::poll_strategy::IntervalStrategy},
         error::{BoxDynError, WorkerError},
         layers::{Layer, Service},
         task::builder::TaskBuilder,
         worker::builder::WorkerBuilder,
     };
     use apalis_diesel_postgres::{
-        Config, Error, PgContext, PgTask, PgTaskId, PostgresStorage, build_pool, setup,
+        Config, Error, PgTask, PgTaskId, PostgresStorage, build_pool, setup,
     };
     use diesel::{RunQueryDsl, sql_query, sql_types::Text};
     use futures::{FutureExt, future::BoxFuture};
@@ -1270,7 +1250,7 @@ mod redispatched_claim {
     fn run_kind(result: &Result<(), WorkerError>) -> &'static str {
         match result {
             Ok(()) => "completed",
-            Err(WorkerError::StreamError(error))
+            Err(WorkerError::BackendError(error))
                 if matches!(
                     error.downcast_ref::<Error>(),
                     Some(Error::WorkerRetired { .. })
@@ -1292,12 +1272,12 @@ mod redispatched_claim {
             .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
         // One attempt makes the first failure terminal, so the fetcher cannot
         // legitimately claim the row a second time during the run.
-        let id = PgTaskId::new(ulid::Ulid::generate());
+        let id = PgTaskId::from_ulid(ulid::Ulid::generate());
         storage
             .push_task(
                 TaskBuilder::new("work".to_owned())
-                    .with_task_id(id)
-                    .with_ctx(PgContext::new().with_max_attempts(1))
+                    .task_id(id.clone())
+                    .max_attempts(1)
                     .build(),
             )
             .await
@@ -1312,14 +1292,15 @@ mod redispatched_claim {
             }
         };
         let mut observer = storage.clone();
+        let signal_id = id.clone();
         let signal = async move {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 let terminal = observer
-                    .fetch_by_id(&id)
+                    .fetch_by_id(&signal_id)
                     .await
-                    .map_err(|error| WorkerError::StreamError(Box::new(error)))?
-                    .is_some_and(|task| task.parts.status.load().to_string() == "Killed");
+                    .map_err(|error| WorkerError::BackendError(Box::new(error)))?
+                    .is_some_and(|task| task.status().to_string() == "Killed");
                 if terminal {
                     // Leave room for any re-dispatch the retry layer attempts.
                     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1331,19 +1312,27 @@ mod redispatched_claim {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        let builder = WorkerBuilder::new("redispatch-worker").backend(storage.clone());
         let run: BoxFuture<'static, Result<(), WorkerError>> = match retries {
-            Retries::DatabaseBudget => builder.build(handler).run_until(signal).boxed(),
-            Retries::InProcessLayer => builder
-                .retry(RetryPolicy::retries(2))
+            Retries::DatabaseBudget => WorkerBuilder::new("redispatch-worker")
+                .backend(storage.clone())
+                .build(handler)
+                .run_until(signal)
+                .boxed(),
+            // Around the backend middleware, as this case is about; apalis
+            // 1.0's `WorkerBuilder::retry` would install it inside.
+            Retries::InProcessLayer => WorkerBuilder::new("redispatch-worker")
+                .backend(crate::one_at_a_time::with_outer_layer(
+                    storage.clone(),
+                    tower::retry::RetryLayer::new(RetryPolicy::retries(2)),
+                ))
                 .build(handler)
                 .run_until(signal)
                 .boxed(),
         };
         let run = run_kind(&run.await);
         let task = storage.fetch_by_id(&id).await.unwrap().unwrap();
-        let status = task.parts.status.load().to_string();
-        let attempts = task.parts.attempt.current();
+        let status = task.status().to_string();
+        let attempts = task.attempt();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().unwrap();
             sql_query("DELETE FROM apalis.jobs WHERE job_type=$1")
@@ -1413,8 +1402,8 @@ mod redispatched_claim {
         }
         fn call(&mut self, task: PgTask<Args>) -> Self::Future {
             self.dispatched.lock().unwrap().push(
-                task.parts
-                    .task_id
+                task.task_id()
+                    .cloned()
                     .map(|id| id.to_string())
                     .unwrap_or_default(),
             );
@@ -1451,19 +1440,25 @@ mod redispatched_claim {
             .with_poll_strategy_factory(|| IntervalStrategy::new(Duration::from_millis(5)));
         let mut ids = Vec::new();
         for label in ["first", "second"] {
-            let id = PgTaskId::new(ulid::Ulid::generate());
+            let id = PgTaskId::from_ulid(ulid::Ulid::generate());
             storage
-                .push_task(TaskBuilder::new(label.to_owned()).with_task_id(id).build())
+                .push_task(
+                    TaskBuilder::new(label.to_owned())
+                        .task_id(id.clone())
+                        .build(),
+                )
                 .await
                 .unwrap();
             ids.push(id);
         }
-        let (first, lost) = (ids[0], ids[1]);
+        let (first, lost) = (ids[0].clone(), ids[1].clone());
         let handler_runs = Arc::new(AtomicUsize::new(0));
         let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (handler_pool, counter) = (pool.clone(), handler_runs.clone());
+        let handler_lost = lost.clone();
         let handler = move |job: String| {
             let (pool, counter) = (handler_pool.clone(), counter.clone());
+            let lost = handler_lost.clone();
             async move {
                 if job == "first" {
                     tokio::task::spawn_blocking(move || {
@@ -1484,19 +1479,20 @@ mod redispatched_claim {
         };
         let mut observer = storage.clone();
         let seen = dispatched.clone();
+        let lost_for_signal = lost.clone();
         let signal = async move {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 let first_done = observer
                     .fetch_by_id(&first)
                     .await
-                    .map_err(|error| WorkerError::StreamError(Box::new(error)))?
-                    .is_some_and(|task| task.parts.status.load().to_string() == "Done");
+                    .map_err(|error| WorkerError::BackendError(Box::new(error)))?
+                    .is_some_and(|task| task.status().to_string() == "Done");
                 let lost_dispatched = seen
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|id| *id == lost.to_string());
+                    .any(|id| *id == lost_for_signal.to_string());
                 if first_done && lost_dispatched {
                     // Leave room for every re-dispatch the retry layer attempts.
                     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1510,11 +1506,21 @@ mod redispatched_claim {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
+        // The gate, the retry layer and the recorder wrap the backend
+        // middleware in that order, as before apalis 1.0 put user layers
+        // inside it.
+        let outer = apalis_core::layers::Stack::new(
+            apalis_core::layers::Stack::new(
+                RecordDispatches(dispatched.clone()),
+                tower::retry::RetryLayer::new(RetryPolicy::retries(2)),
+            ),
+            crate::one_at_a_time::OneAtATimeLayer::default(),
+        );
         let run = WorkerBuilder::new("lost-claim-worker")
-            .backend(storage.clone())
-            .layer(OneAtATimeLayer::default())
-            .retry(RetryPolicy::retries(2))
-            .layer(RecordDispatches(dispatched.clone()))
+            .backend(crate::one_at_a_time::with_outer_layer(
+                storage.clone(),
+                outer,
+            ))
             .build(handler)
             .run_until(signal)
             .await;
@@ -1552,11 +1558,14 @@ mod redispatched_claim {
     fn re_dispatched_within_the_budget()
     -> impl Fn(&Result<crate::support::Outcome<LostClaimObservation>, String>) -> AssertionResult
     {
-        // `RetryPolicy::retries(2)` allows the first dispatch and two retries.
+        // A refused dispatch is marked `Killed`, which ends apalis 1.0's
+        // `RetryPolicy` at once: the lost claim is dispatched once, well within
+        // the budget of `RetryPolicy::retries(2)`. (Before 1.0 the refusal was
+        // counted as an attempt and retried up to the budget: three dispatches.)
         crate::satisfies(|o: &LostClaimObservation| {
             o.run == "completed"
                 && o.handler_runs == 1
-                && o.lost_dispatches == 3
+                && o.lost_dispatches == 1
                 && o.lost_row == ("Pending".to_owned(), 0)
         })
     }
@@ -1578,14 +1587,14 @@ mod redispatched_claim {
 // since its last `register_worker` call; a worker stream honours that window.
 mod token_free_registration {
     use apalis_core::{
-        backend::{BackendExt, RegisterWorker, TaskSink},
+        backend::{RegisterWorker, TaskSink},
         error::BoxDynError,
         task::{attempt::Attempt, builder::TaskBuilder},
         worker::{context::WorkerContext, ext::ack::Acknowledge},
     };
     use apalis_diesel_postgres::{
-        Config, Error, PgAck, PgContext, PgPool, PgTaskId, PostgresStorage, build_pool,
-        lock_task_in_queue, setup,
+        Config, Error, PgAck, PgPool, PgTaskId, PostgresStorage, build_pool, lock_task_in_queue,
+        setup,
     };
     use diesel::{
         QueryableByName, RunQueryDsl, sql_query,
@@ -1644,12 +1653,12 @@ mod token_free_registration {
             .register_worker("shared-name".to_owned())
             .await
             .unwrap();
-        let id = PgTaskId::new(ulid::Ulid::generate());
+        let id = PgTaskId::from_ulid(ulid::Ulid::generate());
         admin
             .push_task(
                 TaskBuilder::new("work".to_owned())
-                    .with_task_id(id)
-                    .with_ctx(PgContext::new().with_max_attempts(3))
+                    .task_id(id.clone())
+                    .max_attempts(3)
                     .build(),
             )
             .await
@@ -1658,7 +1667,7 @@ mod token_free_registration {
         lock_task_in_queue(&pool, &id, "shared-name", &queue)
             .await
             .unwrap();
-        let claimed = job_state(&pool, id).await;
+        let claimed = job_state(&pool, id.clone()).await;
         if matches!(liveness, Liveness::Stale) {
             let aging_pool = pool.clone();
             let aging_queue = queue.clone();
@@ -1675,7 +1684,7 @@ mod token_free_registration {
             .unwrap();
         }
         let native = PostgresStorage::<String>::new_with_config(&pool, &config);
-        let worker = WorkerContext::new::<()>("shared-name");
+        let worker = WorkerContext::new("shared-name");
         let mut stream = native.clone().poll_compact(&worker);
         let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
@@ -1688,22 +1697,18 @@ mod token_free_registration {
                 "other"
             }
         };
-        let after = job_state(&pool, id).await;
+        let after = job_state(&pool, id.clone()).await;
         // The token-free consumer finishes with the manual acknowledgement contract.
-        let mut parts = TaskBuilder::new("work".to_owned())
-            .with_task_id(id)
-            .with_ctx(
-                PgContext::new()
-                    .with_queue(queue.clone())
-                    .with_max_attempts(3)
-                    .with_lock_by(Some("shared-name".to_owned()))
-                    .with_lock_at(claimed.lock_at),
-            )
-            .build()
-            .parts;
-        parts.attempt = Attempt::new_with_value(1);
+        let task = TaskBuilder::new("work".to_owned())
+            .task_id(id.clone())
+            .queue(queue.clone().into())
+            .max_attempts(3)
+            .lock_by(Some("shared-name".to_owned()))
+            .lock_at(claimed.lock_at.and_then(|at| u64::try_from(at).ok()))
+            .attempt(1)
+            .build();
         let result: Result<String, BoxDynError> = Ok("done".to_owned());
-        let token_free_ack = match PgAck::new(&pool).ack(&result, &parts).await {
+        let token_free_ack = match PgAck::new(&pool).ack(&result, &task).await {
             Ok(()) => "acknowledged",
             Err(Error::StaleAcknowledgement { .. }) => "stale",
             Err(_) => "other",
@@ -1767,13 +1772,13 @@ mod token_free_registration {
 mod attempt_accounting {
     use crate::support;
     use apalis_core::{
-        backend::{BackendExt, RegisterWorker},
+        backend::RegisterWorker,
         layers::{Layer, Service},
         task::{attempt::Attempt, builder::TaskBuilder},
-        worker::{AttemptOnPollFuture, context::WorkerContext, ext::ack::Acknowledge},
+        worker::{context::WorkerContext, ext::ack::Acknowledge},
     };
     use apalis_diesel_postgres::{
-        Config, Error, PgAck, PgContext, PgMiddleware, PgTask, PgTaskId, PostgresStorage,
+        Config, Error, PgAck, PgMiddleware, PgTask, PgTaskId, PostgresStorage,
     };
     use diesel::{
         QueryableByName, RunQueryDsl, sql_query,
@@ -1822,7 +1827,7 @@ mod attempt_accounting {
                 observed
                     .lock()
                     .map_err(|_| std::io::Error::other("handler observation lock poisoned"))?
-                    .push(task.parts.attempt.current());
+                    .push(task.attempt());
                 if fails {
                     Err(std::io::Error::other("handler failure"))
                 } else {
@@ -1832,7 +1837,10 @@ mod attempt_accounting {
             .boxed()
         }
     }
-    // Match the real Worker boundary: PgMiddleware -> ack -> Tracker -> handler.
+    // Match the real Worker boundary: PgMiddleware -> ack -> lifecycle ->
+    // handler. apalis 1.0's lifecycle layer, which counts the attempt, cannot
+    // be built outside a worker, so "tracked" hands the handler the task with
+    // its next attempt, as the lifecycle layer does.
     #[derive(Clone)]
     struct MaybeTracked {
         inner: Handler,
@@ -1841,21 +1849,18 @@ mod attempt_accounting {
     impl Service<PgTask<String>> for MaybeTracked {
         type Response = String;
         type Error = std::io::Error;
-        type Future = Either<
-            <Handler as Service<PgTask<String>>>::Future,
-            AttemptOnPollFuture<<Handler as Service<PgTask<String>>>::Future>,
-        >;
+        type Future = <Handler as Service<PgTask<String>>>::Future;
         fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.inner.poll_ready(cx)
         }
         fn call(&mut self, task: PgTask<String>) -> Self::Future {
-            let attempt = task.parts.attempt.clone();
-            let future = self.inner.call(task);
-            if self.tracked {
-                Either::Right(AttemptOnPollFuture::new(attempt, future))
+            let task = if self.tracked {
+                let next = task.attempt() + 1;
+                task.into_builder().attempt(next).build()
             } else {
-                Either::Left(future)
-            }
+                task
+            };
+            self.inner.call(task)
         }
     }
     #[derive(QueryableByName)]
@@ -1914,7 +1919,7 @@ mod attempt_accounting {
     }
 
     async fn next_claim(
-        stream: &mut apalis_core::backend::TaskStream<PgTask<Vec<u8>>, Error>,
+        stream: &mut apalis_diesel_postgres::TaskStream<PgTask<Vec<u8>>, Error>,
     ) -> Result<PgTask<Vec<u8>>, String> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -1941,7 +1946,7 @@ mod attempt_accounting {
         let (pool, storage) =
             fixture(url, previous, budget, !matches!(entry, Entry::PreclaimedDirect)).await?;
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let worker=WorkerContext::new::<()>("attempt-worker");
+        let worker=WorkerContext::new("attempt-worker");
         let mut stream=matches!(entry,Entry::PreclaimedDirect).then(||storage.clone().poll_compact(&worker));
         let mut service = PgMiddleware::new(&pool, true).layer(MaybeTracked { inner: Handler{ fails, observed: observed.clone() }, tracked:matches!(entry,Entry::Tracked) });
         let count = if fails { budget-previous } else { 1 };
@@ -1957,20 +1962,20 @@ mod attempt_accounting {
             let stored = row(pool.clone()).await?;
             let stored_attempts = stored["attempts"].as_u64().ok_or("missing stored attempts")? as usize;
             let builder = TaskBuilder::new("payload".to_owned())
-                .with_task_id(PgTaskId::new(ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").map_err(|e|e.to_string())?))
-                .with_ctx(PgContext::new().with_queue("attempt-queue".to_owned()))
-                .data(WorkerContext::new::<()>("attempt-worker"));
+                .task_id(PgTaskId::from_ulid(ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").map_err(|e|e.to_string())?))
+                .queue("attempt-queue".to_owned().into())
+                .data(WorkerContext::new("attempt-worker"));
             let mut task = match input {
                 Input::Default => builder.build(),
-                Input::Coherent => builder.with_attempt(Attempt::new_with_value(stored_attempts)).build(),
-                Input::StaleHigh => builder.with_attempt(Attempt::new_with_value(99)).build(),
+                Input::Coherent => builder.attempt(stored_attempts).build(),
+                Input::StaleHigh => builder.attempt(99).build(),
             };
             if let Some(stream)=&mut stream {
                 let compact=next_claim(stream).await?;
-                task=compact.map(|_|"payload".to_owned());
-                task.parts.data.insert(worker.clone());
+                task=compact.map_args(|_|"payload".to_owned());
+                task.inject_data(worker.clone());
             }
-            input_attempts.push(task.parts.attempt.current());
+            input_attempts.push(task.attempt());
             futures::future::poll_fn(|cx| service.poll_ready(cx)).await.map_err(|e|e.to_string())?;
             let result = service.call(task).await;
             let classification = match &result {
@@ -2012,12 +2017,12 @@ mod attempt_accounting {
     async fn acknowledge_cloned_claim() -> Result<support::Outcome<Value>, String> {
         support::with_isolated_database(|url| async move {
             let (pool, storage) = fixture(url, 0, 3, false).await?;
-            let worker = WorkerContext::new::<()>("attempt-worker");
+            let worker = WorkerContext::new("attempt-worker");
             let mut stream = storage.poll_compact(&worker);
             let task = next_claim(&mut stream).await?;
-            let parts = task.parts.clone();
+            let parts = task.ctx().clone();
             drop(task);
-            let input_attempt = parts.attempt.current();
+            let input_attempt = parts.attempt();
             let mut acknowledger = PgAck::new(&pool);
             let result: Result<String, apalis_core::error::BoxDynError> = Ok("accepted".to_owned());
             let first = acknowledger.ack(&result, &parts).await;
@@ -2038,9 +2043,9 @@ mod attempt_accounting {
     async fn acknowledge_cloned_claim_concurrently() -> Result<support::Outcome<Value>, String> {
         support::with_isolated_database(|url| async move {
             let (pool, storage) = fixture(url, 0, 3, false).await?;
-            let worker = WorkerContext::new::<()>("attempt-worker");
+            let worker = WorkerContext::new("attempt-worker");
             let mut stream = storage.poll_compact(&worker);
-            let parts = next_claim(&mut stream).await?.parts;
+            let parts = next_claim(&mut stream).await?.ctx().clone();
             let twin = parts.clone();
             let (mut first, mut second) = (PgAck::new(&pool), PgAck::new(&pool));
             let result: Result<String, apalis_core::error::BoxDynError> = Ok("accepted".to_owned());

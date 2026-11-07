@@ -439,14 +439,16 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
 
     // Spin up the storage stream (it LISTENs).
     let config = Config::new(&queue).set_buffer_size(8).with_poll_interval(
-        apalis_core::backend::poll_strategy::StrategyBuilder::new()
-            .apply(apalis_core::backend::poll_strategy::StreamStrategy::new(
-                futures::stream::pending::<()>(),
-            ))
+        apalis_core::backend::ext::poll_strategy::Strategy::new()
+            .apply(
+                apalis_core::backend::ext::poll_strategy::StreamStrategy::new(
+                    futures::stream::pending::<()>(),
+                ),
+            )
             .build(),
     );
     let storage = PostgresStorage::<String>::new_with_notify(&pool, &config);
-    let worker = WorkerContext::new::<()>(&format!("notify-legacy-worker-{queue}"));
+    let worker = WorkerContext::new(&format!("notify-legacy-worker-{queue}"));
     let mut stream = storage.clone().poll(&worker);
 
     notify_support::wait_for_listeners(&pool, 1).await?;
@@ -489,7 +491,7 @@ async fn run_legacy_payload_decoded() -> Result<Outcome<LegacyShapeRun>, String>
 
     drop(stream);
     let received_id =
-        received.and_then(|t: PgTask<String>| t.parts.task_id.map(|id| id.to_string()));
+        received.and_then(|t: PgTask<String>| t.task_id().cloned().map(|id| id.to_string()));
 
     cleanup_queue(pool, queue).await?;
     Ok(Outcome::Completed(LegacyShapeRun {

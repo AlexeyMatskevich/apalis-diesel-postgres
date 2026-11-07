@@ -130,13 +130,9 @@ async fn run_completion_recovery(
         );
         let mut ids = Vec::new();
         for _ in 0..if partial { 2 } else { 1 } {
-            let id = PgTaskId::new(ulid::Ulid::generate());
+            let id = PgTaskId::from_ulid(ulid::Ulid::generate());
             producer
-                .push_task(
-                    TaskBuilder::new("pending".to_owned())
-                        .with_task_id(id)
-                        .build(),
-                )
+                .push_task(TaskBuilder::new("pending".to_owned()).task_id(id).build())
                 .await
                 .map_err(|e| e.to_string())?;
             ids.push(id);

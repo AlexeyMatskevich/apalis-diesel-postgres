@@ -55,6 +55,9 @@ ulid = { version = "3", features = ["serde"] }
 [dev-dependencies]
 apalis = "1.0.0"
 lets_expect = { version = "0.5", features = ["tokio"] }
+# Tests place a retry layer outside the backend middleware, as apalis
+# before 1.0 ordered them; `WorkerBuilder::retry` now installs it inside.
+tower = { version = "0.5", features = ["retry", "util"] }
 ntex = { version = "3", default-features = false, features = ["neon-polling"] }
 scheduled-thread-pool = "0.2.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

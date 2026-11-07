@@ -574,7 +574,7 @@ mod tests {
     }
     fn prepared_schedule(run_at: u64) -> Result<Vec<i64>, Error> {
         let mut task = PgTask::<CompactType>::new(Vec::new());
-        task.parts.run_at = run_at;
+        task.edit(|t| t.run_at_timestamp(run_at));
         prepare_batch(&Config::new("schedule"), vec![task]).map(|batch| {
             batch
                 .into_iter()

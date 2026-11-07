@@ -299,7 +299,7 @@ async fn run_release(ownership: Ownership, claim: Claim) -> Result<Outcome<Relea
             let successor = match worker::register_worker_blocking(
                 conn,
                 &queue,
-                &WorkerContext::new::<()>(&worker),
+                &WorkerContext::new(&worker),
                 "PostgresStorage",
                 "successor-token",
                 Duration::from_secs(30),
@@ -786,7 +786,7 @@ async fn recover_claim(
                 RecoveryKind::Takeover => worker::register_worker_blocking(
                     conn,
                     &queue,
-                    &WorkerContext::new::<()>(&worker),
+                    &WorkerContext::new(&worker),
                     "PostgresStorage",
                     "successor-token",
                     Duration::from_secs(60),
