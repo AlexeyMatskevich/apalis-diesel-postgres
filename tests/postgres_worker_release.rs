@@ -173,7 +173,7 @@ async fn release_with_unfinished_claim(
         let started = match (&next, consumer) {
             (Some(Ok(Some(task))), Consumer::StartsBeforeRunning) => storage
                 .acknowledger()
-                .start(&task)
+                .start(task)
                 .await
                 .map_err(|error| error.to_string()),
             _ => Ok(()),
@@ -418,9 +418,13 @@ async fn restart_under_the_same_name(
         let first_task = push_with_id(&mut producer, "first deploy", None).await?;
         let (first_run, released) = match handover {
             Handover::Released => {
-                let run =
-                    run_until_done(first.clone(), name, &[first_task.clone()], handled.clone())
-                        .await;
+                let run = run_until_done(
+                    first.clone(),
+                    name,
+                    std::slice::from_ref(&first_task),
+                    handled.clone(),
+                )
+                .await;
                 let released = first.release_worker(name).await.map_err(release_error);
                 (run, released)
             }
@@ -428,7 +432,12 @@ async fn restart_under_the_same_name(
                 let ReleasedRun { outcome, released } = first
                     .run_released(
                         name,
-                        run_until_done(first.clone(), name, &[first_task.clone()], handled.clone()),
+                        run_until_done(
+                            first.clone(),
+                            name,
+                            std::slice::from_ref(&first_task),
+                            handled.clone(),
+                        ),
                     )
                     .await;
                 (outcome, released.map_err(release_error))
@@ -437,14 +446,25 @@ async fn restart_under_the_same_name(
                 run_shared_released(&pool, &queue, name, first_task.clone(), handled.clone()).await
             }
             Handover::Kept => (
-                run_until_done(first.clone(), name, &[first_task.clone()], handled.clone()).await,
+                run_until_done(
+                    first.clone(),
+                    name,
+                    std::slice::from_ref(&first_task),
+                    handled.clone(),
+                )
+                .await,
                 Ok(0),
             ),
         };
         let second = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
         let second_task = push_with_id(&mut producer, "second deploy", None).await?;
-        let second_run =
-            run_until_done(second, name, &[second_task.clone()], handled.clone()).await;
+        let second_run = run_until_done(
+            second,
+            name,
+            std::slice::from_ref(&second_task),
+            handled.clone(),
+        )
+        .await;
         let mut statuses = Vec::new();
         for id in [first_task, second_task] {
             statuses.push(
@@ -859,7 +879,7 @@ async fn retention_after_a_run() -> Result<Outcome<RetentionObservation>, String
         run_until_done(
             storage.clone(),
             "retention-worker",
-            &[done.clone()],
+            std::slice::from_ref(&done),
             handled.clone(),
         )
         .await?;

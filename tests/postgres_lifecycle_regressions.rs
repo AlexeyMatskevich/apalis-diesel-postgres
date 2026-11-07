@@ -756,7 +756,7 @@ mod registered_middleware {
         fn call(&mut self, task: PgTask<String>) -> Self::Future {
             self.effects.fetch_add(1, Ordering::SeqCst);
             self.context.store(
-                task.lock_by().as_deref() == Some("fallback-worker")
+                task.lock_by() == Some("fallback-worker")
                     && task.lock_at().is_some()
                     && task.args == "work",
                 Ordering::SeqCst,

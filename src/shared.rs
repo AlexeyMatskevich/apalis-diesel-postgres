@@ -861,7 +861,11 @@ mod tests {
             ],
         );
         let id = new_task_id();
-        deliver_to_queue(&mut registry, "shared-deliver-fanout", &[id.clone()]);
+        deliver_to_queue(
+            &mut registry,
+            "shared-deliver-fanout",
+            std::slice::from_ref(&id),
+        );
 
         let got_id =
             |receiver: &mut Receiver<PgTaskId>| matches!(receiver.try_recv(), Ok(got) if got == id);

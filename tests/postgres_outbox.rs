@@ -1546,7 +1546,7 @@ async fn run_mixed_idempotency_conflict(seeded: bool) -> Result<Outcome<BatchFai
     let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let q = queue.clone();
     let run = with_conn(pool.clone(),move |conn| {
-        let keyed = |key: &str| { let mut task = PgTask::new("payload".to_owned()); task.edit(|b| b.idempotency_key(key.to_owned()));task };
+        let keyed = |key: &str| { let mut task = PgTask::new("payload".to_owned()); task.edit(|b| b.idempotency_key(key));task };
         if seeded { storage.push_task_with_conn(conn,keyed("duplicate")).map_err(|e|e.to_string())?; }
         let expected_error = conn.transaction::<_,PgError,_>(|conn| {
             let tasks = vec![PgTask::new("without-key".to_owned()),keyed(if seeded {"fresh"} else {"duplicate"}),keyed("duplicate")];
@@ -1889,7 +1889,7 @@ async fn run_concurrent_outbox_contract(
                     .n as i32;
                 let mut task = PgTask::new("first".to_owned());
                 task.edit(|b| b.task_id(first_id.clone()));
-                task.edit(|b| b.idempotency_key("shared-key".to_owned()));
+                task.edit(|b| b.idempotency_key("shared-key"));
                 let returned_id = first_storage.push_task_with_conn(conn, task)?;
                 outbox_marker(conn, &format!("first-{first_queue}"), &first_queue)?;
                 ready_first_tx.send(pid).map_err(|_| {
@@ -1943,7 +1943,7 @@ async fn run_concurrent_outbox_contract(
                 })?;
                 let mut task = PgTask::new("second".to_owned());
                 task.edit(|b| b.task_id(second_id.clone()));
-                task.edit(|b| b.idempotency_key("shared-key".to_owned()));
+                task.edit(|b| b.idempotency_key("shared-key"));
                 let second_result_matches = match second_storage.push_task_with_conn(conn, task) {
                     Ok(id) => !first_commits && id == second_id,
                     Err(PgError::IdempotencyConflict {
