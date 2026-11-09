@@ -11,9 +11,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::config::{DateTime, DateTimeExt};
 use apalis_core::task::task_id::TaskId;
 use apalis_diesel_postgres::{PgPool, PgTaskId};
-use apalis_sql::{DateTime, DateTimeExt};
 use diesel::{
     Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{BigInt, Integer, Nullable, Text, Timestamptz},
@@ -97,7 +97,7 @@ async fn insert_running_row(
     max_attempts: i32,
     last_result: Option<Value>,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec("orphan-target").map_err(|e| e.to_string())?;
     let lock_at = <DateTime as DateTimeExt>::from_unix_timestamp(now_unix() as i64);
@@ -253,7 +253,7 @@ fn register_worker_sql_on(
     lease_token: &str,
     stale_after_secs: i32,
 ) -> Result<usize, crate::Error> {
-    let worker = apalis_core::worker::context::WorkerContext::new::<()>(worker_id);
+    let worker = apalis_core::worker::context::WorkerContext::new(worker_id);
     match crate::queries::worker::register_worker_blocking(
         conn,
         queue,
@@ -302,7 +302,7 @@ async fn keep_alive_sql(
     queue: String,
     lease_token: String,
 ) -> Result<usize, String> {
-    let worker = apalis_core::worker::context::WorkerContext::new::<()>(&worker_id);
+    let worker = apalis_core::worker::context::WorkerContext::new(&worker_id);
     match crate::queries::worker::keep_alive(
         pool,
         crate::Config::new(&queue),
@@ -352,8 +352,8 @@ async fn run_reenqueue(setup: ReenqueueSetup) -> Result<Outcome<ReenqueueRun>, S
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-worker-reenq-{}", Ulid::new());
-    let other_queue = format!("apalis-spec-worker-reenq-other-{}", Ulid::new());
+    let queue = format!("apalis-spec-worker-reenq-{}", Ulid::generate());
+    let other_queue = format!("apalis-spec-worker-reenq-other-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
 
@@ -369,7 +369,7 @@ async fn run_reenqueue(setup: ReenqueueSetup) -> Result<Outcome<ReenqueueRun>, S
         pool.clone(),
         row_queue.clone(),
         worker_id.clone(),
-        Some(format!("token-{}", Ulid::new())),
+        Some(format!("token-{}", Ulid::generate())),
         setup.worker_last_seen_age_secs,
     )
     .await?;
@@ -587,7 +587,7 @@ async fn run_concurrent_reenqueue(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-worker-reenq-conc-{}", Ulid::new());
+    let queue = format!("apalis-spec-worker-reenq-conc-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-reenq-conc-worker-{queue}");
 
@@ -597,7 +597,7 @@ async fn run_concurrent_reenqueue(
         pool.clone(),
         queue.clone(),
         worker_id.clone(),
-        Some(format!("token-{}", Ulid::new())),
+        Some(format!("token-{}", Ulid::generate())),
         10,
     )
     .await?;
@@ -752,7 +752,7 @@ async fn run_register(setup: RegisterSetup) -> Result<Outcome<RegisterRun>, Stri
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-worker-reg-{}", Ulid::new());
+    let queue = format!("apalis-spec-worker-reg-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-reg-worker-{queue}");
 
@@ -866,7 +866,7 @@ async fn run_register_under_advisory_contention() -> Result<Outcome<RegisterRun>
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-worker-reg-lock-{}", Ulid::new());
+    let queue = format!("apalis-spec-worker-reg-lock-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-reg-lock-worker-{queue}");
 
@@ -980,7 +980,7 @@ async fn run_keep_alive(setup: KeepAliveSetup) -> Result<Outcome<KeepAliveRun>, 
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-worker-ka-{}", Ulid::new());
+    let queue = format!("apalis-spec-worker-ka-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-ka-worker-{queue}");
 
@@ -998,7 +998,7 @@ async fn run_keep_alive(setup: KeepAliveSetup) -> Result<Outcome<KeepAliveRun>, 
     }
 
     let caller_id = if setup.fabricate_unknown_worker_id {
-        format!("spec-ka-other-{}", Ulid::new())
+        format!("spec-ka-other-{}", Ulid::generate())
     } else {
         worker_id.clone()
     };
@@ -1082,7 +1082,7 @@ async fn run_overflow_sweep() -> Result<Outcome<OverflowSweepRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-worker-overflow-{}", Ulid::new());
+    let queue = format!("apalis-spec-worker-overflow-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let worker_id = format!("spec-overflow-worker-{queue}");
@@ -1090,7 +1090,7 @@ async fn run_overflow_sweep() -> Result<Outcome<OverflowSweepRun>, String> {
         pool.clone(),
         queue.clone(),
         worker_id.clone(),
-        Some(format!("token-{}", Ulid::new())),
+        Some(format!("token-{}", Ulid::generate())),
         10,
     )
     .await?;
@@ -1283,7 +1283,7 @@ async fn run_bounded_sweep(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-worker-bounded-{}", Ulid::new());
+    let queue = format!("apalis-spec-worker-bounded-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let worker_id = format!("spec-bounded-worker-{queue}");
@@ -1292,7 +1292,7 @@ async fn run_bounded_sweep(
         pool.clone(),
         queue.clone(),
         worker_id.clone(),
-        Some(format!("token-{}", Ulid::new())),
+        Some(format!("token-{}", Ulid::generate())),
         10,
     )
     .await?;

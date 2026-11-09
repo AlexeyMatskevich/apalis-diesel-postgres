@@ -15,12 +15,11 @@
 
 mod support;
 
-use support::{Outcome, observe, with_conn};
+use support::{EditTask, Outcome, observe, with_conn};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use apalis_diesel_postgres::{Config, Error as PgError, PgPool, PgTask, PgTaskId, PostgresStorage};
-use apalis_sql::{DateTimeExt, context::SqlContext};
 use diesel::{
     Connection, OptionalExtension, PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{Integer, Jsonb, Text, Timestamptz},
@@ -78,7 +77,7 @@ struct JobRow {
     #[diesel(sql_type = Integer)]
     max_attempts: i32,
     #[diesel(sql_type = Timestamptz)]
-    run_at: apalis_sql::DateTime,
+    run_at: chrono::DateTime<chrono::Utc>,
     #[diesel(sql_type = Jsonb)]
     metadata: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
@@ -140,7 +139,7 @@ async fn run_commit_scenario() -> Result<Outcome<CommitRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-outbox-commit-{}", Ulid::new());
+    let queue = format!("apalis-outbox-commit-{}", Ulid::generate());
     let key = format!("marker-{queue}");
     cleanup(pool.clone(), queue.clone()).await?;
 
@@ -242,7 +241,7 @@ async fn run_batch_commit_scenario() -> Result<Outcome<BatchRun>, String> {
     };
     // `cleanup` deletes from the business-marker table too, so ensure it exists
     // on a cold database (this scenario runs before any commit/rollback one).
-    let queue = format!("apalis-outbox-batch-{}", Ulid::new());
+    let queue = format!("apalis-outbox-batch-{}", Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
 
     let storage =
@@ -385,7 +384,7 @@ async fn run_rollback_scenario() -> Result<Outcome<RollbackRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-outbox-rollback-{}", Ulid::new());
+    let queue = format!("apalis-outbox-rollback-{}", Ulid::generate());
     let key = format!("marker-{queue}");
     cleanup(pool.clone(), queue.clone()).await?;
 
@@ -504,13 +503,13 @@ async fn run_custom_fields_scenario() -> Result<Outcome<CustomRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-outbox-custom-{}", Ulid::new());
+    let queue = format!("apalis-outbox-custom-{}", Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
 
     let storage =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(1));
 
-    let preassigned_id = PgTaskId::new(Ulid::new());
+    let preassigned_id = PgTaskId::from_ulid(Ulid::generate());
     let expected_run_at_secs = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -528,13 +527,14 @@ async fn run_custom_fields_scenario() -> Result<Outcome<CustomRun>, String> {
 
     let expected_idempotency_key = format!("idem-{queue}");
     let mut task = PgTask::<String>::new("payload".to_owned());
-    task.parts.task_id = Some(preassigned_id);
-    task.parts.run_at = expected_run_at_secs as u64;
-    task.parts.idempotency_key = Some(expected_idempotency_key.clone());
-    task.parts.ctx = SqlContext::new()
-        .with_max_attempts(9)
-        .with_priority(5)
-        .with_meta(expected_metadata.clone());
+    task.edit(|b| b.task_id(preassigned_id.clone()));
+    task.edit(|b| b.run_at_timestamp(expected_run_at_secs as u64));
+    task.edit(|b| b.idempotency_key(expected_idempotency_key.clone()));
+    task.edit(|b| {
+        b.max_attempts(9)
+            .priority(5)
+            .with_metadata(support::metadata_store(&expected_metadata.clone()))
+    });
 
     let storage_for_txn = storage.clone();
     let pool_for_txn = pool.clone();
@@ -553,7 +553,7 @@ async fn run_custom_fields_scenario() -> Result<Outcome<CustomRun>, String> {
     })
     .await?;
 
-    let db_run_at_secs = row.run_at.to_unix_timestamp();
+    let db_run_at_secs = row.run_at.timestamp();
 
     cleanup(pool, queue).await?;
     Ok(Outcome::Completed(CustomRun {
@@ -628,7 +628,9 @@ fn custom_run_at_is_stored() -> impl Fn(&Result<Outcome<CustomRun>, String>) -> 
 
 fn custom_metadata_is_stored() -> impl Fn(&Result<Outcome<CustomRun>, String>) -> AssertionResult {
     observe("custom→metadata", |run: &CustomRun| {
-        let expected = serde_json::json!({ "reason": "test", "n": 7 });
+        // apalis 1.0 task metadata is a string-to-string store, so a
+        // non-string value is stored as its JSON text.
+        let expected = serde_json::json!({ "reason": "test", "n": "7" });
         if run.db_metadata == expected {
             Ok(())
         } else {
@@ -704,7 +706,7 @@ async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, S
     // expands each `to` into its own test, and test execution order is not
     // guaranteed, so this scenario cannot rely on another one having already
     // created the table on a cold database.
-    let queue = format!("apalis-outbox-batch-custom-{}", Ulid::new());
+    let queue = format!("apalis-outbox-batch-custom-{}", Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
 
     let storage =
@@ -716,8 +718,8 @@ async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, S
         .as_secs() as i64;
 
     // Two fully-populated tasks that differ in EVERY custom field.
-    let id_a = PgTaskId::new(Ulid::new());
-    let id_b = PgTaskId::new(Ulid::new());
+    let id_a = PgTaskId::from_ulid(Ulid::generate());
+    let id_b = PgTaskId::from_ulid(Ulid::generate());
     let run_at_a = now_secs + 3_600;
     let run_at_b = now_secs + 7_200;
     let meta_a = serde_json::json!({ "which": "a", "n": 1 });
@@ -726,22 +728,28 @@ async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, S
     let idem_b = format!("idem-b-{queue}");
 
     let mut task_a = PgTask::<String>::new("payload-a".to_owned());
-    task_a.parts.task_id = Some(id_a);
-    task_a.parts.run_at = run_at_a as u64;
-    task_a.parts.idempotency_key = Some(idem_a.clone());
-    task_a.parts.ctx = SqlContext::new()
-        .with_max_attempts(3)
-        .with_priority(1)
-        .with_meta(meta_a.as_object().unwrap().clone());
+    task_a.edit(|b| b.task_id(id_a.clone()));
+    task_a.edit(|b| b.run_at_timestamp(run_at_a as u64));
+    task_a.edit(|b| b.idempotency_key(idem_a.clone()));
+    task_a.edit(|b| {
+        b.max_attempts(3)
+            .priority(1)
+            .with_metadata(support::metadata_store(
+                &meta_a.as_object().unwrap().clone(),
+            ))
+    });
 
     let mut task_b = PgTask::<String>::new("payload-b".to_owned());
-    task_b.parts.task_id = Some(id_b);
-    task_b.parts.run_at = run_at_b as u64;
-    task_b.parts.idempotency_key = Some(idem_b.clone());
-    task_b.parts.ctx = SqlContext::new()
-        .with_max_attempts(8)
-        .with_priority(6)
-        .with_meta(meta_b.as_object().unwrap().clone());
+    task_b.edit(|b| b.task_id(id_b.clone()));
+    task_b.edit(|b| b.run_at_timestamp(run_at_b as u64));
+    task_b.edit(|b| b.idempotency_key(idem_b.clone()));
+    task_b.edit(|b| {
+        b.max_attempts(8)
+            .priority(6)
+            .with_metadata(support::metadata_store(
+                &meta_b.as_object().unwrap().clone(),
+            ))
+    });
 
     let expected = vec![
         BatchCustomTaskExpectation {
@@ -749,7 +757,8 @@ async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, S
             priority: 1,
             max_attempts: 3,
             run_at_secs: run_at_a,
-            metadata: meta_a.clone(),
+            // Stored through apalis 1.0's string-valued metadata store.
+            metadata: serde_json::json!({ "which": "a", "n": "1" }),
             idempotency_key: idem_a,
         },
         BatchCustomTaskExpectation {
@@ -757,7 +766,7 @@ async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, S
             priority: 6,
             max_attempts: 8,
             run_at_secs: run_at_b,
-            metadata: meta_b.clone(),
+            metadata: serde_json::json!({ "which": "b", "n": "2" }),
             idempotency_key: idem_b,
         },
     ];
@@ -791,7 +800,7 @@ async fn run_batch_custom_fields_scenario() -> Result<Outcome<BatchCustomRun>, S
             .map(|r| BatchCustomTaskObserved {
                 priority: r.priority,
                 max_attempts: r.max_attempts,
-                run_at_secs: r.run_at.to_unix_timestamp(),
+                run_at_secs: r.run_at.timestamp(),
                 metadata: r.metadata,
                 idempotency_key: r.idempotency_key,
             });
@@ -895,7 +904,7 @@ async fn run_empty_batch_scenario() -> Result<Outcome<EmptyBatchRun>, String> {
     };
     // `cleanup` deletes from the business-marker table too; see the comment
     // in `run_batch_custom_fields_scenario`.
-    let queue = format!("apalis-outbox-empty-{}", Ulid::new());
+    let queue = format!("apalis-outbox-empty-{}", Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
 
     let storage =
@@ -1001,7 +1010,7 @@ impl apalis_core::backend::codec::Codec<String> for FailingEncodeCodec {
     type Error = FailingEncodeError;
     type Compact = Vec<u8>;
 
-    fn encode(val: &String) -> Result<Self::Compact, Self::Error> {
+    fn encode(&self, val: &String) -> Result<Self::Compact, Self::Error> {
         if val == "valid" {
             Ok(b"\"valid\"".to_vec())
         } else {
@@ -1009,7 +1018,7 @@ impl apalis_core::backend::codec::Codec<String> for FailingEncodeCodec {
         }
     }
 
-    fn decode(_val: &Self::Compact) -> Result<String, Self::Error> {
+    fn decode(&self, _val: &Self::Compact) -> Result<String, Self::Error> {
         Err(FailingEncodeError)
     }
 }
@@ -1029,7 +1038,7 @@ async fn run_encode_failure_scenario() -> Result<Outcome<EncodeFailureRun>, Stri
     };
     // `cleanup` deletes from the business-marker table too; see the comment
     // in `run_batch_custom_fields_scenario`.
-    let queue = format!("apalis-outbox-encode-fail-{}", Ulid::new());
+    let queue = format!("apalis-outbox-encode-fail-{}", Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
 
     let storage =
@@ -1047,13 +1056,13 @@ async fn run_encode_failure_scenario() -> Result<Outcome<EncodeFailureRun>, Stri
             let a = is_decode(storage.push_with_conn(&mut conn, "x".to_owned()));
 
             let mut task = PgTask::<String>::new("x".to_owned());
-            task.parts.task_id = Some(PgTaskId::new(Ulid::new()));
+            task.edit(|b| b.task_id(PgTaskId::from_ulid(Ulid::generate()).clone()));
             let b = is_decode(storage.push_task_with_conn(&mut conn, task));
 
             let c = is_decode(storage.push_batch_with_conn(&mut conn, vec!["x".to_owned()]));
 
             let mut task2 = PgTask::<String>::new("x".to_owned());
-            task2.parts.task_id = Some(PgTaskId::new(Ulid::new()));
+            task2.edit(|b| b.task_id(PgTaskId::from_ulid(Ulid::generate()).clone()));
             let d = is_decode(storage.push_tasks_with_conn(&mut conn, vec![task2]));
 
             Ok((a, b, c, d))
@@ -1131,7 +1140,7 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-outbox-conflict-{}", Ulid::new());
+    let queue = format!("apalis-outbox-conflict-{}", Ulid::generate());
     let key = format!("marker-{queue}");
     let idem = format!("idem-{queue}");
     cleanup(pool.clone(), queue.clone()).await?;
@@ -1148,7 +1157,7 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut conn = pool_for_seed.get().map_err(|e| e.to_string())?;
             let mut task = PgTask::<String>::new("payload-1".to_owned());
-            task.parts.idempotency_key = Some(idem_for_seed);
+            task.edit(|b| b.idempotency_key(idem_for_seed));
             conn.transaction::<_, PgError, _>(|c| storage.push_task_with_conn(c, task).map(|_| ()))
                 .map_err(|e| e.to_string())
         })
@@ -1176,7 +1185,7 @@ async fn run_conflict_scenario() -> Result<Outcome<ConflictRun>, String> {
                     .bind::<Text, _>(&q)
                     .execute(c)?;
                 let mut task = PgTask::<String>::new("payload-2".to_owned());
-                task.parts.idempotency_key = Some(idem_for_run.clone());
+                task.edit(|b| b.idempotency_key(idem_for_run.clone()));
                 match storage_for_run.push_task_with_conn(c, task) {
                     Ok(_) => {
                         return Err(PgError::InvalidArgument(
@@ -1279,13 +1288,13 @@ async fn run_pk_conflict_scenario() -> Result<Outcome<PkConflictRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-outbox-pk-conflict-{}", Ulid::new());
+    let queue = format!("apalis-outbox-pk-conflict-{}", Ulid::generate());
     let key = format!("marker-{queue}");
     cleanup(pool.clone(), queue.clone()).await?;
 
     let storage =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue).set_buffer_size(1));
-    let duplicate_id = PgTaskId::new(Ulid::new());
+    let duplicate_id = PgTaskId::from_ulid(Ulid::generate());
 
     // Seed: a first task occupying the caller-supplied id, committed in its
     // own transaction before the conflict scenario starts. No idempotency
@@ -1293,11 +1302,11 @@ async fn run_pk_conflict_scenario() -> Result<Outcome<PkConflictRun>, String> {
     {
         let storage = storage.clone();
         let pool_for_seed = pool.clone();
-        let seed_id = duplicate_id;
+        let seed_id = duplicate_id.clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut conn = pool_for_seed.get().map_err(|e| e.to_string())?;
             let mut task = PgTask::<String>::new("payload-1".to_owned());
-            task.parts.task_id = Some(seed_id);
+            task.edit(|b| b.task_id(seed_id.clone()));
             conn.transaction::<_, PgError, _>(|c| storage.push_task_with_conn(c, task).map(|_| ()))
                 .map_err(|e| e.to_string())
         })
@@ -1324,7 +1333,7 @@ async fn run_pk_conflict_scenario() -> Result<Outcome<PkConflictRun>, String> {
                     .bind::<Text, _>(&q)
                     .execute(c)?;
                 let mut task = PgTask::<String>::new("payload-2".to_owned());
-                task.parts.task_id = Some(duplicate_id);
+                task.edit(|b| b.task_id(duplicate_id.clone()));
                 match storage_for_run.push_task_with_conn(c, task) {
                     Ok(_) => {
                         return Err(PgError::InvalidArgument(
@@ -1421,13 +1430,13 @@ async fn run_schedule_scenario(seconds: u64, mixed: bool) -> Result<Outcome<Sche
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("outbox-schedule-{}", Ulid::new());
+    let queue = format!("outbox-schedule-{}", Ulid::generate());
     let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let q = queue.clone();
     let run = with_conn(pool.clone(),move |conn| {
         let accepted = conn.transaction::<_,PgError,_>(|conn| {
             let mut scheduled = PgTask::new("scheduled".to_owned());
-            scheduled.parts.run_at = seconds;
+            scheduled.edit(|b| b.run_at_timestamp(seconds));
             let result = if mixed { storage.push_tasks_with_conn(conn,vec![PgTask::new("valid".to_owned()),scheduled]).map(|_|()) }
                          else { storage.push_task_with_conn(conn,scheduled).map(|_|()) };
             let accepted = match result { Ok(()) => true, Err(PgError::InvalidArgument(message)) if message.contains("run_at") => false,
@@ -1492,7 +1501,7 @@ async fn run_late_encoding_failure(full_tasks: bool) -> Result<Outcome<BatchFail
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("outbox-codec-prefix-{}", Ulid::new());
+    let queue = format!("outbox-codec-prefix-{}", Ulid::generate());
     let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue))
         .with_codec::<FailingEncodeCodec>();
     let q = queue.clone();
@@ -1533,11 +1542,11 @@ async fn run_mixed_idempotency_conflict(seeded: bool) -> Result<Outcome<BatchFai
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("outbox-mixed-key-{}", Ulid::new());
+    let queue = format!("outbox-mixed-key-{}", Ulid::generate());
     let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let q = queue.clone();
     let run = with_conn(pool.clone(),move |conn| {
-        let keyed = |key: &str| { let mut task = PgTask::new("payload".to_owned()); task.parts.idempotency_key=Some(key.to_owned());task };
+        let keyed = |key: &str| { let mut task = PgTask::new("payload".to_owned()); task.edit(|b| b.idempotency_key(key));task };
         if seeded { storage.push_task_with_conn(conn,keyed("duplicate")).map_err(|e|e.to_string())?; }
         let expected_error = conn.transaction::<_,PgError,_>(|conn| {
             let tasks = vec![PgTask::new("without-key".to_owned()),keyed(if seeded {"fresh"} else {"duplicate"}),keyed("duplicate")];
@@ -1750,7 +1759,7 @@ async fn run_batch_rollback_contract(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("outbox-batch-rollback-{}", Ulid::new());
+    let queue = format!("outbox-batch-rollback-{}", Ulid::generate());
     let storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let q = queue.clone();
     let prepared = with_conn(pool.clone(), move |conn| {
@@ -1857,9 +1866,9 @@ async fn run_concurrent_outbox_contract(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("outbox-concurrent-{}", Ulid::new());
-    let first_id = PgTaskId::new(Ulid::new());
-    let second_id = PgTaskId::new(Ulid::new());
+    let queue = format!("outbox-concurrent-{}", Ulid::generate());
+    let first_id = PgTaskId::from_ulid(Ulid::generate());
+    let second_id = PgTaskId::from_ulid(Ulid::generate());
     let first_storage = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let second_storage = first_storage.clone();
     let first_pool = pool.clone();
@@ -1869,40 +1878,43 @@ async fn run_concurrent_outbox_contract(
     let (ready_first_tx, ready_first_rx) = tokio::sync::oneshot::channel();
     let (ready_second_tx, ready_second_rx) = tokio::sync::oneshot::channel();
     let (release_first_tx, release_first_rx) = std::sync::mpsc::channel::<bool>();
-    let first = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        let mut conn = first_pool.get().map_err(|e| e.to_string())?;
-        let result = conn.transaction::<_, PgError, _>(|conn| {
-            sql_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(conn)?;
-            let pid = sql_query("SELECT pg_backend_pid()::bigint AS n")
-                .get_result::<CountRow>(conn)?
-                .n as i32;
-            let mut task = PgTask::new("first".to_owned());
-            task.parts.task_id = Some(first_id);
-            task.parts.idempotency_key = Some("shared-key".to_owned());
-            let returned_id = first_storage.push_task_with_conn(conn, task)?;
-            outbox_marker(conn, &format!("first-{first_queue}"), &first_queue)?;
-            ready_first_tx
-                .send(pid)
-                .map_err(|_| PgError::InvalidArgument("first sender observer closed".to_owned()))?;
-            // A dropped controller rolls back; a bounded wait prevents stranding a SQL transaction.
-            let commit = release_first_rx
-                .recv_timeout(std::time::Duration::from_secs(15))
-                .map_err(|e| {
-                    PgError::InvalidArgument(format!("first sender was not released: {e}"))
+    let first = tokio::task::spawn_blocking({
+        let first_id = first_id.clone();
+        move || -> Result<bool, String> {
+            let mut conn = first_pool.get().map_err(|e| e.to_string())?;
+            let result = conn.transaction::<_, PgError, _>(|conn| {
+                sql_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(conn)?;
+                let pid = sql_query("SELECT pg_backend_pid()::bigint AS n")
+                    .get_result::<CountRow>(conn)?
+                    .n as i32;
+                let mut task = PgTask::new("first".to_owned());
+                task.edit(|b| b.task_id(first_id.clone()));
+                task.edit(|b| b.idempotency_key("shared-key"));
+                let returned_id = first_storage.push_task_with_conn(conn, task)?;
+                outbox_marker(conn, &format!("first-{first_queue}"), &first_queue)?;
+                ready_first_tx.send(pid).map_err(|_| {
+                    PgError::InvalidArgument("first sender observer closed".to_owned())
                 })?;
-            if commit {
-                Ok(returned_id == first_id)
-            } else {
-                Err(diesel::result::Error::RollbackTransaction.into())
+                // A dropped controller rolls back; a bounded wait prevents stranding a SQL transaction.
+                let commit = release_first_rx
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .map_err(|e| {
+                        PgError::InvalidArgument(format!("first sender was not released: {e}"))
+                    })?;
+                if commit {
+                    Ok(returned_id == first_id)
+                } else {
+                    Err(diesel::result::Error::RollbackTransaction.into())
+                }
+            });
+            match result {
+                Ok(ids_match) if first_commits => Ok(ids_match),
+                Err(PgError::Database {
+                    source: diesel::result::Error::RollbackTransaction,
+                    ..
+                }) if !first_commits => Ok(true),
+                other => Err(format!("unexpected first sender completion: {other:?}")),
             }
-        });
-        match result {
-            Ok(ids_match) if first_commits => Ok(ids_match),
-            Err(PgError::Database {
-                source: diesel::result::Error::RollbackTransaction,
-                ..
-            }) if !first_commits => Ok(true),
-            other => Err(format!("unexpected first sender completion: {other:?}")),
         }
     });
     let first_pid = match ready_first_rx.await {
@@ -1916,39 +1928,42 @@ async fn run_concurrent_outbox_contract(
             ));
         }
     };
-    let second = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        let mut conn = second_pool.get().map_err(|e| e.to_string())?;
-        conn.transaction::<_, PgError, _>(|conn| {
-            sql_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(conn)?;
-            sql_query("SET LOCAL statement_timeout = '10s'").execute(conn)?;
-            let pid = sql_query("SELECT pg_backend_pid()::bigint AS n")
-                .get_result::<CountRow>(conn)?
-                .n as i32;
-            ready_second_tx.send(pid).map_err(|_| {
-                PgError::InvalidArgument("second sender observer closed".to_owned())
-            })?;
-            let mut task = PgTask::new("second".to_owned());
-            task.parts.task_id = Some(second_id);
-            task.parts.idempotency_key = Some("shared-key".to_owned());
-            let second_result_matches = match second_storage.push_task_with_conn(conn, task) {
-                Ok(id) => !first_commits && id == second_id,
-                Err(PgError::IdempotencyConflict {
-                    job_type,
-                    conflicting_keys,
-                    total,
-                }) => {
-                    first_commits
-                        && job_type == second_queue
-                        && conflicting_keys == ["shared-key"]
-                        && total == 1
-                }
-                Err(error) => return Err(error),
-            };
-            // A caught duplicate must leave the caller's business transaction usable.
-            outbox_marker(conn, &format!("second-{second_queue}"), &second_queue)?;
-            Ok(second_result_matches)
-        })
-        .map_err(|e| e.to_string())
+    let second = tokio::task::spawn_blocking({
+        let second_id = second_id.clone();
+        move || -> Result<bool, String> {
+            let mut conn = second_pool.get().map_err(|e| e.to_string())?;
+            conn.transaction::<_, PgError, _>(|conn| {
+                sql_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(conn)?;
+                sql_query("SET LOCAL statement_timeout = '10s'").execute(conn)?;
+                let pid = sql_query("SELECT pg_backend_pid()::bigint AS n")
+                    .get_result::<CountRow>(conn)?
+                    .n as i32;
+                ready_second_tx.send(pid).map_err(|_| {
+                    PgError::InvalidArgument("second sender observer closed".to_owned())
+                })?;
+                let mut task = PgTask::new("second".to_owned());
+                task.edit(|b| b.task_id(second_id.clone()));
+                task.edit(|b| b.idempotency_key("shared-key"));
+                let second_result_matches = match second_storage.push_task_with_conn(conn, task) {
+                    Ok(id) => !first_commits && id == second_id,
+                    Err(PgError::IdempotencyConflict {
+                        job_type,
+                        conflicting_keys,
+                        total,
+                    }) => {
+                        first_commits
+                            && job_type == second_queue
+                            && conflicting_keys == ["shared-key"]
+                            && total == 1
+                    }
+                    Err(error) => return Err(error),
+                };
+                // A caught duplicate must leave the caller's business transaction usable.
+                outbox_marker(conn, &format!("second-{second_queue}"), &second_queue)?;
+                Ok(second_result_matches)
+            })
+            .map_err(|e| e.to_string())
+        }
     });
     let second_pid = ready_second_rx.await.map_err(|e| e.to_string());
     let blocked = match second_pid {
@@ -2032,25 +2047,28 @@ async fn run_cross_queue_identity_contract(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let first_queue = format!("outbox-identity-first-{}", Ulid::new());
-    let second_queue = format!("outbox-identity-second-{}", Ulid::new());
+    let first_queue = format!("outbox-identity-first-{}", Ulid::generate());
+    let second_queue = format!("outbox-identity-second-{}", Ulid::generate());
     let first_storage =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&first_queue));
     let second_storage =
         PostgresStorage::<String>::new_with_config(&pool, &Config::new(&second_queue));
-    let first_id = PgTaskId::new(Ulid::new());
+    let first_id = PgTaskId::from_ulid(Ulid::generate());
     let second_id = if same_task_id {
-        first_id
+        first_id.clone()
     } else {
-        PgTaskId::new(Ulid::new())
+        PgTaskId::from_ulid(Ulid::generate())
     };
     let key = (!same_task_id).then(|| "shared-key".to_owned());
     let q1 = first_queue.clone();
     let q2 = second_queue.clone();
     let run = with_conn(pool.clone(), move |conn| {
         let mut first_task = PgTask::new("first".to_owned());
-        first_task.parts.task_id = Some(first_id);
-        first_task.parts.idempotency_key = key.clone();
+        first_task.edit(|b| b.task_id(first_id.clone()));
+        first_task.edit(|b| match key.clone() {
+            Some(key) => b.idempotency_key(key),
+            None => b,
+        });
         let first_result_matches = conn
             .transaction::<_, PgError, _>(|conn| {
                 let returned = first_storage.push_task_with_conn(conn, first_task)?;
@@ -2059,8 +2077,11 @@ async fn run_cross_queue_identity_contract(
             })
             .map_err(|e| e.to_string())?;
         let mut second_task = PgTask::new("second".to_owned());
-        second_task.parts.task_id = Some(second_id);
-        second_task.parts.idempotency_key = key.clone();
+        second_task.edit(|b| b.task_id(second_id.clone()));
+        second_task.edit(|b| match key.clone() {
+            Some(key) => b.idempotency_key(key),
+            None => b,
+        });
         let second_result_matches = conn
             .transaction::<_, PgError, _>(|conn| {
                 let outcome = match second_storage.push_task_with_conn(conn, second_task) {

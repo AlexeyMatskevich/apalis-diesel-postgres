@@ -2,15 +2,22 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
-use std::{fmt::Debug, future::Future, marker::PhantomData, time::Duration};
+use std::{
+    fmt::Debug,
+    future::Future,
+    marker::PhantomData,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 pub use apalis_codec::json::JsonCodec;
 use apalis_core::{
-    backend::{Backend, BackendExt, TaskStream, codec::Codec, queue::Queue},
-    task::{Task, task_id::TaskId},
+    backend::{
+        Backend, BackendConfig, WireFormatBackend, codec::Codec, finalize::Durable, queue::Queue,
+    },
+    task::{Task, builder::TaskBuilder, task_id::TaskId},
     worker::context::WorkerContext,
 };
-pub use apalis_sql::{config::Config, from_row::TaskRow};
 use diesel::{
     PgConnection,
     r2d2::{ConnectionManager, Pool},
@@ -20,8 +27,9 @@ use ulid::Ulid;
 
 pub use crate::{
     ack::{PgAck, PgMiddleware, lock_task, lock_task_in_queue},
+    config::Config,
     error::Error,
-    fetcher::{PgFetcher, PgNotify},
+    fetcher::{PgFetcher, PgNotify, TaskStream},
     lifecycle::{refresh_queue_stats_snapshot, setup, verify_schema},
     pool::{build_pool, build_pool_with},
     queries::migrations::MIGRATIONS,
@@ -38,6 +46,7 @@ mod ack;
 mod admin;
 #[cfg(all(test, feature = "tokio"))]
 mod async_specs;
+mod config;
 mod error;
 mod fetcher;
 mod lease;
@@ -70,12 +79,11 @@ pub mod schema;
 
 /// Diesel/r2d2 PostgreSQL pool accepted by this backend.
 pub type PgPool = Pool<ConnectionManager<PgConnection>>;
-/// SQL context associated with PostgreSQL tasks.
-pub type PgContext = apalis_sql::context::SqlContext<PgPool>;
 /// Apalis task stored in PostgreSQL.
-pub type PgTask<Args> = Task<Args, PgContext, Ulid>;
-/// PostgreSQL task identifier.
-pub type PgTaskId = TaskId<Ulid>;
+pub type PgTask<Args> = Task<Args>;
+/// PostgreSQL task identifier. Tasks of this backend always carry a
+/// [`TaskId::Ulid`].
+pub type PgTaskId = TaskId;
 /// Compact serialized payload representation.
 pub type CompactType = Vec<u8>;
 
@@ -181,7 +189,8 @@ pub struct PostgresStorage<
     _marker: PhantomData<(Args, Codec)>,
     pub(crate) pool: PgPool,
     pub(crate) config: Config,
-    pub(crate) fetcher: Fetcher,
+    /// Taken by the first worker that polls this storage.
+    pub(crate) fetcher: Option<Fetcher>,
     pub(crate) sink: PgSink<Args, Codec>,
     /// Registration token generated per storage instance and shared by clones.
     /// Managed operations check it to fence older registrations. This is not an
@@ -189,6 +198,34 @@ pub struct PostgresStorage<
     pub(crate) lease_token: std::sync::Arc<str>,
     pub(crate) leases: crate::lease::LeaseRegistry,
     pub(crate) poll_factory: Option<crate::fetcher::PollStrategyFactory>,
+    pub(crate) codec: Codec,
+    /// The heartbeat and task streams of the worker this storage was handed
+    /// to, built on that worker's first poll. A clone starts without them.
+    pub(crate) active: ActiveStreams<Args>,
+}
+
+/// The streams apalis drives through `Backend::poll_ready` (heartbeat) and
+/// `Backend::poll_next` (tasks). apalis 1.0 polls the backend itself instead
+/// of taking streams from it, so the storage keeps them between polls.
+///
+/// Each stream sits in a `Mutex` only so the storage stays `Sync`; `&mut
+/// self` polling reaches it through `get_mut` without locking.
+pub(crate) struct ActiveStreams<Args> {
+    heartbeat: std::sync::Mutex<Option<futures::stream::BoxStream<'static, Result<(), Error>>>>,
+    tasks: std::sync::Mutex<Option<crate::fetcher::TaskStream<PgTask<CompactType>, Error>>>,
+    heartbeat_ended: bool,
+    _marker: PhantomData<fn() -> Args>,
+}
+
+impl<Args> Default for ActiveStreams<Args> {
+    fn default() -> Self {
+        Self {
+            heartbeat: std::sync::Mutex::new(None),
+            tasks: std::sync::Mutex::new(None),
+            heartbeat_ended: false,
+            _marker: PhantomData,
+        }
+    }
 }
 
 // Manual Unpin requires Fetcher: Unpin so pinning guarantees from a
@@ -206,7 +243,7 @@ impl<Args, Codec, Fetcher: Debug> Debug for PostgresStorage<Args, Codec, Fetcher
     }
 }
 
-impl<Args, Codec, Fetcher: Clone> Clone for PostgresStorage<Args, Codec, Fetcher> {
+impl<Args, Codec: Clone, Fetcher: Clone> Clone for PostgresStorage<Args, Codec, Fetcher> {
     fn clone(&self) -> Self {
         Self {
             _marker: PhantomData,
@@ -217,6 +254,8 @@ impl<Args, Codec, Fetcher: Clone> Clone for PostgresStorage<Args, Codec, Fetcher
             lease_token: self.lease_token.clone(),
             leases: self.leases.clone(),
             poll_factory: self.poll_factory.clone(),
+            codec: self.codec.clone(),
+            active: ActiveStreams::default(),
         }
     }
 }
@@ -235,14 +274,9 @@ impl<Args> PostgresStorage<Args> {
     pub fn new(pool: &PgPool) -> Self {
         let config = Config::new(std::any::type_name::<Args>());
         Self::new_with_config(pool, &config)
-            .with_poll_strategy_factory(|| Config::default().poll_strategy().clone())
     }
 
-    /// Create storage with an explicit Apalis SQL config.
-    ///
-    /// The config carries a single-use polling strategy, shared by its clones.
-    /// Before creating multiple worker streams from this config or storage, set
-    /// [`Self::with_poll_strategy_factory`] to build a fresh strategy per stream.
+    /// Create storage with an explicit config.
     ///
     /// **Do not share `pool` with HTTP request handlers or other unrelated
     /// workloads** — see [`Self::new`] for the rationale.
@@ -252,19 +286,17 @@ impl<Args> PostgresStorage<Args> {
             _marker: PhantomData,
             pool: pool.clone(),
             config: config.clone(),
-            fetcher: PgFetcher::default(),
+            fetcher: Some(PgFetcher::default()),
             sink: PgSink::new(pool, config),
             lease_token: queries::worker::mint_lease_token().into(),
             leases: Default::default(),
             poll_factory: None,
+            codec: JsonCodec::default(),
+            active: ActiveStreams::default(),
         }
     }
 
     /// Create storage that also listens for PostgreSQL notifications.
-    ///
-    /// The config carries a single-use polling strategy, shared by its clones.
-    /// Before creating multiple worker streams from this config or storage, set
-    /// [`Self::with_poll_strategy_factory`] to build a fresh strategy per stream.
     ///
     /// Notify mode uses a dedicated pooled connection for `LISTEN
     /// "apalis::job::insert"` while the polling stream is alive. **Each active
@@ -286,11 +318,13 @@ impl<Args> PostgresStorage<Args> {
             _marker: PhantomData,
             pool: pool.clone(),
             config: config.clone(),
-            fetcher: PgNotify,
+            fetcher: Some(PgNotify),
             sink: PgSink::new(pool, config),
             lease_token: queries::worker::mint_lease_token().into(),
             leases: Default::default(),
             poll_factory: None,
+            codec: JsonCodec::default(),
+            active: ActiveStreams::default(),
         }
     }
 
@@ -308,6 +342,13 @@ impl<Args> PostgresStorage<Args> {
 }
 
 impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
+    /// The queue this storage pushes to and polls, as apalis-sql's
+    /// `BackendExt::get_queue` returned it.
+    #[must_use]
+    pub fn get_queue(&self) -> Queue {
+        self.config.queue().clone()
+    }
+
     /// An acknowledger bound to this storage's registration token and local
     /// liveness, for manual acknowledgement of tasks claimed by this
     /// storage's worker streams.
@@ -489,7 +530,7 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     /// buffer holds already-encoded compact tasks, so switching the codec
     /// must not silently drop them).
     #[must_use]
-    pub fn with_codec<NewCodec>(self) -> PostgresStorage<Args, NewCodec, Fetcher> {
+    pub fn with_codec<NewCodec: Default>(self) -> PostgresStorage<Args, NewCodec, Fetcher> {
         PostgresStorage {
             _marker: PhantomData,
             sink: self.sink.retype(),
@@ -499,18 +540,21 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
             lease_token: self.lease_token,
             leases: self.leases,
             poll_factory: self.poll_factory,
+            codec: NewCodec::default(),
+            active: ActiveStreams::default(),
         }
     }
 
-    /// Build an independent polling strategy for each worker stream.
+    /// Use the strategy `factory` builds to decide when to poll, instead of
+    /// the config's.
     ///
-    /// Apalis SQL `Config` carries a single-use strategy even when cloned.
-    /// Supply a factory when reusing a configured storage for multiple workers.
-    /// The factory is called once per stream with its own polling context.
+    /// The factory runs once per worker stream, so each worker gets an
+    /// independent strategy. [`Config::with_poll_strategy`] does the same for
+    /// every storage made from a config.
     ///
     /// ```no_run
     /// use std::time::Duration;
-    /// use apalis_core::backend::poll_strategy::IntervalStrategy;
+    /// use apalis_core::backend::ext::poll_strategy::IntervalStrategy;
     /// # use apalis_diesel_postgres::{PostgresStorage, PgPool};
     /// # fn example(pool: &PgPool) {
     /// let storage = PostgresStorage::<String>::new(pool)
@@ -521,8 +565,7 @@ impl<Args, Codec, Fetcher> PostgresStorage<Args, Codec, Fetcher> {
     pub fn with_poll_strategy_factory<F, S>(mut self, factory: F) -> Self
     where
         F: Fn() -> S + Send + Sync + 'static,
-        S: apalis_core::backend::poll_strategy::PollStrategy + 'static,
-        S::Stream: Send + 'static,
+        S: apalis_core::backend::ext::poll_strategy::PollStrategy + Send + Sync + 'static,
     {
         self.poll_factory = Some(crate::fetcher::PollStrategyFactory::new(factory));
         self
@@ -605,10 +648,12 @@ where
     ///   metadata exceeds its byte cap, or for unreachable `run_at`.
     /// - [`Error::Database`] for SQL/driver failures.
     pub fn push_with_conn(&self, conn: &mut PgConnection, args: Args) -> Result<PgTaskId, Error> {
-        let encoded = EncodeCodec::encode(&args).map_err(|err| Error::Decode(Box::new(err)))?;
-        let task_id = PgTaskId::new(Ulid::new());
-        let mut task = PgTask::<CompactType>::new(encoded);
-        task.parts.task_id = Some(task_id);
+        let encoded = self
+            .codec
+            .encode(&args)
+            .map_err(|err| Error::Decode(Box::new(err)))?;
+        let task_id = PgTaskId::from_ulid(Ulid::generate());
+        let task = TaskBuilder::new(encoded).task_id(task_id.clone()).build();
         queries::push_tasks_on_conn(conn, &self.config, vec![task])?;
         Ok(task_id)
     }
@@ -621,8 +666,9 @@ where
     /// Semantics are identical to [`Self::push_with_conn`]; see that method's
     /// docs for the transaction/NOTIFY contract.
     ///
-    /// If `task.parts.task_id` is `None`, a fresh Ulid is generated and
-    /// returned. If `Some`, that id is used as-is and echoed back.
+    /// If the task has no `task_id`, a fresh Ulid is generated and returned.
+    /// Otherwise that id is used as-is and echoed back; it must be a
+    /// [`TaskId::Ulid`].
     ///
     /// # Errors
     /// - [`Error::Decode`] if the codec rejects the task's `args`.
@@ -638,17 +684,7 @@ where
         conn: &mut PgConnection,
         task: PgTask<Args>,
     ) -> Result<PgTaskId, Error> {
-        let encoded =
-            EncodeCodec::encode(&task.args).map_err(|err| Error::Decode(Box::new(err)))?;
-        let task_id = task
-            .parts
-            .task_id
-            .unwrap_or_else(|| PgTaskId::new(Ulid::new()));
-        let mut compact = PgTask::<CompactType> {
-            args: encoded,
-            parts: task.parts,
-        };
-        compact.parts.task_id = Some(task_id);
+        let (compact, task_id) = self.encode_task(task)?;
         queries::push_tasks_on_conn(conn, &self.config, vec![compact])?;
         Ok(task_id)
     }
@@ -675,11 +711,12 @@ where
         let mut tasks = Vec::new();
         let mut ids = Vec::new();
         for args in args_batch {
-            let encoded = EncodeCodec::encode(&args).map_err(|err| Error::Decode(Box::new(err)))?;
-            let task_id = PgTaskId::new(Ulid::new());
-            let mut task = PgTask::<CompactType>::new(encoded);
-            task.parts.task_id = Some(task_id);
-            tasks.push(task);
+            let encoded = self
+                .codec
+                .encode(&args)
+                .map_err(|err| Error::Decode(Box::new(err)))?;
+            let task_id = PgTaskId::from_ulid(Ulid::generate());
+            tasks.push(TaskBuilder::new(encoded).task_id(task_id.clone()).build());
             ids.push(task_id);
         }
         queries::push_tasks_on_conn(conn, &self.config, tasks)?;
@@ -711,104 +748,78 @@ where
         let mut compact_tasks = Vec::new();
         let mut ids = Vec::new();
         for task in tasks {
-            let encoded =
-                EncodeCodec::encode(&task.args).map_err(|err| Error::Decode(Box::new(err)))?;
-            let task_id = task
-                .parts
-                .task_id
-                .unwrap_or_else(|| PgTaskId::new(Ulid::new()));
-            let mut compact = PgTask::<CompactType> {
-                args: encoded,
-                parts: task.parts,
-            };
-            compact.parts.task_id = Some(task_id);
+            let (compact, task_id) = self.encode_task(task)?;
             compact_tasks.push(compact);
             ids.push(task_id);
         }
         queries::push_tasks_on_conn(conn, &self.config, compact_tasks)?;
         Ok(ids)
     }
-}
 
-/// Single generic `Backend` impl covering every `Fetcher: PgFetcherSource`.
-/// Heartbeat/middleware are identical for all three modes; the per-mode
-/// pipeline is delegated through `PgFetcherSource::into_compact_stream`.
-impl<Args, Decode, Fetcher> Backend for PostgresStorage<Args, Decode, Fetcher>
-where
-    Args: Send + 'static + Unpin,
-    Decode: Codec<Args, Compact = CompactType> + Send + 'static,
-    Decode::Error: std::error::Error + Send + Sync + 'static,
-    Fetcher: crate::fetcher::PgFetcherSource,
-{
-    type Args = Args;
-    type IdType = Ulid;
-    type Context = PgContext;
-    type Error = Error;
-    type Stream = TaskStream<PgTask<Args>, Error>;
-    type Beat = futures::stream::BoxStream<'static, Result<(), Error>>;
-    type Layer = PgMiddleware;
-
-    /// The keep-alive and orphan-sweep stream for `worker`. It yields nothing
-    /// until the task stream returned by [`Backend::poll`] has yielded its
-    /// first item, the registration outcome; then it renews every
-    /// `keep_alive`, reporting `WorkerNotRegistered` when the registration
-    /// was refused, and yields [`Error::WorkerRetired`] once the name is
-    /// retired.
-    fn heartbeat(&self, worker: &WorkerContext) -> Self::Beat {
-        self.heartbeat_stream(worker)
-    }
-
-    fn middleware(&self) -> Self::Layer {
-        PgMiddleware::with_lease_registry(
-            &self.pool,
-            self.config.ack(),
-            std::sync::Arc::clone(&self.lease_token),
-            self.leases.clone(),
-        )
-    }
-
-    fn poll(self, worker: &WorkerContext) -> Self::Stream {
-        // The decode stage keeps its own pool handle (and the claiming
-        // worker's id) so it can fail rows whose payload does not decode —
-        // see `queries::fail_undecodable_task`.
-        let pool = self.pool.clone();
-        let lease_token = self.lease_token.clone();
-        let lease = self.leases.for_worker(worker.name());
-        let compact = self.fetcher.into_compact_stream(
-            self.pool,
-            self.config,
-            worker.clone(),
-            self.lease_token,
-            self.poll_factory,
-        );
-        crate::fetcher::decode_task_stream::<Args, Decode>(
-            crate::fetcher::LeaseStream::new(compact, lease.clone(), true).boxed(),
-            pool,
-            std::sync::Arc::from(worker.name().as_str()),
-            Some(lease_token),
-            lease,
-        )
+    /// Encode a task's `args`, giving it a fresh Ulid when it has no id.
+    fn encode_task(&self, task: PgTask<Args>) -> Result<(PgTask<CompactType>, PgTaskId), Error> {
+        let compact = task
+            .try_map_args(|args| self.codec.encode(&args))
+            .map_err(|err| Error::Decode(Box::new(err)))?;
+        let task_id = compact
+            .task_id()
+            .cloned()
+            .unwrap_or_else(|| PgTaskId::from_ulid(Ulid::generate()));
+        let compact = compact.into_builder().task_id(task_id.clone()).build();
+        Ok((compact, task_id))
     }
 }
 
-impl<Args, Decode, Fetcher> BackendExt for PostgresStorage<Args, Decode, Fetcher>
+#[allow(private_bounds)]
+impl<Args, Decode, Fetcher> PostgresStorage<Args, Decode, Fetcher>
 where
     Args: Send + 'static + Unpin,
-    Decode: Codec<Args, Compact = CompactType> + Send + 'static,
+    Decode: Codec<Args, Compact = CompactType> + Clone + Send + Sync + 'static,
     Decode::Error: std::error::Error + Send + Sync + 'static,
     Fetcher: crate::fetcher::PgFetcherSource,
 {
-    type Compact = CompactType;
-    type Codec = Decode;
-    type CompactStream = TaskStream<PgTask<CompactType>, Self::Error>;
-
-    fn get_queue(&self) -> Queue {
-        self.config.queue().clone()
+    /// The task stream for `worker` without apalis's worker: the
+    /// registration outcome first (`Ok(None)`), then claimed tasks, decoded.
+    ///
+    /// For consumers that run tasks themselves; a worker built with
+    /// `WorkerBuilder` polls the storage through [`Backend`] instead. Start
+    /// each task with [`PgAck::start`] (or run it through [`Self::middleware`])
+    /// and acknowledge it with [`Self::acknowledger`]; keep
+    /// [`Self::heartbeat`] running alongside. A row whose payload does not
+    /// decode is released and reported as [`Error::Decode`].
+    pub fn poll(mut self, worker: &WorkerContext) -> TaskStream<PgTask<Args>, Error> {
+        match self.task_stream(worker) {
+            Ok(tasks) => {
+                let codec = self.codec.clone();
+                tasks
+                    .map(move |item| {
+                        item.and_then(|task| {
+                            task.map(|task| {
+                                task.try_map_args(|args| codec.decode(&args))
+                                    .map_err(|error| Error::Decode(error.into()))
+                            })
+                            .transpose()
+                        })
+                    })
+                    .boxed()
+            }
+            Err(error) => futures::stream::once(futures::future::ready(Err(error))).boxed(),
+        }
     }
 
-    fn poll_compact(self, worker: &WorkerContext) -> Self::CompactStream {
+    /// [`Self::poll`] without decoding: the compact tasks as stored.
+    pub fn poll_compact(
+        mut self,
+        worker: &WorkerContext,
+    ) -> TaskStream<PgTask<CompactType>, Error> {
+        let Some(fetcher) = self.fetcher.take() else {
+            let error = Error::AlreadyPolled {
+                queue: self.config.queue().to_string(),
+            };
+            return futures::stream::once(futures::future::ready(Err(error))).boxed();
+        };
         let lease = self.leases.for_worker(worker.name());
-        let compact = self.fetcher.into_compact_stream(
+        let compact = fetcher.into_compact_stream(
             self.pool,
             self.config,
             worker.clone(),
@@ -817,34 +828,246 @@ where
         );
         crate::fetcher::LeaseStream::new(compact, lease, true).boxed()
     }
+
+    /// The keep-alive and orphan-sweep stream for `worker`, to run alongside
+    /// [`Self::poll`] when consuming tasks without apalis's worker. It yields
+    /// nothing until the task stream has yielded the registration outcome;
+    /// then it renews every `keep_alive`, reporting `WorkerNotRegistered` when
+    /// the registration was refused, and yields [`Error::WorkerRetired`] once
+    /// the name is retired.
+    pub fn heartbeat(
+        &self,
+        worker: &WorkerContext,
+    ) -> futures::stream::BoxStream<'static, Result<(), Error>> {
+        self.heartbeat_stream(worker)
+    }
+
+    /// The middleware a worker of this storage runs tasks through: it starts
+    /// each claim and, when the config enables it, acknowledges the result.
+    #[must_use]
+    pub fn middleware(&self) -> PgMiddleware {
+        PgMiddleware::with_lease_registry(
+            &self.pool,
+            self.config.ack(),
+            std::sync::Arc::clone(&self.lease_token),
+            self.leases.clone(),
+        )
+    }
+
+    /// The task stream for `worker`: registration first, then claimed tasks.
+    /// Every payload is test-decoded first; a row that does not decode is
+    /// released by the decode stage (see `queries::fail_undecodable_task`)
+    /// instead of reaching apalis, whose `Durable` wrapper decodes the rest.
+    ///
+    /// A storage typed on [`CompactType`] skips that stage: its consumer
+    /// takes the stored bytes as they are. apalis-workflow's `GraphFlow` and
+    /// `SteppedFlow` run on the raw backend, not behind `Durable`, and their
+    /// payloads are not a JSON-encoded `Vec<u8>`, so test-decoding them as
+    /// one would release every workflow task as undecodable.
+    fn task_stream(
+        &mut self,
+        worker: &WorkerContext,
+    ) -> Result<crate::fetcher::TaskStream<PgTask<CompactType>, Error>, Error> {
+        let fetcher = self.fetcher.take().ok_or_else(|| Error::AlreadyPolled {
+            queue: self.config.queue().to_string(),
+        })?;
+        let lease = self.leases.for_worker(worker.name());
+        let compact = fetcher.into_compact_stream(
+            self.pool.clone(),
+            self.config.clone(),
+            worker.clone(),
+            std::sync::Arc::clone(&self.lease_token),
+            self.poll_factory.clone(),
+        );
+        let compact = crate::fetcher::LeaseStream::new(compact, lease.clone(), true).boxed();
+        if std::any::TypeId::of::<Args>() == std::any::TypeId::of::<CompactType>() {
+            return Ok(compact);
+        }
+        Ok(crate::fetcher::decode_task_stream::<Args, Decode>(
+            compact,
+            self.codec.clone(),
+            self.pool.clone(),
+            std::sync::Arc::from(worker.name()),
+            Some(std::sync::Arc::clone(&self.lease_token)),
+            lease,
+        ))
+    }
+}
+
+/// Every fetcher mode shares this impl; the per-mode pipeline comes from
+/// `PgFetcherSource::into_compact_stream`.
+///
+/// The backend is `Durable`: it yields compact tasks and apalis decodes them
+/// with [`WireFormatBackend::codec`]. Each payload is test-decoded here first,
+/// so a row that does not decode is released and the stream goes on instead
+/// of apalis reporting it as a poll error.
+impl<Args, Decode, Fetcher> Backend for PostgresStorage<Args, Decode, Fetcher>
+where
+    Args: Send + 'static + Unpin,
+    Decode: Codec<Args, Compact = CompactType> + Clone + Send + Sync + 'static,
+    Decode::Error: std::error::Error + Send + Sync + 'static,
+    Fetcher: crate::fetcher::PgFetcherSource,
+{
+    type Task = PgTask<CompactType>;
+    type Error = Error;
+
+    /// Drives the keep-alive and orphan-sweep stream for `worker`. It renews
+    /// nothing until the task stream has yielded the registration outcome;
+    /// then it renews every `keep_alive`. A refused registration, a lost one
+    /// (`WorkerNotRegistered`) and a retired name ([`Error::WorkerRetired`])
+    /// end the worker through this method.
+    fn poll_ready(
+        &mut self,
+        cx: &mut Context<'_>,
+        worker: &WorkerContext,
+    ) -> Poll<Result<(), Error>> {
+        if self.active.heartbeat_ended {
+            return Poll::Ready(Ok(()));
+        }
+        if self
+            .active
+            .heartbeat
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+        {
+            let beats = self.heartbeat_stream(worker);
+            *self
+                .active
+                .heartbeat
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner()) = Some(beats);
+            worker.heartbeat(cx);
+        }
+        let heartbeat = self
+            .active
+            .heartbeat
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(beats) = heartbeat.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        loop {
+            match beats.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(()))) => worker.heartbeat(cx),
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(None) => {
+                    self.active.heartbeat_ended = true;
+                    return Poll::Ready(Ok(()));
+                }
+                // Not due: the stream holds the waker for the next renewal.
+                Poll::Pending => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+        worker: &WorkerContext,
+    ) -> Poll<Option<Result<PgTask<CompactType>, Error>>> {
+        if self
+            .active
+            .tasks
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+        {
+            match self.task_stream(worker) {
+                Ok(stream) => {
+                    *self
+                        .active
+                        .tasks
+                        .get_mut()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(stream);
+                }
+                Err(error) => return Poll::Ready(Some(Err(error))),
+            }
+        }
+        let Some(tasks) = self
+            .active
+            .tasks
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        else {
+            return Poll::Ready(None);
+        };
+        loop {
+            match tasks.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(Some(task)))) => return Poll::Ready(Some(Ok(task))),
+                // The registration outcome, or a poll that found nothing.
+                Poll::Ready(Some(Ok(None))) => continue,
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn poll_close(
+        &mut self,
+        cx: &mut Context<'_>,
+        _worker: &WorkerContext,
+    ) -> Poll<Result<(), Error>> {
+        self.sink.poll_flush_inner(cx)
+    }
+}
+
+impl<Args, Decode, Fetcher> BackendConfig for PostgresStorage<Args, Decode, Fetcher> {
+    type Args = Args;
+    type Id = Ulid;
+    type Kind = Durable;
+    type Config = Config;
+    type Layer = PgMiddleware;
+
+    fn config(&self) -> &Config {
+        &self.config
+    }
+
+    fn middleware(&mut self, _worker: &mut WorkerContext) -> PgMiddleware {
+        PgMiddleware::with_lease_registry(
+            &self.pool,
+            self.config.ack(),
+            std::sync::Arc::clone(&self.lease_token),
+            self.leases.clone(),
+        )
+    }
+}
+
+impl<Args, Decode: Send + 'static, Fetcher> WireFormatBackend
+    for PostgresStorage<Args, Decode, Fetcher>
+{
+    type Codec = Decode;
+    type Compact = CompactType;
+
+    fn codec(&self) -> &Decode {
+        &self.codec
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use apalis_core::{
-        backend::{Backend, BackendExt},
-        task::status::Status,
-    };
-    use apalis_sql::{DateTime, DateTimeExt, from_row::FromRowError};
+    use apalis_core::task::status::Status;
+
     use lets_expect::{AssertionError, AssertionResult, *};
 
     use super::*;
-    use crate::unreachable::unreachable_pool;
+    use crate::{
+        config::{DateTime, DateTimeExt},
+        models::JobRow,
+        unreachable::unreachable_pool,
+    };
 
-    fn row(
-        id: &str,
-        status: &str,
-        run_at: Option<DateTime>,
-        idempotency_key: Option<&str>,
-    ) -> TaskRow {
-        TaskRow {
+    fn row(id: &str, status: &str, idempotency_key: Option<&str>) -> JobRow {
+        JobRow {
             job: b"payload".to_vec(),
             id: id.to_owned(),
             job_type: "unit-queue".to_owned(),
             status: status.to_owned(),
             attempts: 2,
-            max_attempts: Some(3),
-            run_at,
+            max_attempts: 3,
+            run_at: DateTime::now(),
             last_result: None,
             lock_at: None,
             lock_by: Some("worker-a".to_owned()),
@@ -856,16 +1079,16 @@ mod tests {
     }
 
     fn compact_task_has_expected_parts(
-        result: &Result<PgTask<CompactType>, FromRowError>,
+        result: &Result<PgTask<CompactType>, Error>,
     ) -> AssertionResult {
         match result {
             Ok(task)
                 if task.args == b"payload"
-                    && task.parts.attempt.current() == 2
-                    && task.parts.status.load() == Status::Pending
-                    && task.parts.ctx.priority() == 7
-                    && task.parts.ctx.lock_by() == &Some("worker-a".to_owned())
-                    && task.parts.idempotency_key == Some("same-key".to_owned()) =>
+                    && task.attempt() == 2
+                    && task.status() == Status::Pending
+                    && task.priority() == Some(7)
+                    && task.lock_by() == Some("worker-a")
+                    && task.idempotency_key() == Some("same-key") =>
             {
                 Ok(())
             }
@@ -879,13 +1102,13 @@ mod tests {
     }
 
     fn compact_task_omits_idempotency_key(
-        result: &Result<PgTask<CompactType>, FromRowError>,
+        result: &Result<PgTask<CompactType>, Error>,
     ) -> AssertionResult {
         match result {
-            Ok(task) if task.parts.idempotency_key.is_none() => Ok(()),
+            Ok(task) if task.idempotency_key().is_none() => Ok(()),
             Ok(task) => Err(AssertionError::new(vec![format!(
                 "expected idempotency_key None, got {:?}",
-                task.parts.idempotency_key
+                task.idempotency_key()
             )])),
             Err(error) => Err(AssertionError::new(vec![format!(
                 "expected successful conversion, got {error:?}"
@@ -893,18 +1116,9 @@ mod tests {
         }
     }
 
-    fn column_not_found(column: &'static str) -> impl Fn(&FromRowError) -> AssertionResult {
-        move |error| match error {
-            FromRowError::ColumnNotFound(found) if found == column => Ok(()),
-            other => Err(AssertionError::new(vec![format!(
-                "expected missing column {column}, got {other:?}"
-            )])),
-        }
-    }
-
-    fn decode_error(error: &FromRowError) -> AssertionResult {
+    fn decode_error(error: &Error) -> AssertionResult {
         match error {
-            FromRowError::DecodeError(_) => Ok(()),
+            Error::Row(_) => Ok(()),
             other => Err(AssertionError::new(vec![format!(
                 "expected decode error, got {other:?}"
             )])),
@@ -1036,7 +1250,7 @@ mod tests {
     }
 
     fn backend_trait_surfaces(notify: bool) -> (String, String, String) {
-        let worker = WorkerContext::new::<()>("backend-trait-worker");
+        let worker = WorkerContext::new("backend-trait-worker");
         if notify {
             let storage = notify_storage_for_config("notify-trait-api", 2);
             let middleware = std::any::type_name_of_val(&storage.middleware()).to_owned();
@@ -1064,11 +1278,10 @@ mod tests {
 
     fn constructs_backend_traits(result: &(String, String, String)) -> AssertionResult {
         let (middleware, heartbeat, compact) = result;
-        // `std::any::type_name_of_val` resolves type aliases away, so neither
-        // `BoxStream` nor `PgContext` ever appears literally — `BoxStream<T>`
-        // always prints as its expansion `Pin<Box<dyn Stream<Item = T> + Send>>`,
-        // and `PgContext` as its expansion `SqlContext<PgPool>`. Match those
-        // expansions instead of the alias names.
+        // `std::any::type_name_of_val` resolves type aliases away, so
+        // `BoxStream` never appears literally — `BoxStream<T>` always prints as
+        // its expansion `Pin<Box<dyn Stream<Item = T> + Send>>`. Match that
+        // expansion instead of the alias name.
         //
         // The heartbeat is `Beat = BoxStream<'static, Result<(), Error>>`: a bare
         // `()` beat, so its type name carries the `Result`/`Error` item shape but
@@ -1079,17 +1292,16 @@ mod tests {
             && heartbeat.contains("Stream")
             && heartbeat.contains("Result")
             && heartbeat.contains("Error")
-            && !heartbeat.contains("SqlContext")
             && !heartbeat.contains("Task<");
         // The compact stream is `CompactStream = TaskStream<PgTask<CompactType>,
-        // Error>` = `BoxStream<'static, Result<Option<Task<Vec<u8>, PgContext,
-        // Ulid>>, Error>>`: it must name the `Option`-wrapped task with its
-        // `SqlContext`, distinguishing it from the bare heartbeat beat.
+        // Error>` = `BoxStream<'static, Result<Option<Task<Vec<u8>>>, Error>>`:
+        // it must name the `Option`-wrapped task, distinguishing it from the
+        // bare heartbeat beat.
         let compact_is_task_stream = compact.contains("Pin")
             && compact.contains("Box")
             && compact.contains("Stream")
             && compact.contains("Option")
-            && compact.contains("SqlContext")
+            && compact.contains("Task<")
             && compact.contains("Error");
         if middleware.contains("PgMiddleware") && heartbeat_is_beat_stream && compact_is_task_stream
         {
@@ -1187,10 +1399,9 @@ mod tests {
             to returns_the_crate_name { equal("apalis-diesel-postgres") }
         }
 
-        expect(row(id, status, run_at, idempotency_key).try_into_task_compact::<Ulid, PgPool>()) as compact_task_record {
-            let id = &Ulid::new().to_string();
+        expect(row(id, status, idempotency_key).into_task()) as compact_task_record {
+            let id = &Ulid::generate().to_string();
             let status = "Pending";
-            let run_at = Some(DateTime::now());
             let idempotency_key = Some("same-key");
 
             when row_has_all_required_fields {
@@ -1200,11 +1411,6 @@ mod tests {
             when idempotency_key_is_absent {
                 let idempotency_key = None;
                 to omits_the_idempotency_key { compact_task_omits_idempotency_key }
-            }
-
-            when run_time_is_missing {
-                let run_at = None;
-                to rejects_the_row { be_err_and column_not_found("run_at") }
             }
 
             when status_is_unknown {

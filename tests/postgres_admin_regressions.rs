@@ -2,6 +2,7 @@
 #![cfg(feature = "tokio")]
 
 mod support;
+use support::EditTask;
 
 use apalis_core::{
     backend::{Filter, ListAllTasks, ListTasks, Metrics},
@@ -57,7 +58,7 @@ async fn pagination(global: bool, equal_times: bool) -> Result<Outcome<Pages>, S
         let mut expected = with_conn(pool, move |conn| {
             let tasks = (0..20).map(|i| {
                 let mut task = PgTask::new(i.to_string());
-                task.parts.run_at = 1_700_000_001 + if equal_times { 0 } else { i };
+                task.edit(|t| t.run_at_timestamp(1_700_000_001 + if equal_times { 0 } else { i }));
                 task
             });
             writer
@@ -86,7 +87,7 @@ async fn pagination(global: bool, equal_times: bool) -> Result<Outcome<Pages>, S
                     .await
                     .map_err(|error| error.to_string())?
                     .into_iter()
-                    .map(|task| task.parts.task_id)
+                    .map(|task| task.task_id().cloned())
                     .collect::<Vec<_>>()
             } else {
                 storage
@@ -94,7 +95,7 @@ async fn pagination(global: bool, equal_times: bool) -> Result<Outcome<Pages>, S
                     .await
                     .map_err(|error| error.to_string())?
                     .into_iter()
-                    .map(|task| task.parts.task_id)
+                    .map(|task| task.task_id().cloned())
                     .collect::<Vec<_>>()
             };
             if page == 11 {
@@ -205,7 +206,7 @@ async fn limited_listing(global: bool, completed: bool) -> Result<Outcome<Listin
                 .await
                 .map_err(|error| error.to_string())?
                 .into_iter()
-                .map(|task| task.parts.task_id)
+                .map(|task| task.task_id().cloned())
                 .collect::<Vec<_>>()
         } else {
             storage
@@ -213,7 +214,7 @@ async fn limited_listing(global: bool, completed: bool) -> Result<Outcome<Listin
                 .await
                 .map_err(|error| error.to_string())?
                 .into_iter()
-                .map(|task| task.parts.task_id)
+                .map(|task| task.task_id().cloned())
                 .collect::<Vec<_>>()
         };
         let actual = returned_ids
@@ -346,7 +347,7 @@ async fn metrics(
             let writer = storage.clone();
             with_conn(pool, move |conn| {
                 let mut task = PgTask::new("value".to_owned());
-                task.parts.run_at = 1_700_000_001;
+                task.edit(|t| t.run_at_timestamp(1_700_000_001));
                 writer
                     .push_task_with_conn(conn, task)
                     .map_err(|error| error.to_string())?;

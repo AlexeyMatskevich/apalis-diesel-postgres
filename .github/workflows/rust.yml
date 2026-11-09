@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.88.0", "stable"]
+        rust: ["1.89.0", "stable"]
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.88.0", "stable"]
+        rust: ["1.89.0", "stable"]
         runtime: [tokio, ntex, both]
         include:
         - runtime: tokio

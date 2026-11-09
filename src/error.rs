@@ -193,7 +193,7 @@ pub enum Error {
     #[error("sink buffer is full; call poll_ready before start_send (capacity: {0})")]
     SinkBufferFull(usize),
 
-    /// A custom polling strategy ended or its single-use Config was reused.
+    /// A custom polling strategy ended.
     #[error(
         "polling strategy for queue `{queue}` ended; use with_poll_strategy_factory for independent workers or provide a fresh Config; no automatic polling is started"
     )]
@@ -209,6 +209,16 @@ pub enum Error {
     WorkerRetired {
         /// Worker whose local lease can no longer acquire tasks.
         worker_id: String,
+    },
+    /// The storage was already handed to a worker, which took its fetcher.
+    /// Each worker needs its own storage: clone the storage before building
+    /// the worker, or create a fresh one.
+    #[error(
+        "storage for queue `{queue}` was already polled by a worker; give each worker its own storage"
+    )]
+    AlreadyPolled {
+        /// Queue of the storage.
+        queue: String,
     },
 }
 

@@ -44,7 +44,7 @@ async fn insert_worker(pool: PgPool, queue: String, worker_id: String) -> Result
         )
         .bind::<Text, _>(&worker_id)
         .bind::<Text, _>(&queue)
-        .bind::<Text, _>(format!("token-{}", Ulid::new()))
+        .bind::<Text, _>(format!("token-{}", Ulid::generate()))
         .execute(conn)
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -66,7 +66,7 @@ async fn insert_row(
     run_at_offset_secs: i64,
     priority: i32,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let owner = if matches!(status, "Queued" | "Running") {
@@ -125,7 +125,7 @@ async fn fetch_next_sql(
     worker_id: String,
     buffer_size: i32,
 ) -> Result<Vec<FetchedRow>, String> {
-    let worker = apalis_core::worker::context::WorkerContext::new::<()>(&worker_id);
+    let worker = apalis_core::worker::context::WorkerContext::new(&worker_id);
     let config = crate::Config::new(&queue).set_buffer_size(buffer_size as usize);
     crate::queries::fetch_next(pool, config, worker, None)
         .await
@@ -134,12 +134,14 @@ async fn fetch_next_sql(
 }
 fn observe_fetched(task: crate::PgTask<crate::CompactType>) -> FetchedRow {
     FetchedRow {
-        id: task.parts.task_id.unwrap().to_string(),
-        status: task.parts.status.load().to_string(),
-        lock_by: task.parts.ctx.lock_by().clone(),
-        lock_at_present: task.parts.ctx.lock_at().is_some(),
-        done_at_null: task.parts.ctx.done_at().is_none(),
-        priority: task.parts.ctx.priority(),
+        id: task.task_id().cloned().unwrap().to_string(),
+        status: task.status().to_string(),
+        lock_by: task.lock_by().map(str::to_owned),
+        lock_at_present: task.lock_at().is_some(),
+        done_at_null: task.done_at().is_none(),
+        priority: task
+            .priority()
+            .map_or(0, |priority| i32::try_from(priority).unwrap_or(i32::MAX)),
     }
 }
 
@@ -168,7 +170,7 @@ async fn run_empty_queue() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-empty-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-empty-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-empty-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -193,7 +195,7 @@ async fn run_buffer_sizes(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-buffer-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-buffer-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-buffer-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -233,7 +235,7 @@ async fn run_cross_queue_isolation() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-iso-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-iso-{}", Ulid::generate());
     let foreign = format!("{queue}-foreign");
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), foreign.clone()).await?;
@@ -272,7 +274,7 @@ async fn run_run_at_boundary() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-runat-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-runat-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-runat-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -299,7 +301,7 @@ async fn run_equal_priority_tie_break() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-tie-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-tie-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-tie-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -355,7 +357,7 @@ async fn run_status_matrix(setup: StatusSetup) -> Result<Outcome<FetchRun>, Stri
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fetch-status-{}", Ulid::new());
+    let queue = format!("apalis-spec-fetch-status-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-fetch-status-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -636,7 +638,7 @@ async fn run_queue_by_id_eligibility(setup: StatusSetup) -> Result<Outcome<Fetch
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-status-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-status-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-status-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -674,7 +676,7 @@ async fn run_queue_by_id_skips_unlisted() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-unlisted-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-unlisted-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-unlisted-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -726,8 +728,8 @@ async fn run_queue_by_id_cross_queue() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-home-{}", Ulid::new());
-    let other_queue = format!("apalis-spec-qbi-other-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-home-{}", Ulid::generate());
+    let other_queue = format!("apalis-spec-qbi-other-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
     let worker_id = format!("spec-qbi-cross-{queue}");
@@ -768,7 +770,7 @@ async fn run_queue_by_id_ordering() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-order-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-order-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-order-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -820,7 +822,7 @@ async fn run_queue_by_id_partial_claim() -> Result<Outcome<FetchRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-qbi-partial-{}", Ulid::new());
+    let queue = format!("apalis-spec-qbi-partial-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-qbi-partial-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker_id.clone()).await?;
@@ -1001,7 +1003,7 @@ async fn fail_undecodable_sql(
 ) -> Result<usize, String> {
     crate::queries::fail_undecodable_task(
         pool,
-        PgTaskId::new(task_id.parse::<ulid::Ulid>().map_err(|e| e.to_string())?),
+        PgTaskId::from_ulid(task_id.parse::<ulid::Ulid>().map_err(|e| e.to_string())?),
         worker_id,
         lock_at_epoch,
         attempts,
@@ -1024,7 +1026,7 @@ async fn insert_lock_state_row(
     lock_at_epoch: Option<i64>,
     last_result: Option<serde_json::Value>,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec("undecodable-probe").map_err(|e| e.to_string())?;
     with_conn(pool, move |conn| {
@@ -1106,7 +1108,7 @@ async fn run_fail_undecodable(setup: &'static str) -> Result<Outcome<FailUndecod
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fail-undecodable-{}", Ulid::new());
+    let queue = format!("apalis-spec-fail-undecodable-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_a = format!("fail-undecodable-a-{queue}");
     let worker_b = format!("fail-undecodable-b-{queue}");
@@ -1186,7 +1188,7 @@ async fn insert_live_claim_with_budget(
     max_attempts: i32,
     lock_at_epoch: i64,
 ) -> Result<PgTaskId, String> {
-    let id = Ulid::new();
+    let id = Ulid::generate();
     let task_id = TaskId::from_str(&id.to_string()).map_err(|e| e.to_string())?;
     let job = serde_json::to_vec("undecodable-budget-probe").map_err(|e| e.to_string())?;
     with_conn(pool, move |conn| {
@@ -1226,7 +1228,7 @@ async fn run_fail_undecodable_budget(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-fail-budget-{}", Ulid::new());
+    let queue = format!("apalis-spec-fail-budget-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker = format!("fail-budget-{queue}");
     insert_worker(pool.clone(), queue.clone(), worker.clone()).await?;

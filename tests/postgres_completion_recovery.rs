@@ -47,8 +47,8 @@ impl PollFaults {
             self.hidden = hidden;
         }
         let completed = match step {
-            2 if self.partial => Some(self.ids[0]),
-            5 => self.ids.last().copied(),
+            2 if self.partial => Some(self.ids[0].clone()),
+            5 => self.ids.last().cloned(),
             _ => None,
         };
         if let Some(id) = completed {
@@ -130,11 +130,11 @@ async fn run_completion_recovery(
         );
         let mut ids = Vec::new();
         for _ in 0..if partial { 2 } else { 1 } {
-            let id = PgTaskId::new(ulid::Ulid::new());
+            let id = PgTaskId::from_ulid(ulid::Ulid::generate());
             producer
                 .push_task(
                     TaskBuilder::new("pending".to_owned())
-                        .with_task_id(id)
+                        .task_id(id.clone())
                         .build(),
                 )
                 .await
@@ -166,10 +166,10 @@ async fn run_completion_recovery(
         })
         .await
         .map_err(|e| e.to_string())??;
-        let storage =
+        let mut storage =
             PostgresStorage::<String>::new_with_config(&pool, &Config::new("completion-observer"));
         let mut results = <PostgresStorage<String> as WaitForCompletion<String>>::wait_for(
-            &storage,
+            &mut storage,
             expected_ids.clone(),
         );
         let completed = tokio::time::timeout(Duration::from_secs(10), async {
@@ -200,7 +200,7 @@ fn completes_across_separate_failures()
         let expected = run
             .expected_ids
             .iter()
-            .copied()
+            .cloned()
             .map(|id| (id, Status::Done, Ok("completed".to_owned())))
             .collect::<Vec<_>>();
         let errors = run

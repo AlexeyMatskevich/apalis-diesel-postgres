@@ -7,31 +7,28 @@
 
 use apalis_core::{
     backend::{
-        BackendExt, FetchById, Filter, ListAllTasks, ListQueues, ListTasks, ListWorkers, Metrics,
+        Backend, FetchById, Filter, ListAllTasks, ListQueues, ListTasks, ListWorkers, Metrics,
         QueueInfo, RegisterWorker, RunningWorker, Statistic, TaskResult, Vacuum, WaitForCompletion,
-        codec::Codec,
+        WireFormatBackend,
     },
-    task::{Task, task_id::TaskId},
+    task::task_id::TaskId,
 };
 use futures::stream::BoxStream;
 use serde::de::DeserializeOwned;
-use ulid::Ulid;
 
-use crate::{CompactType, Error, PgContext, PgTask, PgTaskId, PostgresStorage, queries};
+use crate::{CompactType, Error, PgTask, PostgresStorage, queries};
 
-impl<Args, D, F> FetchById<Args> for PostgresStorage<Args, D, F>
+/// apalis 1.0 returns admin listings and lookups in the backend's compact
+/// form; decode `args` with [`WireFormatBackend::codec`] when needed.
+impl<Args, D, F> FetchById for PostgresStorage<Args, D, F>
 where
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
-    D: Codec<Args, Compact = CompactType>,
-    D::Error: std::error::Error + Send + Sync + 'static,
-    Args: 'static,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>,
 {
     fn fetch_by_id(
         &mut self,
-        task_id: &PgTaskId,
-    ) -> impl Future<Output = Result<Option<PgTask<Args>>, Self::Error>> + Send {
-        queries::fetch_by_id::<Args, D>(
+        task_id: &TaskId,
+    ) -> impl Future<Output = Result<Option<PgTask<CompactType>>, Self::Error>> + Send {
+        queries::fetch_by_id(
             self.pool.clone(),
             task_id.to_string(),
             self.config.queue().to_string(),
@@ -39,13 +36,10 @@ where
     }
 }
 
-impl<Args, D, F> ListTasks<Args> for PostgresStorage<Args, D, F>
+impl<Args, D, F> ListTasks for PostgresStorage<Args, D, F>
 where
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
-    D: Codec<Args, Compact = CompactType>,
-    D::Error: std::error::Error + Send + Sync + 'static,
-    Args: 'static,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>
+        + WireFormatBackend<Compact = CompactType>,
 {
     /// List this queue's tasks matching `filter.status`, newest-completed first
     /// (`done_at DESC, run_at DESC, id DESC`, with NULL completion times first).
@@ -61,15 +55,15 @@ where
     fn list_tasks(
         &self,
         filter: &Filter,
-    ) -> impl Future<Output = Result<Vec<PgTask<Args>>, Self::Error>> + Send {
-        queries::list_tasks::<Args, D>(self.pool.clone(), self.config.queue().to_string(), filter)
+    ) -> impl Future<Output = Result<Vec<PgTask<CompactType>>, Self::Error>> + Send {
+        queries::list_tasks(self.pool.clone(), self.config.queue().to_string(), filter)
     }
 }
 
 impl<Args, D, F> ListAllTasks for PostgresStorage<Args, D, F>
 where
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>
+        + WireFormatBackend<Compact = CompactType>,
 {
     /// List tasks across **every** queue matching `filter.status`,
     /// newest-completed first (`done_at DESC, run_at DESC, id DESC`, with NULL
@@ -84,9 +78,7 @@ where
     fn list_all_tasks(
         &self,
         filter: &Filter,
-    ) -> impl Future<
-        Output = Result<Vec<Task<Self::Compact, Self::Context, Self::IdType>>, Self::Error>,
-    > + Send {
+    ) -> impl Future<Output = Result<Vec<PgTask<CompactType>>, Self::Error>> + Send {
         queries::list_all_tasks(self.pool.clone(), filter)
     }
 }
@@ -97,8 +89,7 @@ where
     // `apalis.workers` and never read `Args`, so requiring it would needlessly
     // exclude otherwise valid `Send + !Sync` argument types — every other admin
     // impl on this storage already omits it.
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>,
 {
     fn list_workers(&self) -> impl Future<Output = Result<Vec<RunningWorker>, Self::Error>> + Send {
         queries::list_workers(self.pool.clone(), Some(self.config.queue().to_string()))
@@ -123,8 +114,7 @@ const _: fn() = || {
 
 impl<Args, D, F> ListQueues for PostgresStorage<Args, D, F>
 where
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>,
 {
     fn list_queues(&self) -> impl Future<Output = Result<Vec<QueueInfo>, Self::Error>> + Send {
         queries::list_queues(self.pool.clone())
@@ -133,8 +123,7 @@ where
 
 impl<Args, D, F> Metrics for PostgresStorage<Args, D, F>
 where
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>,
 {
     /// Scans `apalis.jobs` to compute global statistics. Each call evaluates
     /// 20+ FILTER aggregates over every row; cost grows linearly with the
@@ -152,8 +141,7 @@ where
 
 impl<Args, D, F> RegisterWorker for PostgresStorage<Args, D, F>
 where
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>,
 {
     /// Register a worker name for this storage's queue without a lease token.
     ///
@@ -183,8 +171,7 @@ where
 
 impl<Args, D, F> Vacuum for PostgresStorage<Args, D, F>
 where
-    PostgresStorage<Args, D, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+    PostgresStorage<Args, D, F>: Backend<Task = PgTask<CompactType>, Error = Error>,
 {
     /// Delete every terminal task of this storage's queue, whatever its age:
     /// [`PostgresStorage::purge_terminal_tasks`] with a zero window. A result
@@ -198,16 +185,24 @@ where
             std::time::Duration::ZERO,
         )
     }
+
+    /// [`PostgresStorage::purge_terminal_tasks`]: delete the terminal tasks of
+    /// this storage's queue that completed at least `duration` ago.
+    fn vacuum_before(
+        &mut self,
+        duration: std::time::Duration,
+    ) -> impl Future<Output = Result<usize, Self::Error>> + Send {
+        queries::purge_terminal_tasks(self.pool.clone(), self.config.queue().to_string(), duration)
+    }
 }
 
 impl<O, Args, F, Decode> WaitForCompletion<O> for PostgresStorage<Args, Decode, F>
 where
     O: 'static + Send,
-    PostgresStorage<Args, Decode, F>:
-        BackendExt<Context = PgContext, Compact = CompactType, IdType = Ulid, Error = Error>,
+    PostgresStorage<Args, Decode, F>: Backend<Task = PgTask<CompactType>, Error = Error>,
     Result<O, String>: DeserializeOwned,
 {
-    type ResultStream = BoxStream<'static, Result<TaskResult<O, Ulid>, Error>>;
+    type ResultStream = BoxStream<'static, Result<TaskResult<O>, Error>>;
 
     /// Wait for the given tasks to complete, yielding each result as it lands.
     ///
@@ -229,17 +224,14 @@ where
     /// Because completed results are durable in `apalis.jobs`, a surfaced error
     /// is always safe to recover from by calling `wait_for` again with the ids
     /// that have not yet yielded a result.
-    fn wait_for(
-        &self,
-        task_ids: impl IntoIterator<Item = TaskId<Self::IdType>>,
-    ) -> Self::ResultStream {
+    fn wait_for(&mut self, task_ids: impl IntoIterator<Item = TaskId>) -> Self::ResultStream {
         queries::admin::wait_for_completion(self.pool.clone(), task_ids)
     }
 
     fn check_status(
-        &self,
-        task_ids: impl IntoIterator<Item = TaskId<Self::IdType>> + Send,
-    ) -> impl Future<Output = Result<Vec<TaskResult<O, Ulid>>, Self::Error>> + Send {
+        &mut self,
+        task_ids: impl IntoIterator<Item = TaskId> + Send,
+    ) -> impl Future<Output = Result<Vec<TaskResult<O>>, Self::Error>> + Send {
         queries::admin::check_status(self.pool.clone(), task_ids)
     }
 }

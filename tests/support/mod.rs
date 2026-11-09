@@ -168,7 +168,7 @@ where
     };
     let name = format!(
         "apalis_test_{}",
-        ulid::Ulid::new().to_string().to_lowercase()
+        ulid::Ulid::generate().to_string().to_lowercase()
     );
     let scheme_end = maintenance_url
         .find("://")
@@ -259,6 +259,67 @@ where
 
 // Pure specifications for the environment gate helpers. They do not mutate
 // process environment and can run alongside database scenarios.
+/// Edit a task through apalis 1.0's `TaskBuilder`; 1.0 replaced the public,
+/// mutable `Parts` of a task with a builder.
+#[allow(dead_code)]
+pub trait EditTask<A> {
+    fn edit(
+        &mut self,
+        f: impl FnOnce(
+            apalis_core::task::builder::TaskBuilder<A>,
+        ) -> apalis_core::task::builder::TaskBuilder<A>,
+    );
+}
+
+impl<A: Default> EditTask<A> for apalis_core::task::Task<A> {
+    fn edit(
+        &mut self,
+        f: impl FnOnce(
+            apalis_core::task::builder::TaskBuilder<A>,
+        ) -> apalis_core::task::builder::TaskBuilder<A>,
+    ) {
+        let task = std::mem::replace(self, apalis_core::task::Task::new(A::default()));
+        *self = f(task.into_builder()).build();
+    }
+}
+
+/// A JSON object as apalis 1.0's string metadata store: string values as-is,
+/// any other value as its JSON text, as the backend stores them.
+#[allow(dead_code)]
+pub fn metadata_store(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> apalis_core::task::metadata::MetadataStore {
+    apalis_core::task::metadata::MetadataStore::from_map(
+        map.iter()
+            .map(|(key, value)| match value {
+                serde_json::Value::String(text) => (key.clone(), text.clone()),
+                other => (key.clone(), other.to_string()),
+            })
+            .collect(),
+    )
+}
+
+/// The `timestamptz` columns as the crate reads them, which apalis-sql
+/// exported before apalis 1.0.
+#[allow(dead_code)]
+pub type DateTime = chrono::DateTime<chrono::Utc>;
+
+#[allow(dead_code)]
+pub trait DateTimeExt {
+    fn from_unix_timestamp(secs: i64) -> Self;
+    fn to_unix_timestamp(&self) -> i64;
+}
+
+impl DateTimeExt for DateTime {
+    fn from_unix_timestamp(secs: i64) -> Self {
+        Self::from_timestamp(secs, 0).unwrap_or_default()
+    }
+
+    fn to_unix_timestamp(&self) -> i64 {
+        self.timestamp()
+    }
+}
+
 #[cfg(test)]
 mod helper_specs {
     use super::{is_truthy_flag, normalize_url};

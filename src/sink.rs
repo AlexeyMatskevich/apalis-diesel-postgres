@@ -133,7 +133,7 @@ impl<Args, Codec> PgSink<Args, Codec> {
     /// flush that could not obtain a connection hands the batch back to the
     /// buffer, and one refused by validation drops it; both leave the
     /// pipeline usable because nothing was written.
-    fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    pub(crate) fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         if self.failed {
             return Poll::Ready(Err(Error::SinkFailed));
         }
@@ -395,17 +395,17 @@ mod tests {
             Cap::None | Cap::QueueName => {}
             Cap::Payload => item.args = vec![0; queries::MAX_JOB_PAYLOAD_LEN + 1],
             Cap::Metadata => {
-                let mut meta = item.parts.ctx.meta().clone();
-                meta.insert(
-                    "blob".to_owned(),
-                    serde_json::Value::String("m".repeat(queries::MAX_METADATA_PAYLOAD_LEN)),
-                );
-                item.parts.ctx = item.parts.ctx.with_meta(meta);
+                let mut meta = item.metadata().clone();
+                meta.replace("blob", "m".repeat(queries::MAX_METADATA_PAYLOAD_LEN));
+                item = item.into_builder().with_metadata(meta).build();
             }
             Cap::IdempotencyKey => {
-                item.parts.idempotency_key = Some("k".repeat(queries::MAX_IDEMPOTENCY_KEY_LEN + 1));
+                item = item
+                    .into_builder()
+                    .idempotency_key("k".repeat(queries::MAX_IDEMPOTENCY_KEY_LEN + 1))
+                    .build();
             }
-            Cap::RunAt => item.parts.run_at = u64::MAX,
+            Cap::RunAt => item = item.into_builder().run_at_timestamp(u64::MAX).build(),
         }
         let result = Pin::new(&mut storage).start_send(item);
         (result, storage.sink.buffer.len())

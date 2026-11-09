@@ -2,8 +2,8 @@
 #![cfg(feature = "tokio")]
 mod support;
 use apalis_core::{
-    backend::{BackendExt, FetchById, Filter, ListAllTasks, ListTasks},
-    task::{attempt::Attempt, status::Status},
+    backend::{FetchById, Filter, ListAllTasks, ListTasks},
+    task::status::Status,
     worker::{context::WorkerContext, ext::ack::Acknowledge},
 };
 use apalis_diesel_postgres::{
@@ -74,22 +74,22 @@ async fn fixture(
 async fn read_ack(source: Read, coherent: bool) -> Result<support::Outcome<Value>, String> {
     support::with_isolated_database(move|url|async move{
  let (pool,mut storage)=fixture(url,if matches!(source,Read::Claim){"Failed"}else{"Running"},matches!(source,Read::Claim)).await?;
- let id=PgTaskId::new(ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap());
+ let id=PgTaskId::from_ulid(ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap());
  let filter=Filter{status:Some(Status::Running),page:1,page_size:Some(1)};
  let mut held_stream=None;
- let mut parts=match source {
- Read::ById=>storage.fetch_by_id(&id).await.map_err(|e|e.to_string())?.ok_or("missing job")?.parts,
- Read::QueueList=>storage.list_tasks(&filter).await.map_err(|e|e.to_string())?.remove(0).parts,
- Read::GlobalList=>storage.list_all_tasks(&filter).await.map_err(|e|e.to_string())?.remove(0).parts,
+ let mut task=match source {
+ Read::ById=>storage.fetch_by_id(&id).await.map_err(|e|e.to_string())?.ok_or("missing job")?,
+ Read::QueueList=>storage.list_tasks(&filter).await.map_err(|e|e.to_string())?.remove(0),
+ Read::GlobalList=>storage.list_all_tasks(&filter).await.map_err(|e|e.to_string())?.remove(0),
  Read::Claim=>{
- let worker=WorkerContext::new::<()>("schema-worker"); let mut stream=storage.poll_compact(&worker);
+ let worker=WorkerContext::new("schema-worker"); let mut stream=storage.poll_compact(&worker);
  let task=tokio::time::timeout(std::time::Duration::from_secs(5),async{loop{match stream.next().await{Some(Ok(Some(task)))=>break Ok(task),Some(Ok(None))=>{},Some(Err(e))=>break Err(e.to_string()),None=>break Err("stream ended".into())}}}).await.map_err(|e|e.to_string())??;
- held_stream=Some(stream);task.parts
+ held_stream=Some(stream);task
  }};
- if !matches!(source,Read::Claim){parts.attempt=Attempt::new_with_value(if coherent{3}else{4});}
+ if !matches!(source,Read::Claim){task=task.into_builder().attempt(if coherent{3}else{4}).build();}
  let before=row(pool.clone()).await?;
  let result:Result<(),apalis_core::error::BoxDynError>=Ok(());
- let actual=PgAck::new(&pool).ack(&result,&parts).await;
+ let actual=PgAck::new(&pool).ack(&result,&task).await;
  let after=row(pool).await?;
  let observation=json!({"ok":actual.is_ok(),"stale":matches!(actual,Err(Error::StaleAcknowledgement{..})),"before":before,"after":after});
 

@@ -31,8 +31,10 @@
 
 use std::time::Duration;
 
+use apalis_core::task::builder::TaskBuilder;
+
 use apalis_diesel_postgres::{
-    Config, Error as PgError, PgPool, PgTask, PostgresStorage, build_pool_with, setup,
+    Config, Error as PgError, PgPool, PostgresStorage, build_pool_with, setup,
 };
 use diesel::{Connection, PgConnection, QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
 use ulid::Ulid;
@@ -80,7 +82,7 @@ async fn main() -> Result<(), BoxError> {
 
     setup(&apalis_pool).await?;
 
-    let queue = format!("outbox-example-{}", Ulid::new());
+    let queue = format!("outbox-example-{}", Ulid::generate());
     let storage = PostgresStorage::<SendConfirmationEmail>::new_with_config(
         &apalis_pool,
         &Config::new(&queue),
@@ -109,7 +111,7 @@ async fn scenario_commit(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 1: commit");
-    let order_id = format!("{queue}:{}", Ulid::new());
+    let order_id = format!("{queue}:{}", Ulid::generate());
 
     let task_id = tokio::task::spawn_blocking({
         let storage = storage.clone();
@@ -145,7 +147,7 @@ async fn scenario_rollback(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 2: rollback");
-    let order_id = format!("{queue}:{}", Ulid::new());
+    let order_id = format!("{queue}:{}", Ulid::generate());
 
     // The closure simulates a downstream check that fails AFTER the apalis
     // enqueue — e.g. a domain validation. Returning `Err` from the closure
@@ -194,7 +196,7 @@ async fn scenario_idempotency_conflict(
     queue: &str,
 ) -> Result<(), BoxError> {
     println!("scenario 3: idempotency conflict");
-    let order_id = format!("{queue}:{}", Ulid::new());
+    let order_id = format!("{queue}:{}", Ulid::generate());
     let idempotency_key = format!("order:{order_id}");
 
     // Seed: first push with the idempotency_key, in its own transaction.
@@ -205,11 +207,12 @@ async fn scenario_idempotency_conflict(
         let order_id_for_seed = order_id.clone();
         tokio::task::spawn_blocking(move || -> Result<(), PgError> {
             let mut conn = backend_pool.get().map_err(PgError::Pool)?;
-            let mut task = PgTask::<SendConfirmationEmail>::new(SendConfirmationEmail {
+            let task = TaskBuilder::new(SendConfirmationEmail {
                 order_id: order_id_for_seed,
                 to: "carol@example.com".to_owned(),
-            });
-            task.parts.idempotency_key = Some(idempotency_key);
+            })
+            .idempotency_key(idempotency_key)
+            .build();
             conn.transaction(|c| storage.push_task_with_conn(c, task).map(|_| ()))
         })
         .await??;
@@ -229,11 +232,12 @@ async fn scenario_idempotency_conflict(
             let mut conn = backend_pool.get().map_err(PgError::Pool)?;
             conn.transaction(|c| {
                 insert_order(c, &order_id, "carol@example.com")?;
-                let mut task = PgTask::<SendConfirmationEmail>::new(SendConfirmationEmail {
+                let task = TaskBuilder::new(SendConfirmationEmail {
                     order_id: order_id.clone(),
                     to: "carol@example.com".to_owned(),
-                });
-                task.parts.idempotency_key = Some(idempotency_key);
+                })
+                .idempotency_key(idempotency_key)
+                .build();
                 match storage.push_task_with_conn(c, task) {
                     Ok(_) => Ok("no conflict observed"),
                     Err(PgError::IdempotencyConflict { .. }) => {

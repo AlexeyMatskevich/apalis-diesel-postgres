@@ -8,6 +8,7 @@
 #[path = "support/one_at_a_time.rs"]
 mod one_at_a_time;
 mod support;
+use support::EditTask;
 
 use std::{
     sync::{
@@ -18,20 +19,19 @@ use std::{
 };
 
 use apalis::prelude::*;
-use apalis_core::backend::shared::MakeShared;
 use apalis_core::{
-    backend::{Backend, BackendExt, FetchById, TaskSink, Vacuum},
+    backend::{FetchById, TaskSink, Vacuum},
     task::status::Status,
     worker::context::WorkerContext,
 };
 use apalis_diesel_postgres::{
-    CompactType, Config, Error, PgContext, PgPool, PgTask, PgTaskId, PostgresStorage, ReleasedRun,
+    CompactType, Config, Error, PgPool, PgTask, PgTaskId, PostgresStorage, ReleasedRun,
     SharedPostgresStorage,
 };
 use diesel::{QueryableByName, RunQueryDsl, sql_query, sql_types::Text};
 use futures::StreamExt;
 use lets_expect::{AssertionResult, *};
-use one_at_a_time::OneAtATimeLayer;
+use one_at_a_time::one_at_a_time;
 use support::{Outcome, observe};
 
 async fn pool() -> Result<Option<PgPool>, String> {
@@ -98,11 +98,11 @@ async fn push_with_id(
     args: &str,
     run_at: Option<u64>,
 ) -> Result<PgTaskId, String> {
-    let id = PgTaskId::new(ulid::Ulid::new());
+    let id = PgTaskId::from_ulid(ulid::Ulid::generate());
     let mut task = PgTask::<String>::new(args.to_owned());
-    task.parts.task_id = Some(id);
+    task.edit(|t| t.task_id(id.clone()));
     if let Some(run_at) = run_at {
-        task.parts.run_at = run_at;
+        task.edit(|t| t.run_at_timestamp(run_at));
     }
     producer.push_task(task).await.map_err(|e| e.to_string())?;
     Ok(id)
@@ -158,10 +158,10 @@ async fn release_with_unfinished_claim(
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-claim-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-claim-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
-        let worker = WorkerContext::new::<()>("rolling-worker");
+        let worker = WorkerContext::new("rolling-worker");
         let storage = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
         let mut producer = storage.clone();
         let task_id = push_with_id(&mut producer, "unfinished", None).await?;
@@ -173,7 +173,7 @@ async fn release_with_unfinished_claim(
         let started = match (&next, consumer) {
             (Some(Ok(Some(task))), Consumer::StartsBeforeRunning) => storage
                 .acknowledger()
-                .start(&task.parts)
+                .start(task)
                 .await
                 .map_err(|error| error.to_string()),
             _ => Ok(()),
@@ -284,8 +284,8 @@ async fn run_until_done(
                 let status = observer
                     .fetch_by_id(task_id)
                     .await
-                    .map_err(|error| WorkerError::StreamError(Box::new(error)))?
-                    .map(|task| task.parts.status.load());
+                    .map_err(|error| WorkerError::BackendError(Box::new(error)))?
+                    .map(|task| task.status());
                 all_terminal &= matches!(status, Some(Status::Done | Status::Killed));
             }
             if all_terminal {
@@ -325,8 +325,7 @@ async fn run_one_then_stop(
         }
     };
     let worker = WorkerBuilder::new(name)
-        .backend(storage)
-        .layer(OneAtATimeLayer::default())
+        .backend(one_at_a_time(storage))
         .build(handler);
     let signal = async move {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -364,11 +363,9 @@ async fn run_shared_released(
     handled: Arc<AtomicUsize>,
 ) -> (Result<(), String>, Result<usize, &'static str>) {
     let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(pool);
-    let storage = <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        config(queue),
-    )
-    .expect("a shared storage");
+    let storage = shared
+        .make_shared_with_config::<String>(config(queue))
+        .expect("a shared storage");
     let releaser = storage.releaser();
     let observer = PostgresStorage::<String>::new_with_config(pool, &config(queue));
     let handler = move |_job: String| {
@@ -386,8 +383,8 @@ async fn run_shared_released(
             let status = observer
                 .fetch_by_id(&task_id)
                 .await
-                .map_err(|error| WorkerError::StreamError(Box::new(error)))?
-                .map(|task| task.parts.status.load());
+                .map_err(|error| WorkerError::BackendError(Box::new(error)))?
+                .map(|task| task.status());
             if matches!(status, Some(Status::Done | Status::Killed)) {
                 return Ok(());
             }
@@ -411,7 +408,7 @@ async fn restart_under_the_same_name(
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-restart-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-restart-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let name = "deployed-worker";
@@ -421,7 +418,13 @@ async fn restart_under_the_same_name(
         let first_task = push_with_id(&mut producer, "first deploy", None).await?;
         let (first_run, released) = match handover {
             Handover::Released => {
-                let run = run_until_done(first.clone(), name, &[first_task], handled.clone()).await;
+                let run = run_until_done(
+                    first.clone(),
+                    name,
+                    std::slice::from_ref(&first_task),
+                    handled.clone(),
+                )
+                .await;
                 let released = first.release_worker(name).await.map_err(release_error);
                 (run, released)
             }
@@ -429,22 +432,39 @@ async fn restart_under_the_same_name(
                 let ReleasedRun { outcome, released } = first
                     .run_released(
                         name,
-                        run_until_done(first.clone(), name, &[first_task], handled.clone()),
+                        run_until_done(
+                            first.clone(),
+                            name,
+                            std::slice::from_ref(&first_task),
+                            handled.clone(),
+                        ),
                     )
                     .await;
                 (outcome, released.map_err(release_error))
             }
             Handover::SharedReleaser => {
-                run_shared_released(&pool, &queue, name, first_task, handled.clone()).await
+                run_shared_released(&pool, &queue, name, first_task.clone(), handled.clone()).await
             }
             Handover::Kept => (
-                run_until_done(first.clone(), name, &[first_task], handled.clone()).await,
+                run_until_done(
+                    first.clone(),
+                    name,
+                    std::slice::from_ref(&first_task),
+                    handled.clone(),
+                )
+                .await,
                 Ok(0),
             ),
         };
         let second = PostgresStorage::<String>::new_with_config(&pool, &config(&queue));
         let second_task = push_with_id(&mut producer, "second deploy", None).await?;
-        let second_run = run_until_done(second, name, &[second_task], handled.clone()).await;
+        let second_run = run_until_done(
+            second,
+            name,
+            std::slice::from_ref(&second_task),
+            handled.clone(),
+        )
+        .await;
         let mut statuses = Vec::new();
         for id in [first_task, second_task] {
             statuses.push(
@@ -452,7 +472,7 @@ async fn restart_under_the_same_name(
                     .fetch_by_id(&id)
                     .await
                     .map_err(|e| e.to_string())?
-                    .map(|task| task.parts.status.load())
+                    .map(|task| task.status())
                     .ok_or("the task row exists")?,
             );
         }
@@ -529,13 +549,13 @@ async fn misconfigured_liveness() -> Result<Outcome<LivenessObservation>, String
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-liveness-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-liveness-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let config = Config::new(&queue)
             .set_keep_alive(Duration::from_secs(2))
             .set_reenqueue_orphaned_after(Duration::from_secs(1));
-        let worker = WorkerContext::new::<()>("misconfigured-worker");
+        let worker = WorkerContext::new("misconfigured-worker");
         let storage = PostgresStorage::<String>::new_with_config(&pool, &config);
         let mut poll = storage.clone().poll_compact(&worker);
         let poll = next_item(&mut poll).await;
@@ -610,7 +630,7 @@ async fn graceful_stop_with_buffered_tasks() -> Result<Outcome<BufferedStopObser
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-buffered-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-buffered-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let name = "buffered-worker";
@@ -620,10 +640,10 @@ async fn graceful_stop_with_buffered_tasks() -> Result<Outcome<BufferedStopObser
         let mut producer = storage.clone();
         let mut ids = Vec::new();
         for label in ["first", "second", "third"] {
-            let id = PgTaskId::new(ulid::Ulid::new());
+            let id = PgTaskId::from_ulid(ulid::Ulid::generate());
             let mut task = PgTask::<String>::new(label.to_owned());
-            task.parts.task_id = Some(id);
-            task.parts.ctx = PgContext::new().with_max_attempts(1);
+            task.edit(|t| t.task_id(id.clone()));
+            task.edit(|t| t.max_attempts(1));
             producer.push_task(task).await.map_err(|e| e.to_string())?;
             ids.push(id);
         }
@@ -634,7 +654,7 @@ async fn graceful_stop_with_buffered_tasks() -> Result<Outcome<BufferedStopObser
         let released = storage.release_worker(name).await.map_err(release_error);
         let mut after_release = Vec::new();
         for id in &ids {
-            let (status, attempts, _) = job_row(pool.clone(), *id).await?;
+            let (status, attempts, _) = job_row(pool.clone(), id.clone()).await?;
             after_release.push((status, attempts));
         }
         after_release.sort();
@@ -651,7 +671,7 @@ async fn graceful_stop_with_buffered_tasks() -> Result<Outcome<BufferedStopObser
                     .fetch_by_id(id)
                     .await
                     .map_err(|e| e.to_string())?
-                    .map(|task| task.parts.status.load())
+                    .map(|task| task.status())
                     .ok_or("the task row exists")?,
             );
         }
@@ -752,13 +772,13 @@ async fn heartbeat_before_registration(
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-heartbeat-order-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-heartbeat-order-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let config = Config::new(&queue)
             .set_keep_alive(Duration::from_millis(10))
             .set_reenqueue_orphaned_after(Duration::from_secs(60));
-        let worker = WorkerContext::new::<()>("early-heartbeat-worker");
+        let worker = WorkerContext::new("early-heartbeat-worker");
         let mut holder = None;
         if matches!(registration, Registration::Refused) {
             let mut stream =
@@ -849,7 +869,7 @@ async fn retention_after_a_run() -> Result<Outcome<RetentionObservation>, String
     let Some(pool) = pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("worker-release-retention-{}", ulid::Ulid::new());
+    let queue = format!("worker-release-retention-{}", ulid::Ulid::generate());
     cleanup(pool.clone(), queue.clone()).await?;
     let observation = async {
         let handled = Arc::new(AtomicUsize::new(0));
@@ -859,7 +879,7 @@ async fn retention_after_a_run() -> Result<Outcome<RetentionObservation>, String
         run_until_done(
             storage.clone(),
             "retention-worker",
-            &[done],
+            std::slice::from_ref(&done),
             handled.clone(),
         )
         .await?;
@@ -881,7 +901,7 @@ async fn retention_after_a_run() -> Result<Outcome<RetentionObservation>, String
                     .fetch_by_id(&id)
                     .await
                     .map_err(|e| e.to_string())?
-                    .map(|task| task.parts.status.load()),
+                    .map(|task| task.status()),
             );
         }
         // The released registration is stale and, once its task is gone,

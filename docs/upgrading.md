@@ -1,5 +1,56 @@
 # Installation and upgrades
 
+## Upgrading from 0.6.0 to apalis 1.0
+
+This release moves from the apalis 1.0 release candidate (`apalis-core
+1.0.0-rc.9`, `apalis-sql 1.0.0-rc.9`) to apalis 1.0.0. The schema does not
+change and no migration runs. The changes are to the Rust API and need Rust
+1.89.
+
+### Dependencies
+
+- Depend on `apalis = "1"` / `apalis-core = "1"` and drop `apalis-sql`, which
+  has no 1.0 release; `Config` now lives in this crate
+  (`apalis_diesel_postgres::Config`, same builder methods).
+- apalis 1.0 uses `ulid` 3. Build ids with `PgTaskId::from_ulid` from a
+  `ulid = "3"` value; an older `ulid` type does not convert.
+- The MSRV is Rust 1.89, which `ulid` 3's `uuid` dependency requires.
+
+### Tasks
+
+- `PgContext` and the re-exported `TaskRow` are gone. `PgTask<Args>` is apalis
+  1.0's `Task<Args>`, and `PgTaskId` is `TaskId` (a `TaskId::Ulid` for every
+  task this crate stores). `TaskId` is no longer `Copy`.
+- Set task options with `TaskBuilder` instead of writing `task.parts`:
+  `TaskBuilder::new(args).idempotency_key(key).run_at_timestamp(at)
+  .max_attempts(n).priority(p).build()`.
+- Metadata is apalis 1.0's string key-value store. The `metadata` JSONB object
+  maps to it in both directions: a string value is read as-is, any other value
+  as its JSON text, and every value is written back as a JSON string. A
+  numeric value written by 0.6.0 therefore reads as its text (`"7"`), and is
+  stored as a string once the task is written again.
+
+### Storage and workers
+
+- Poll strategies left apalis's `Config`. `Config::with_poll_interval` is
+  replaced by `Config::with_poll_strategy`, which takes a factory: each worker
+  built from the config, or from a clone, gets its own strategy, so a reused
+  config no longer reports `PollStrategyExhausted`. Strategy types moved to
+  `apalis_core::backend::ext::poll_strategy`.
+- `MakeShared` no longer exists. Call `SharedPostgresStorage::make_shared` and
+  `make_shared_with_config` as ordinary methods.
+- `get_queue` is an inherent method of `PostgresStorage` (apalis 1.0 dropped
+  `BackendExt`).
+- The admin traits follow apalis 1.0: `fetch_by_id`, `list_tasks` and
+  `list_all_tasks` return the stored (encoded) payload, so decode `args` with
+  the storage's codec; `WaitForCompletion` takes `&mut self`; `TaskResult`
+  carries the task's `attempt`.
+- A claim refused before the handler (lost, already acknowledged, retired
+  worker) marks that dispatch `Killed` instead of advancing its attempt
+  counter, which apalis 1.0 advances only when the handler runs. apalis's
+  `RetryPolicy` stops on `Killed`, so a retry layer outside the backend
+  middleware no longer retries a refusal. The database row is unaffected.
+
 ## Upgrading from 0.5.0 to 0.6.0
 
 Use this path when moving from `0.5.0` to `0.6.0`. Update the application's
@@ -104,7 +155,7 @@ consumed strategy. Choose the interval appropriate for the application:
 
 ```rust
 use std::time::Duration;
-use apalis_core::backend::poll_strategy::IntervalStrategy;
+use apalis_core::backend::ext::poll_strategy::IntervalStrategy;
 use apalis_diesel_postgres::{Config, PgPool, PostgresStorage};
 
 fn storage(pool: &PgPool) -> PostgresStorage<String> {

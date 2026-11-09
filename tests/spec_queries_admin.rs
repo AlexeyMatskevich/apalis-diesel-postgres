@@ -95,7 +95,7 @@ fn now_unix() -> u64 {
 }
 
 fn fresh_task_id() -> String {
-    TaskId::<Ulid>::from_str(&Ulid::new().to_string())
+    TaskId::from_str(&Ulid::generate().to_string())
         .expect("generated ULID parses as task id")
         .to_string()
 }
@@ -117,7 +117,7 @@ async fn insert_job(
     attempts: i32,
     max_attempts: i32,
 ) -> Result<String, String> {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     let task_id = id.clone();
     let owner = if matches!(status, "Queued" | "Running") {
         let owner = format!("seeded-owner-{id}");
@@ -192,7 +192,7 @@ async fn insert_job_at(
     attempts: i32,
     max_attempts: i32,
 ) -> Result<String, String> {
-    let id = Ulid::new().to_string();
+    let id = Ulid::generate().to_string();
     let task_id = id.clone();
     with_conn(pool, move |conn| {
         let job = serde_json::to_vec("admin-spec-payload").map_err(|e| e.to_string())?;
@@ -263,7 +263,7 @@ async fn run_status_filter(setup: StatusFilterSetup) -> Result<Outcome<StatusFil
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-status-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-status-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Seed one row per status. Non-terminal rows (Pending / Queued / Running)
@@ -351,7 +351,7 @@ async fn run_status_filter(setup: StatusFilterSetup) -> Result<Outcome<StatusFil
     let listed = storage.list_tasks(&f).await.map_err(|e| e.to_string())?;
     let returned_ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
 
     cleanup_queue(pool, queue).await?;
@@ -403,7 +403,7 @@ async fn run_list_tasks_default_status() -> Result<Outcome<StatusFilterRun>, Str
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-default-status-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-default-status-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let pending = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
@@ -422,7 +422,7 @@ async fn run_list_tasks_default_status() -> Result<Outcome<StatusFilterRun>, Str
     let listed = storage.list_tasks(&f).await.map_err(|e| e.to_string())?;
     let returned_ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
 
     cleanup_queue(pool, queue).await?;
@@ -443,7 +443,7 @@ async fn run_list_tasks_default_page_size() -> Result<Outcome<DefaultLimitRun>, 
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-default-size-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-default-size-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Read the apalis default so the assertion tracks it instead of hardcoding.
@@ -519,7 +519,7 @@ async fn run_order_by_run_at() -> Result<Outcome<OrderRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-order-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-order-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Two Pending rows, same status, different `run_at`. SQL is
@@ -537,7 +537,7 @@ async fn run_order_by_run_at() -> Result<Outcome<OrderRun>, String> {
 
     let ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
     if ids.len() < 2 {
         return Err(format!("expected at least 2 rows, got {ids:?}"));
@@ -576,7 +576,7 @@ async fn run_order_by_done_at() -> Result<Outcome<OrderRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-order-done-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-order-done-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Two terminal Done rows with CROSSED offsets (offset = seconds in the
@@ -598,7 +598,7 @@ async fn run_order_by_done_at() -> Result<Outcome<OrderRun>, String> {
 
     let ids: Vec<String> = listed
         .into_iter()
-        .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+        .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
         .collect();
     if ids.len() < 2 {
         return Err(format!("expected at least 2 rows, got {ids:?}"));
@@ -651,7 +651,7 @@ async fn run_pagination(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-page-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-page-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Seed 5 Pending rows with monotonically newer run_at so the SQL order
@@ -685,7 +685,7 @@ async fn run_pagination(
         Ok(tasks) => PaginationOutcome::Ok {
             ids: tasks
                 .into_iter()
-                .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
                 .collect(),
         },
         Err(err) => {
@@ -748,7 +748,7 @@ async fn run_list_all_page_zero() -> Result<Outcome<PaginationOutcome>, String> 
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-all-page0-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-all-page0-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     // One row is enough; the page=0 validation rejects before any scan.
     let _ = insert_job(pool.clone(), queue.clone(), "Pending", 5, None, 0, 3).await?;
@@ -763,7 +763,7 @@ async fn run_list_all_page_zero() -> Result<Outcome<PaginationOutcome>, String> 
         Ok(tasks) => PaginationOutcome::Ok {
             ids: tasks
                 .into_iter()
-                .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
                 .collect(),
         },
         Err(err) => {
@@ -836,7 +836,7 @@ async fn run_list_all_offset_slice() -> Result<Outcome<ListAllOffsetRun>, String
         apalis_diesel_postgres::setup(&pool)
             .await
             .map_err(|error| error.to_string())?;
-        let queue = format!("apalis-spec-admin-all-offset-{}", Ulid::new());
+        let queue = format!("apalis-spec-admin-all-offset-{}", Ulid::generate());
         cleanup_queue(pool.clone(), queue.clone()).await?;
 
         // Three Done rows with done_at ~10 years in the future (offsets are
@@ -897,7 +897,7 @@ async fn run_list_all_offset_slice() -> Result<Outcome<ListAllOffsetRun>, String
                     .map(|tasks| {
                         tasks
                             .into_iter()
-                            .filter_map(|t| t.parts.task_id.map(|id| id.to_string()))
+                            .filter_map(|t| t.task_id().cloned().map(|id| id.to_string()))
                             .collect::<Vec<String>>()
                     })
             }
@@ -1004,13 +1004,13 @@ async fn run_workers_only_queue() -> Result<Outcome<WorkersOnlyQueueRun>, String
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-workers-only-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-workers-only-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     // Worker registered, zero jobs in this queue.
     insert_worker(
         pool.clone(),
         queue.clone(),
-        format!("workers-only-worker-{}", Ulid::new()),
+        format!("workers-only-worker-{}", Ulid::generate()),
     )
     .await?;
 
@@ -1061,7 +1061,7 @@ async fn run_queue_stats_for_jobs_backed_queue() -> Result<Outcome<QueueStatsRun
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-queue-stats-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-queue-stats-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     // One Pending job, so PENDING_JOBS = 1 and TOTAL_JOBS = 1.
     let _ = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
@@ -1140,7 +1140,7 @@ async fn run_queue_activity_daily_buckets() -> Result<Outcome<QueueActivityRun>,
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-activity-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-activity-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Two rows on the "2 days ago" calendar date and three on "1 day ago".
@@ -1217,7 +1217,7 @@ async fn run_metrics_terminal_mix() -> Result<Outcome<MetricsRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-metrics-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-metrics-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     // Seed: 2 Pending, 1 Running, 1 Queued (both active, non-terminal),
@@ -1281,7 +1281,7 @@ async fn run_stuck_work_stats(source: StatsSource) -> Result<Outcome<StuckWorkRu
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-stuck-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-stuck-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let _ = insert_job(pool.clone(), queue.clone(), "Queued", 7_200, None, 0, 3).await?;
     let _ = insert_job(pool.clone(), queue.clone(), "Running", 5_400, None, 0, 3).await?;
@@ -1411,8 +1411,8 @@ async fn run_metrics_scoped_excludes_other_queue() -> Result<Outcome<ScopedMetri
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-scope-mine-{}", Ulid::new());
-    let other = format!("apalis-spec-admin-scope-other-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-scope-mine-{}", Ulid::generate());
+    let other = format!("apalis-spec-admin-scope-other-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other.clone()).await?;
 
@@ -1493,7 +1493,7 @@ async fn run_metrics_global() -> Result<Outcome<GlobalMetricsRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-global-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-global-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     // At least one row, so TOTAL_JOBS is well-defined even on a quiet DB.
     let _ = insert_job(pool.clone(), queue.clone(), "Pending", 1, None, 0, 3).await?;
@@ -1584,8 +1584,8 @@ async fn run_metrics_global_aggregates_across_queues()
         apalis_diesel_postgres::setup(&pool)
             .await
             .map_err(|error| error.to_string())?;
-        let queue_a = format!("apalis-spec-admin-global-agg-a-{}", Ulid::new());
-        let queue_b = format!("apalis-spec-admin-global-agg-b-{}", Ulid::new());
+        let queue_a = format!("apalis-spec-admin-global-agg-a-{}", Ulid::generate());
+        let queue_b = format!("apalis-spec-admin-global-agg-b-{}", Ulid::generate());
         cleanup_queue(pool.clone(), queue_a.clone()).await?;
         cleanup_queue(pool.clone(), queue_b.clone()).await?;
 
@@ -1718,7 +1718,7 @@ async fn run_admin_register(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-spec-admin-register-{}", Ulid::new());
+    let queue = format!("apalis-spec-admin-register-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
     let worker_id = format!("spec-admin-register-{queue}");
     match existing {

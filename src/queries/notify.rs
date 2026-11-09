@@ -201,9 +201,9 @@ pub(crate) mod test_support {
     pub(crate) fn saturated(ids: &[PgTaskId]) -> (NotifyTaskIds, Vec<PgTaskId>) {
         let (mut sender, receiver) = mpsc::channel(1);
         let mut accepted = Vec::new();
-        for &id in ids {
-            match classify_delivery(sender.try_send(id)) {
-                DeliveryOutcome::Delivered => accepted.push(id),
+        for id in ids {
+            match classify_delivery(sender.try_send(id.clone())) {
+                DeliveryOutcome::Delivered => accepted.push(id.clone()),
                 DeliveryOutcome::ChannelFull => {}
                 DeliveryOutcome::ReceiverGone => panic!("fresh receiver disconnected"),
             }

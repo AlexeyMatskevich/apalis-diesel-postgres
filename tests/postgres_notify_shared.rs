@@ -10,9 +10,8 @@ use std::time::Duration;
 
 use apalis_core::{
     backend::{
-        Backend, TaskSink,
-        poll_strategy::{StrategyBuilder, StreamStrategy},
-        shared::MakeShared,
+        TaskSink,
+        ext::poll_strategy::{Strategy, StreamStrategy},
     },
     worker::context::WorkerContext,
 };
@@ -64,11 +63,9 @@ async fn cleanup_queue(pool: PgPool, queue: String) -> Result<(), String> {
 }
 
 fn notify_only_config(queue: &str) -> Config {
-    Config::new(queue).set_buffer_size(2).with_poll_interval(
-        StrategyBuilder::new()
-            .apply(StreamStrategy::new(stream::pending::<()>()))
-            .build(),
-    )
+    Config::new(queue)
+        .set_buffer_size(2)
+        .with_poll_strategy(|| Strategy::new().apply(StreamStrategy::new(stream::pending::<()>())))
 }
 
 async fn next_task<Args>(
@@ -108,12 +105,12 @@ async fn run_notify_delivery() -> Result<Outcome<DeliveryRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-notify-deliver-{}", Ulid::new());
+    let queue = format!("apalis-notify-deliver-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let config = notify_only_config(&queue);
     let mut storage = PostgresStorage::<String>::new_with_notify(&pool, &config);
-    let worker = WorkerContext::new::<()>(&format!("notify-worker-{queue}"));
+    let worker = WorkerContext::new(&format!("notify-worker-{queue}"));
     let mut stream = storage.clone().poll(&worker);
 
     notify_support::wait_for_listeners(&pool, 1).await?;
@@ -133,7 +130,7 @@ async fn run_notify_isolation() -> Result<Outcome<IsolationRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-notify-iso-{}", Ulid::new());
+    let queue = format!("apalis-notify-iso-{}", Ulid::generate());
     let other_queue = format!("{queue}-other");
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
@@ -142,8 +139,8 @@ async fn run_notify_isolation() -> Result<Outcome<IsolationRun>, String> {
     let other_config = notify_only_config(&other_queue);
     let mut storage = PostgresStorage::<String>::new_with_notify(&pool, &config);
     let other_storage = PostgresStorage::<String>::new_with_notify(&pool, &other_config);
-    let worker = WorkerContext::new::<()>(&format!("notify-worker-{queue}"));
-    let other_worker = WorkerContext::new::<()>(&format!("notify-worker-{other_queue}"));
+    let worker = WorkerContext::new(&format!("notify-worker-{queue}"));
+    let other_worker = WorkerContext::new(&format!("notify-worker-{other_queue}"));
     let mut stream = storage.clone().poll(&worker);
     let mut other_stream = other_storage.clone().poll(&other_worker);
 
@@ -168,27 +165,22 @@ async fn run_shared_delivery_and_duplicate() -> Result<Outcome<SharedDuplicateRu
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-shared-deliver-{}", Ulid::new());
+    let queue = format!("apalis-shared-deliver-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let config = notify_only_config(&queue);
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
         SharedPostgresStorage::new(&pool);
-    let mut storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        config.clone(),
-    )
-    .map_err(|error| error.to_string())?;
+    let mut storage = shared
+        .make_shared_with_config::<String>(config.clone())
+        .map_err(|error| error.to_string())?;
     // Broadcast redesign: a second registration on the SAME queue config is now
     // accepted (it used to be rejected). Capture the real result so the
     // assertion can genuinely fail if that ever regresses, then use the handle
     // as a second consumer that must also receive the broadcast. `SharedFetcher`
     // is not `Clone`, so the second consumer is created via a fresh
     // `make_shared_with_config` rather than by cloning the first handle.
-    let second = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        config,
-    );
+    let second = shared.make_shared_with_config::<String>(config);
     let second_registration_accepted = second.is_ok();
     let Ok(poll_handle) = second else {
         cleanup_queue(pool, queue).await?;
@@ -197,7 +189,7 @@ async fn run_shared_delivery_and_duplicate() -> Result<Outcome<SharedDuplicateRu
             delivered_payload: String::new(),
         }));
     };
-    let worker = WorkerContext::new::<()>(&format!("shared-worker-{queue}"));
+    let worker = WorkerContext::new(&format!("shared-worker-{queue}"));
     let mut stream = poll_handle.poll(&worker);
 
     notify_support::wait_for_listeners(&pool, 1).await?;
@@ -218,7 +210,7 @@ async fn run_shared_isolation() -> Result<Outcome<IsolationRun>, String> {
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-shared-iso-{}", Ulid::new());
+    let queue = format!("apalis-shared-iso-{}", Ulid::generate());
     let other_queue = format!("{queue}-other");
     cleanup_queue(pool.clone(), queue.clone()).await?;
     cleanup_queue(pool.clone(), other_queue.clone()).await?;
@@ -227,31 +219,23 @@ async fn run_shared_isolation() -> Result<Outcome<IsolationRun>, String> {
     let other_config = notify_only_config(&other_queue);
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
         SharedPostgresStorage::new(&pool);
-    let mut storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        config,
-    )
-    .map_err(|error| error.to_string())?;
-    let _other_storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        other_config,
-    )
-    .map_err(|error| error.to_string())?;
+    let mut storage = shared
+        .make_shared_with_config::<String>(config)
+        .map_err(|error| error.to_string())?;
+    let _other_storage = shared
+        .make_shared_with_config::<String>(other_config)
+        .map_err(|error| error.to_string())?;
     // Q6-rest: clone removed from SharedFetcher. Take a second handle per
     // queue for polling so the original `storage` / `other_storage` remain
     // usable for `push`.
-    let poll_handle = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        notify_only_config(&queue),
-    )
-    .map_err(|error| error.to_string())?;
-    let other_poll_handle = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        notify_only_config(&other_queue),
-    )
-    .map_err(|error| error.to_string())?;
-    let worker = WorkerContext::new::<()>(&format!("shared-worker-{queue}"));
-    let other_worker = WorkerContext::new::<()>(&format!("shared-worker-{other_queue}"));
+    let poll_handle = shared
+        .make_shared_with_config::<String>(notify_only_config(&queue))
+        .map_err(|error| error.to_string())?;
+    let other_poll_handle = shared
+        .make_shared_with_config::<String>(notify_only_config(&other_queue))
+        .map_err(|error| error.to_string())?;
+    let worker = WorkerContext::new(&format!("shared-worker-{queue}"));
+    let other_worker = WorkerContext::new(&format!("shared-worker-{other_queue}"));
     let mut stream = poll_handle.poll(&worker);
     let mut other_stream = other_poll_handle.poll(&other_worker);
 
@@ -306,23 +290,19 @@ async fn run_shared_malformed_payload_survival() -> Result<Outcome<MalformedPayl
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("apalis-shared-malformed-{}", Ulid::new());
+    let queue = format!("apalis-shared-malformed-{}", Ulid::generate());
     cleanup_queue(pool.clone(), queue.clone()).await?;
 
     let config = notify_only_config(&queue);
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
         SharedPostgresStorage::new(&pool);
-    let mut storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        config.clone(),
-    )
-    .map_err(|error| error.to_string())?;
-    let poll_handle = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        config,
-    )
-    .map_err(|error| error.to_string())?;
-    let worker = WorkerContext::new::<()>(&format!("shared-worker-{queue}"));
+    let mut storage = shared
+        .make_shared_with_config::<String>(config.clone())
+        .map_err(|error| error.to_string())?;
+    let poll_handle = shared
+        .make_shared_with_config::<String>(config)
+        .map_err(|error| error.to_string())?;
+    let worker = WorkerContext::new(&format!("shared-worker-{queue}"));
     let mut stream = poll_handle.poll(&worker);
 
     // Warm-up barrier: deliver a real job and await it BEFORE sending the
@@ -502,14 +482,12 @@ async fn run_listener_recycles_a_clean_connection() -> Result<Outcome<UnlistenRu
     let pool = build_pool_with(url, |builder| builder.max_size(1).min_idle(Some(0)))
         .map_err(|e| e.to_string())?;
 
-    let queue = format!("apalis-shared-unlisten-{}", Ulid::new());
+    let queue = format!("apalis-shared-unlisten-{}", Ulid::generate());
     let mut shared: SharedPostgresStorage<JsonCodec<CompactType>> =
         SharedPostgresStorage::new(&pool);
-    let storage = <SharedPostgresStorage<JsonCodec<CompactType>> as MakeShared<String>>::make_shared_with_config(
-        &mut shared,
-        notify_only_config(&queue),
-    )
-    .map_err(|e| e.to_string())?;
+    let storage = shared
+        .make_shared_with_config::<String>(notify_only_config(&queue))
+        .map_err(|e| e.to_string())?;
 
     // The listener thread claims the pool's only connection and LISTENs.
     wait_until(
@@ -652,16 +630,17 @@ async fn run_listener_disconnect(
     let Some(pool) = test_pool().await? else {
         return Ok(Outcome::Skipped);
     };
-    let queue = format!("listener-disconnect-{}", Ulid::new());
+    let queue = format!("listener-disconnect-{}", Ulid::generate());
     let config = Config::new(&queue);
-    let worker = WorkerContext::new::<()>(&queue);
+    let worker = WorkerContext::new(&queue);
     let mut publisher = PostgresStorage::<String>::new_with_config(&pool, &Config::new(&queue));
     let mut shared: SharedPostgresStorage = SharedPostgresStorage::new(&pool);
-    let mut stream: apalis_core::backend::TaskStream<
+    let mut stream: apalis_diesel_postgres::TaskStream<
         PgTask<String>,
         apalis_diesel_postgres::Error,
     > = if shared_mode {
-        <SharedPostgresStorage as MakeShared<String>>::make_shared_with_config(&mut shared, config)
+        shared
+            .make_shared_with_config::<String>(config)
             .map_err(|error| error.to_string())?
             .poll(&worker)
     } else {

@@ -23,7 +23,6 @@ use apalis_core::{
 use apalis_diesel_postgres::{
     Config, Error as PgError, PgPool, PgTask, PostgresStorage, build_pool, setup,
 };
-use apalis_sql::context::SqlContext;
 use diesel::{Connection, RunQueryDsl, sql_query, sql_types::Text};
 use lets_expect::{AssertionError, AssertionResult, *};
 use serde::{Deserialize, Serialize};
@@ -84,11 +83,82 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut task: PgTask<J>) -> Self::Future {
-        if self.refresh {
-            task.parts.ctx = task.parts.ctx.with_lock_by(None).with_lock_at(None);
-        }
+    fn call(&mut self, task: PgTask<J>) -> Self::Future {
+        let task = if self.refresh {
+            task.into_builder().lock_by(None).lock_at(None).build()
+        } else {
+            task
+        };
         self.inner.call(task)
+    }
+}
+
+/// apalis 1.0 installs layers added with `WorkerBuilder::layer` inside the
+/// backend middleware. This wrapper puts `RefreshClaimLayer` outside it, as
+/// the old ordering did, so the middleware sees the cleared claim.
+struct RefreshingBackend<B> {
+    inner: B,
+    refresh: bool,
+}
+
+impl<B: apalis_core::backend::Backend> apalis_core::backend::Backend for RefreshingBackend<B> {
+    type Task = B::Task;
+    type Error = B::Error;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        worker: &WorkerContext,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx, worker)
+    }
+
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        worker: &WorkerContext,
+    ) -> std::task::Poll<Option<Result<Self::Task, Self::Error>>> {
+        self.inner.poll_next(cx, worker)
+    }
+
+    fn poll_close(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        worker: &WorkerContext,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_close(cx, worker)
+    }
+}
+
+impl<B: apalis_core::backend::BackendConfig> apalis_core::backend::BackendConfig
+    for RefreshingBackend<B>
+{
+    type Args = B::Args;
+    type Id = B::Id;
+    type Kind = B::Kind;
+    type Config = B::Config;
+    type Layer = apalis_core::layers::Stack<B::Layer, RefreshClaimLayer>;
+
+    fn config(&self) -> &Self::Config {
+        self.inner.config()
+    }
+
+    fn middleware(&mut self, worker: &mut WorkerContext) -> Self::Layer {
+        apalis_core::layers::Stack::new(
+            self.inner.middleware(worker),
+            RefreshClaimLayer(self.refresh),
+        )
+    }
+}
+
+impl<B: apalis_core::backend::WireFormatBackend> apalis_core::backend::WireFormatBackend
+    for RefreshingBackend<B>
+{
+    type Codec = B::Codec;
+    type Compact = B::Compact;
+
+    fn codec(&self) -> &Self::Codec {
+        self.inner.codec()
     }
 }
 
@@ -194,7 +264,7 @@ async fn run_worker_integration(
     let pool = build_pool(database_url).map_err(|e| e.to_string())?;
     setup(&pool).await.map_err(|e| e.to_string())?;
 
-    let suffix = Ulid::new();
+    let suffix = Ulid::generate();
     let emails_queue = format!("worker-int-emails-{suffix}");
     let activity_queue = format!("worker-int-activity-{suffix}");
     cleanup_queues(
@@ -219,10 +289,11 @@ async fn run_worker_integration(
                 // relying on worker shutdown winning a race against the
                 // fetcher's next poll (a `Failed` row with attempts left would
                 // be immediately re-claimed).
-                let mut task = PgTask::<SendEmail>::new(SendEmail {
+                let task = apalis_core::task::builder::TaskBuilder::new(SendEmail {
                     to: "ada@example.com".to_owned(),
-                });
-                task.parts.ctx = SqlContext::new().with_max_attempts(1);
+                })
+                .max_attempts(1)
+                .build();
                 storage.push_task_with_conn(c, task)
             })
         })
@@ -279,8 +350,10 @@ async fn run_worker_integration(
     };
 
     let worker = WorkerBuilder::new(format!("worker-int-{suffix}"))
-        .backend(emails.clone())
-        .layer(RefreshClaimLayer(refresh_claim))
+        .backend(RefreshingBackend {
+            inner: emails.clone(),
+            refresh: refresh_claim,
+        })
         .build(handler);
     let mut observer = emails.clone();
     let terminal_observed = Arc::new(std::sync::Mutex::new(None));
@@ -291,8 +364,8 @@ async fn run_worker_integration(
             let status = observer
                 .fetch_by_id(&email_task_id)
                 .await
-                .map_err(|error| apalis_core::error::WorkerError::StreamError(Box::new(error)))?
-                .map(|task| (task.parts.status.load(), task.parts.attempt.current()));
+                .map_err(|error| apalis_core::error::WorkerError::BackendError(Box::new(error)))?
+                .map(|task| (task.status(), task.attempt()));
             if matches!(status, Some((Status::Done | Status::Killed, _))) {
                 *signal_status.lock().expect("status mutex") = status;
                 return Ok(());

@@ -80,3 +80,90 @@ where
         })
     }
 }
+
+/// A backend whose middleware runs `layer` *outside* the backend's own
+/// middleware. apalis 1.0 installs `WorkerBuilder::layer` layers inside it;
+/// tests that need the pre-1.0 order (a gate or a retry layer around the
+/// backend middleware) wrap the backend instead.
+pub struct WithOuterLayer<B, L> {
+    inner: B,
+    layer: L,
+}
+
+/// Wrap `backend` so `layer` runs outside its middleware.
+#[allow(dead_code)]
+pub fn with_outer_layer<B, L>(backend: B, layer: L) -> WithOuterLayer<B, L> {
+    WithOuterLayer {
+        inner: backend,
+        layer,
+    }
+}
+
+/// Wrap `backend` so its worker admits one task at a time. Inside the backend
+/// middleware the gate would close only once that middleware had started the
+/// claim, so the worker could admit the rest of the batch meanwhile.
+#[allow(dead_code)]
+pub fn one_at_a_time<B>(backend: B) -> WithOuterLayer<B, OneAtATimeLayer> {
+    with_outer_layer(backend, OneAtATimeLayer::default())
+}
+
+impl<B: apalis_core::backend::Backend, L> apalis_core::backend::Backend for WithOuterLayer<B, L> {
+    type Task = B::Task;
+    type Error = B::Error;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        worker: &apalis_core::worker::context::WorkerContext,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx, worker)
+    }
+
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        worker: &apalis_core::worker::context::WorkerContext,
+    ) -> std::task::Poll<Option<Result<Self::Task, Self::Error>>> {
+        self.inner.poll_next(cx, worker)
+    }
+
+    fn poll_close(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        worker: &apalis_core::worker::context::WorkerContext,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_close(cx, worker)
+    }
+}
+
+impl<B: apalis_core::backend::BackendConfig, L: Clone> apalis_core::backend::BackendConfig
+    for WithOuterLayer<B, L>
+{
+    type Args = B::Args;
+    type Id = B::Id;
+    type Kind = B::Kind;
+    type Config = B::Config;
+    type Layer = apalis_core::layers::Stack<B::Layer, L>;
+
+    fn config(&self) -> &Self::Config {
+        self.inner.config()
+    }
+
+    fn middleware(
+        &mut self,
+        worker: &mut apalis_core::worker::context::WorkerContext,
+    ) -> Self::Layer {
+        apalis_core::layers::Stack::new(self.inner.middleware(worker), self.layer.clone())
+    }
+}
+
+impl<B: apalis_core::backend::WireFormatBackend, L> apalis_core::backend::WireFormatBackend
+    for WithOuterLayer<B, L>
+{
+    type Codec = B::Codec;
+    type Compact = B::Compact;
+
+    fn codec(&self) -> &Self::Codec {
+        self.inner.codec()
+    }
+}

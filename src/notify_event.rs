@@ -4,7 +4,7 @@
 //! trigger introduced in migration `20260521000001` (`{job_type, ids: [...]}`)
 //! serialize into this struct via `serde(default)` on the optional fields.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// One pending listener failure per consumer, separate from lossy wakeup ids.
 /// Repeated failures coalesce until observed; a full hint buffer cannot hide
@@ -56,10 +56,35 @@ pub(crate) const INSERT_EVENT_IDS_CAP: usize = 65_536;
 #[derive(Debug, Deserialize)]
 pub(crate) struct InsertEvent {
     pub(crate) job_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "ulid_task_id")]
     pub(crate) id: Option<PgTaskId>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "ulid_task_ids")]
     pub(crate) ids: Vec<PgTaskId>,
+}
+
+/// A task id as the triggers write it: the text of a ULID.
+///
+/// apalis 1.0's untagged `TaskId` would read the text as `TaskId::String`,
+/// which never equals the `TaskId::Ulid` a fetched task carries. Parse it as a
+/// ULID instead and reject anything else, as apalis-sql's `TaskId<Ulid>` did.
+struct UlidTaskId(PgTaskId);
+
+impl<'de> Deserialize<'de> for UlidTaskId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        ulid::Ulid::from_string(&text)
+            .map(|id| Self(PgTaskId::from_ulid(id)))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+fn ulid_task_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<PgTaskId>, D::Error> {
+    Option::<UlidTaskId>::deserialize(deserializer).map(|id| id.map(|UlidTaskId(id)| id))
+}
+
+fn ulid_task_ids<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<PgTaskId>, D::Error> {
+    Vec::<UlidTaskId>::deserialize(deserializer)
+        .map(|ids| ids.into_iter().map(|UlidTaskId(id)| id).collect())
 }
 
 impl InsertEvent {
@@ -104,8 +129,8 @@ pub(crate) mod test_support {
         let mut accepted = Vec::new();
         if full {
             for value in 1..=16_u128 {
-                let id = PgTaskId::new(ulid::Ulid::from(value));
-                match sender.try_send(id) {
+                let id = PgTaskId::from_ulid(ulid::Ulid::from(value));
+                match sender.try_send(id.clone()) {
                     Ok(()) => accepted.push(id),
                     Err(error) if error.is_full() => break,
                     Err(error) => panic!("fresh hint receiver disconnected: {error}"),
@@ -187,9 +212,9 @@ mod tests {
     fn resolved_ids(ids_len: usize, has_legacy: bool) -> (String, Vec<PgTaskId>) {
         InsertEvent {
             job_type: "emails".into(),
-            id: has_legacy.then(|| PgTaskId::new(Ulid::from(99_999u128))),
+            id: has_legacy.then(|| PgTaskId::from_ulid(Ulid::from(99_999u128))),
             ids: (0..ids_len)
-                .map(|id| PgTaskId::new(Ulid::from(id as u128)))
+                .map(|id| PgTaskId::from_ulid(Ulid::from(id as u128)))
                 .collect(),
         }
         .into_ids()
@@ -197,10 +222,10 @@ mod tests {
 
     fn expected_ids(ids_len: usize, has_legacy: bool) -> (String, Vec<PgTaskId>) {
         let ids = if ids_len == 0 && has_legacy {
-            vec![PgTaskId::new(Ulid::from(99_999u128))]
+            vec![PgTaskId::from_ulid(Ulid::from(99_999u128))]
         } else {
             (0..ids_len.min(INSERT_EVENT_IDS_CAP))
-                .map(|id| PgTaskId::new(Ulid::from(id as u128)))
+                .map(|id| PgTaskId::from_ulid(Ulid::from(id as u128)))
                 .collect()
         };
         ("emails".into(), ids)
@@ -263,7 +288,7 @@ mod tests {
     }
 
     fn sample_id() -> PgTaskId {
-        PgTaskId::new("01AN4Z07BY79KA1307SR9X4MV3".parse().unwrap())
+        PgTaskId::from_ulid("01AN4Z07BY79KA1307SR9X4MV3".parse().unwrap())
     }
 
     lets_expect! {
@@ -308,6 +333,13 @@ mod tests {
 
             when the_payload_is_not_valid_json {
                 let payload = "not json";
+                to fails_to_deserialize { be_err }
+            }
+
+            when an_id_is_not_a_ulid {
+                let payload = r#"{"job_type":"emails","ids":["not-a-ulid"]}"#;
+                // A fetched task carries a ULID id; any other text could
+                // never match one.
                 to fails_to_deserialize { be_err }
             }
         }

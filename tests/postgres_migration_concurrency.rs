@@ -926,7 +926,7 @@ async fn namespace_privileges(
 ) -> Result<Outcome<Observations>, String> {
     with_isolated_database(move |url| async move {
         let owner = pool(&url)?;
-        let role = format!("apalis_migration_role_{}", ulid::Ulid::new().to_string().to_lowercase());
+        let role = format!("apalis_migration_role_{}", ulid::Ulid::generate().to_string().to_lowercase());
         sql(&owner, format!("CREATE ROLE \"{role}\" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION")).await?;
         // Keep all fallible scenario work inside this future so cleanup also
         // executes on an infrastructure error, before the isolated DB is removed.

@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 use ulid::Ulid;
 
 pub(crate) fn mint_lease_token() -> String {
-    Ulid::new().to_string()
+    Ulid::generate().to_string()
 }
 /// Per-statement cap on the periodic orphan-recovery sweep. Without a bound,
 /// a mass worker death would rewrite every orphaned row in one statement
@@ -482,7 +482,7 @@ mod tests {
     }
 
     fn heartbeat(updated_rows: usize) -> Result<(), Error> {
-        let worker = WorkerContext::new::<()>("heartbeat-worker");
+        let worker = WorkerContext::new("heartbeat-worker");
         heartbeat_outcome(updated_rows, &worker, "heartbeat-queue")
     }
 

@@ -54,7 +54,7 @@ fn config() -> Config {
 }
 
 fn worker_context() -> WorkerContext {
-    WorkerContext::new::<()>("worker")
+    WorkerContext::new("worker")
 }
 
 fn worker_fixture(conn: &mut PgConnection) -> Result<(), String> {

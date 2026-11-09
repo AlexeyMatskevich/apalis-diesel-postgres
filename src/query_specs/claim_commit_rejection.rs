@@ -1,7 +1,7 @@
 //! Server-confirmed COMMIT rejection must remain distinguishable from lost outcome.
 use crate::{Config, Error, PgTaskId, PostgresStorage, test_support as support};
 use apalis_core::{
-    backend::{BackendExt, TaskSink, poll_strategy::IntervalStrategy},
+    backend::{TaskSink, ext::poll_strategy::IntervalStrategy},
     task::builder::TaskBuilder,
     worker::context::WorkerContext,
 };
@@ -34,14 +34,14 @@ async fn commit_rejection(rejection: Rejection) -> Result<Outcome<Value>, String
         crate::setup(&pool).await.map_err(|e|e.to_string())?;
         let mut storage=PostgresStorage::<String>::new_with_config(&pool,&Config::new("rejected-commit"))
             .with_poll_strategy_factory(||IntervalStrategy::new(Duration::from_millis(1)));
-        let id=PgTaskId::new(ulid::Ulid::new());
-        storage.push_task(TaskBuilder::new("payload".to_owned()).with_task_id(id).build()).await.map_err(|e|e.to_string())?;
+        let id=PgTaskId::from_ulid(ulid::Ulid::generate());
+        storage.push_task(TaskBuilder::new("payload".to_owned()).task_id(id.clone()).build()).await.map_err(|e|e.to_string())?;
         with_conn(pool.clone(),move |conn| {
             let code=match rejection {Rejection::Serialization=>"40001",Rejection::Constraint=>"23514"};
             conn.batch_execute(&format!("CREATE FUNCTION public.reject_claim_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled server commit rejection' USING ERRCODE='{code}'; END $$;
                 CREATE CONSTRAINT TRIGGER reject_claim_commit AFTER UPDATE ON apalis.jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.status='Queued') EXECUTE FUNCTION public.reject_claim_commit();")).map_err(|e|e.to_string())
         }).await?;
-        let worker=WorkerContext::new::<()>("rejection-worker");let mut tasks=storage.poll_compact(&worker);
+        let worker=WorkerContext::new("rejection-worker");let mut tasks=storage.poll_compact(&worker);
         let registered=tasks.next().await.ok_or("registration stream ended")?.map_err(|e|e.to_string())?;
         if registered.is_some() {return Err("registration unexpectedly returned a claim".to_owned());}
         let failure=tokio::time::timeout(Duration::from_secs(5),tasks.next()).await.map_err(|e|e.to_string())?
@@ -54,7 +54,7 @@ async fn commit_rejection(rejection: Rejection) -> Result<Outcome<Value>, String
         let rejected=stored(pool.clone()).await?;
         with_conn(pool.clone(),|conn|conn.batch_execute("DROP TRIGGER reject_claim_commit ON apalis.jobs; DROP FUNCTION public.reject_claim_commit()").map_err(|e|e.to_string())).await?;
         let subsequent=tokio::time::timeout(Duration::from_secs(5),tasks.next()).await.map_err(|e|e.to_string())?;
-        let same_task=matches!(subsequent,Some(Ok(Some(ref task))) if task.parts.task_id==Some(id));
+        let same_task=matches!(subsequent,Some(Ok(Some(ref task))) if task.task_id()==Some(&id));
         let claimed=stored(pool).await?;drop(tasks);
         Ok(json!({"known_rejection":known_rejection,"rejected":rejected,"same_task":same_task,"claimed":claimed}))
     }).await
