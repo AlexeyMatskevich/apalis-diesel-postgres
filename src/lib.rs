@@ -858,6 +858,12 @@ where
     /// Every payload is test-decoded first; a row that does not decode is
     /// released by the decode stage (see `queries::fail_undecodable_task`)
     /// instead of reaching apalis, whose `Durable` wrapper decodes the rest.
+    ///
+    /// A storage typed on [`CompactType`] skips that stage: its consumer
+    /// takes the stored bytes as they are. apalis-workflow's `GraphFlow` and
+    /// `SteppedFlow` run on the raw backend, not behind `Durable`, and their
+    /// payloads are not a JSON-encoded `Vec<u8>`, so test-decoding them as
+    /// one would release every workflow task as undecodable.
     fn task_stream(
         &mut self,
         worker: &WorkerContext,
@@ -873,8 +879,12 @@ where
             std::sync::Arc::clone(&self.lease_token),
             self.poll_factory.clone(),
         );
+        let compact = crate::fetcher::LeaseStream::new(compact, lease.clone(), true).boxed();
+        if std::any::TypeId::of::<Args>() == std::any::TypeId::of::<CompactType>() {
+            return Ok(compact);
+        }
         Ok(crate::fetcher::decode_task_stream::<Args, Decode>(
-            crate::fetcher::LeaseStream::new(compact, lease.clone(), true).boxed(),
+            compact,
             self.codec.clone(),
             self.pool.clone(),
             std::sync::Arc::from(worker.name()),
